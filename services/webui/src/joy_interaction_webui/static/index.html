@@ -3902,6 +3902,13 @@ limitations under the License.
         const ASR_AUDIO_BUFFER_SIZE = 4096;
         const ASR_FINAL_FALLBACK_MS = 1200;
         const ASR_WS_PATH = '/ws/asr';
+        const AUDIO_INGRESS_WS_PATH = '/ws/audio-ingress';
+        const AUDIO_INGRESS_PACKET_MS = 40;
+        const AUDIO_INGRESS_PACKET_SAMPLES = Math.round(
+            ASR_TARGET_SAMPLE_RATE * AUDIO_INGRESS_PACKET_MS / 1000
+        );
+        const AUDIO_INGRESS_HEADER_BYTES = 28;
+        const AUDIO_INGRESS_RECONNECT_MAX_MS = 5000;
 
         // Elements
         const themeToggle = document.getElementById('themeToggle');
@@ -3999,6 +4006,18 @@ limitations under the License.
         let asrFinalFallbackTimer = null;
         let asrStopRequested = false;
         let mobileVoiceMode = false;
+        let continuousAudioWs = null;
+        let continuousAudioStream = null;
+        let continuousAudioContext = null;
+        let continuousAudioSource = null;
+        let continuousAudioProcessor = null;
+        let continuousAudioSilence = null;
+        let continuousAudioPending = new Int16Array(0);
+        let continuousAudioPendingStartMs = null;
+        let continuousAudioSequence = 1;
+        let continuousAudioToken = 0;
+        let continuousAudioReconnectTimer = null;
+        let continuousAudioReconnectAttempt = 0;
         // Multi-session: one ID per page/tab; sent in WebSocket and /offer so this tab gets only its VLM output
         let sessionId = crypto.randomUUID ? crypto.randomUUID() : 'tab-' + Date.now() + '-' + Math.random().toString(36).slice(2);
         let isAnalysisRunning = false;
@@ -7054,6 +7073,10 @@ limitations under the License.
                 isStreamStarting = false;
                 isAnalysisRunning = true;
                 updatePromptAvailability();
+                startContinuousAudioIngress().catch(async error => {
+                    console.warn('Unable to start continuous microphone ingress:', error);
+                    await stopContinuousAudioIngress();
+                });
                 if (revealVideoAfterMetricsToken === token) {
                     updateStatus('Preparing first metrics...', 'processing');
                     cancelRevealVideoFallback();
@@ -7360,6 +7383,220 @@ limitations under the License.
             return Math.sqrt(sum / Math.max(1, input.length));
         }
 
+        function buildContinuousAudioPacket(pcm, sequence, monotonicMs, voiceActive) {
+            const sessionBytes = new TextEncoder().encode(sessionId);
+            const packet = new ArrayBuffer(
+                AUDIO_INGRESS_HEADER_BYTES + sessionBytes.length + pcm.length * 2
+            );
+            const view = new DataView(packet);
+            view.setUint32(0, 0x4a414931); // "JAI1"
+            view.setUint8(4, 1);
+            view.setUint8(5, voiceActive ? 1 : 0);
+            view.setUint16(6, sessionBytes.length);
+            view.setUint32(8, sequence);
+            view.setFloat64(12, monotonicMs);
+            view.setUint32(20, ASR_TARGET_SAMPLE_RATE);
+            view.setUint32(24, pcm.length);
+            new Uint8Array(packet, AUDIO_INGRESS_HEADER_BYTES, sessionBytes.length).set(
+                sessionBytes
+            );
+            const pcmOffset = AUDIO_INGRESS_HEADER_BYTES + sessionBytes.length;
+            for (let i = 0; i < pcm.length; i += 1) {
+                view.setInt16(pcmOffset + i * 2, pcm[i], true);
+            }
+            return packet;
+        }
+
+        function sendContinuousAudioSamples(pcmBuffer, captureStartMs, voiceActive) {
+            if (!continuousAudioWs || continuousAudioWs.readyState !== WebSocket.OPEN) {
+                continuousAudioPending = new Int16Array(0);
+                continuousAudioPendingStartMs = null;
+                return;
+            }
+
+            const incoming = new Int16Array(pcmBuffer);
+            if (!incoming.length) {
+                return;
+            }
+            if (!continuousAudioPending.length) {
+                continuousAudioPendingStartMs = captureStartMs;
+            }
+
+            const combined = new Int16Array(continuousAudioPending.length + incoming.length);
+            combined.set(continuousAudioPending);
+            combined.set(incoming, continuousAudioPending.length);
+            continuousAudioPending = combined;
+
+            while (continuousAudioPending.length >= AUDIO_INGRESS_PACKET_SAMPLES) {
+                const packetPcm = continuousAudioPending.slice(0, AUDIO_INGRESS_PACKET_SAMPLES);
+                continuousAudioPending = continuousAudioPending.slice(AUDIO_INGRESS_PACKET_SAMPLES);
+                const packetTimestamp = continuousAudioPendingStartMs ?? performance.now();
+                continuousAudioWs.send(
+                    buildContinuousAudioPacket(
+                        packetPcm,
+                        continuousAudioSequence,
+                        packetTimestamp,
+                        voiceActive
+                    )
+                );
+                continuousAudioSequence = (continuousAudioSequence + 1) >>> 0;
+                continuousAudioPendingStartMs = packetTimestamp + AUDIO_INGRESS_PACKET_MS;
+            }
+        }
+
+        function connectContinuousAudioWebSocket(token) {
+            if (token !== continuousAudioToken || !isAnalysisRunning) {
+                return;
+            }
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}${AUDIO_INGRESS_WS_PATH}?session_id=${encodeURIComponent(sessionId)}`;
+            const ws = new WebSocket(wsUrl);
+            continuousAudioWs = ws;
+
+            ws.onopen = () => {
+                continuousAudioReconnectAttempt = 0;
+                continuousAudioPending = new Int16Array(0);
+                continuousAudioPendingStartMs = null;
+            };
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    if (data.type === 'error') {
+                        console.warn('Continuous audio ingress error:', data.message);
+                    }
+                } catch (error) {
+                    console.debug('Ignoring non-JSON audio ingress response', error);
+                }
+            };
+            ws.onerror = () => {
+                console.warn('Continuous audio ingress connection error');
+            };
+            ws.onclose = () => {
+                if (continuousAudioWs === ws) {
+                    continuousAudioWs = null;
+                }
+                if (token !== continuousAudioToken || !isAnalysisRunning) {
+                    return;
+                }
+                const delay = Math.min(
+                    500 * (2 ** continuousAudioReconnectAttempt),
+                    AUDIO_INGRESS_RECONNECT_MAX_MS
+                );
+                continuousAudioReconnectAttempt += 1;
+                clearTimeout(continuousAudioReconnectTimer);
+                continuousAudioReconnectTimer = setTimeout(
+                    () => connectContinuousAudioWebSocket(token),
+                    delay
+                );
+            };
+        }
+
+        async function startContinuousAudioIngress() {
+            if (
+                continuousAudioStream ||
+                continuousAudioContext ||
+                !isAnalysisRunning
+            ) {
+                return;
+            }
+
+            const token = ++continuousAudioToken;
+            continuousAudioSequence = 1;
+            continuousAudioReconnectAttempt = 0;
+            continuousAudioPending = new Int16Array(0);
+            continuousAudioPendingStartMs = null;
+
+            continuousAudioStream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    channelCount: 1,
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true
+                }
+            });
+            if (token !== continuousAudioToken || !isAnalysisRunning) {
+                continuousAudioStream.getTracks().forEach(track => track.stop());
+                continuousAudioStream = null;
+                return;
+            }
+
+            const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+            continuousAudioContext = new AudioContextClass();
+            if (continuousAudioContext.state === 'suspended') {
+                await continuousAudioContext.resume();
+            }
+            continuousAudioSource = continuousAudioContext.createMediaStreamSource(
+                continuousAudioStream
+            );
+            continuousAudioProcessor = continuousAudioContext.createScriptProcessor(
+                ASR_AUDIO_BUFFER_SIZE,
+                1,
+                1
+            );
+            continuousAudioSilence = continuousAudioContext.createGain();
+            continuousAudioSilence.gain.value = 0;
+
+            continuousAudioProcessor.onaudioprocess = (event) => {
+                if (token !== continuousAudioToken || !isAnalysisRunning) {
+                    return;
+                }
+                const input = event.inputBuffer.getChannelData(0);
+                const durationMs = input.length / continuousAudioContext.sampleRate * 1000;
+                const pcm = downsampleToInt16(input, continuousAudioContext.sampleRate);
+                const voiceActive = getAudioRms(input) >= ASR_SILENCE_RMS_THRESHOLD;
+                sendContinuousAudioSamples(
+                    pcm,
+                    performance.now() - durationMs,
+                    voiceActive
+                );
+            };
+
+            continuousAudioSource.connect(continuousAudioProcessor);
+            continuousAudioProcessor.connect(continuousAudioSilence);
+            continuousAudioSilence.connect(continuousAudioContext.destination);
+            connectContinuousAudioWebSocket(token);
+        }
+
+        async function stopContinuousAudioIngress() {
+            continuousAudioToken += 1;
+            if (continuousAudioReconnectTimer) {
+                clearTimeout(continuousAudioReconnectTimer);
+                continuousAudioReconnectTimer = null;
+            }
+            if (
+                continuousAudioWs &&
+                continuousAudioWs.readyState === WebSocket.OPEN
+            ) {
+                continuousAudioWs.send(JSON.stringify({ type: 'end' }));
+            }
+            if (
+                continuousAudioWs &&
+                [WebSocket.CONNECTING, WebSocket.OPEN].includes(continuousAudioWs.readyState)
+            ) {
+                continuousAudioWs.close();
+            }
+            continuousAudioWs = null;
+
+            if (continuousAudioProcessor) {
+                continuousAudioProcessor.onaudioprocess = null;
+                continuousAudioProcessor.disconnect();
+            }
+            continuousAudioSource?.disconnect();
+            continuousAudioSilence?.disconnect();
+            continuousAudioStream?.getTracks().forEach(track => track.stop());
+            if (continuousAudioContext && continuousAudioContext.state !== 'closed') {
+                await continuousAudioContext.close();
+            }
+
+            continuousAudioStream = null;
+            continuousAudioContext = null;
+            continuousAudioSource = null;
+            continuousAudioProcessor = null;
+            continuousAudioSilence = null;
+            continuousAudioPending = new Int16Array(0);
+            continuousAudioPendingStartMs = null;
+        }
+
         function getMicErrorMessage(error) {
             if (!window.isSecureContext) {
                 return '当前页面不是安全来源，浏览器会禁止麦克风。请用 localhost/127.0.0.1 访问，或改用 HTTPS。';
@@ -7409,14 +7646,20 @@ limitations under the License.
         }
 
         async function prepareSpeechMic() {
-            asrStream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    channelCount: 1,
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true
-                }
-            });
+            if (continuousAudioStream?.getAudioTracks().length) {
+                asrStream = new MediaStream(
+                    continuousAudioStream.getAudioTracks().map(track => track.clone())
+                );
+            } else {
+                asrStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
+                });
+            }
 
             asrAudioContext = new AudioContext();
             asrSource = asrAudioContext.createMediaStreamSource(asrStream);
@@ -8619,6 +8862,7 @@ limitations under the License.
             if (asrRecording || asrStream || asrAudioContext) {
                 await stopSpeech({ sendEnd: false, sendPrompt: false });
             }
+            await stopContinuousAudioIngress();
 
             // Reset overlay buttons
             resetVideoButtons();

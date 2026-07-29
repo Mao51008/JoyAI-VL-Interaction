@@ -64,3 +64,30 @@ source ../.venv/bin/activate
 ```bash
 ./scripts/stop_server.sh
 ```
+
+## 持续音频入口
+
+启动视频流后，浏览器会自动采集单声道 PCM16 音频，并以 40 ms 小包发送到：
+
+```text
+GET /ws/audio-ingress?session_id=<session-id>
+```
+
+每包包含 session ID、序号、浏览器单调时钟时间戳、采样率、sample 数量、
+`voice_active` 标志和 PCM16 数据。服务端默认只保留最近 30 秒音频，避免长时间
+运行导致内存持续增长。
+
+查看单个会话统计：
+
+```text
+GET /api/audio-ingress/status?session_id=<session-id>
+```
+
+可以用环境变量调整缓冲长度：
+
+```bash
+export AUDIO_INGRESS_BUFFER_SECONDS=30
+```
+
+该持续入口在 A2 阶段只负责采集、缓存和统计，不会把无限音频直接送入当前
+final-only ASR；滑动窗口 partial ASR 将在 A3 接入。

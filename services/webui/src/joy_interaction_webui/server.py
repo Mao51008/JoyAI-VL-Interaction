@@ -43,7 +43,7 @@ from aiortc.contrib.media import MediaRelay
 from .vlm_service import SYSTEM_PROMPT_DEFAULT_KEY, VLMService
 from .video_processor import VideoProcessorTrack
 from .rtsp_track import RTSPVideoTrack
-from .asr import setup_asr_routes
+from .asr import cleanup_audio_ingress_session, setup_asr_routes
 from .tts import setup_tts_routes
 from .background_model import BackgroundModelService
 from .local_file_server import setup_local_file_routes
@@ -199,6 +199,7 @@ async def cleanup_session(session_id: str, reset_adapter: bool = True) -> dict:
         return {"session_id": session_id, "removed": False, "reason": "missing_session_id"}
 
     logger.info("[%s] Cleaning up session", session_id)
+    audio_ingress_removed = cleanup_audio_ingress_session(session_id)
 
     session_sockets = list(session_websockets.pop(session_id, set()))
     for ws in session_sockets:
@@ -237,9 +238,10 @@ async def cleanup_session(session_id: str, reset_adapter: bool = True) -> dict:
         await bg_svc.close(cancel_requests=False)
 
     logger.info(
-        "[%s] Session cleanup complete: removed=%s, websockets=%s, peer_connections=%s, cancelled_vlm_tasks=%s, cancelled_background_tasks=%s",
+        "[%s] Session cleanup complete: removed=%s, audio_ingress_removed=%s, websockets=%s, peer_connections=%s, cancelled_vlm_tasks=%s, cancelled_background_tasks=%s",
         session_id,
         bool(session),
+        audio_ingress_removed,
         len(session_sockets),
         len(pcs_for_session),
         cancelled,
@@ -248,6 +250,7 @@ async def cleanup_session(session_id: str, reset_adapter: bool = True) -> dict:
     return {
         "session_id": session_id,
         "removed": bool(session),
+        "audio_ingress_removed": audio_ingress_removed,
         "websockets_closed": len(session_sockets),
         "peer_connections_closed": len(pcs_for_session),
         "cancelled_vlm_tasks": cancelled,
@@ -350,7 +353,9 @@ async def detect_local_service_and_model():
 
 async def index(request):
     """Serve the main HTML page"""
-    content = open(os.path.join(os.path.dirname(__file__), "static", "index.html"), "r").read()
+    index_path = os.path.join(os.path.dirname(__file__), "static", "index.html")
+    with open(index_path, encoding="utf-8") as index_file:
+        content = index_file.read()
     return web.Response(content_type="text/html", text=content)
 
 

@@ -8,6 +8,8 @@ import os
 import struct
 import time
 import uuid
+from collections import deque
+from dataclasses import dataclass, field
 
 import aiohttp
 from aiohttp import web
@@ -45,7 +47,194 @@ ASR_RECOGNIZE_PARAMS = {
 }
 ASR_RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 
+# Continuous microphone ingress. This path deliberately does not invoke ASR yet:
+# A2 establishes a bounded, timestamped audio source; A3 consumes it with
+# sliding-window/streaming recognition.
+AUDIO_INGRESS_SAMPLE_RATE = int(os.getenv("AUDIO_INGRESS_SAMPLE_RATE", "16000"))
+AUDIO_INGRESS_BUFFER_SECONDS = float(os.getenv("AUDIO_INGRESS_BUFFER_SECONDS", "30"))
+AUDIO_INGRESS_SESSION_TTL_SECONDS = float(
+    os.getenv("AUDIO_INGRESS_SESSION_TTL_SECONDS", "3600")
+)
+AUDIO_PACKET_MAGIC = b"JAI1"
+AUDIO_PACKET_VERSION = 1
+AUDIO_PACKET_HEADER = struct.Struct(">4sBBHIdII")
+
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class AudioIngressPacket:
+    session_id: str
+    sequence: int
+    client_monotonic_ms: float
+    sample_rate: int
+    pcm: bytes
+    voice_active: bool = False
+
+
+@dataclass
+class AudioIngressSession:
+    session_id: str
+    sample_rate: int = AUDIO_INGRESS_SAMPLE_RATE
+    buffer_seconds: float = AUDIO_INGRESS_BUFFER_SECONDS
+    chunks: deque[bytes] = field(default_factory=deque)
+    buffered_bytes: int = 0
+    packets_received: int = 0
+    packets_accepted: int = 0
+    packets_dropped: int = 0
+    packets_out_of_order: int = 0
+    voice_active_packets: int = 0
+    reconnects: int = 0
+    active_connections: int = 0
+    last_sequence: int | None = None
+    first_client_monotonic_ms: float | None = None
+    first_server_monotonic_ms: float | None = None
+    last_client_monotonic_ms: float | None = None
+    clock_drift_ms: float | None = None
+    last_seen_server_monotonic: float = field(default_factory=time.monotonic)
+
+    @property
+    def max_buffer_bytes(self) -> int:
+        return max(2, int(self.sample_rate * self.buffer_seconds) * 2)
+
+    def connection_opened(self) -> None:
+        if self.packets_received or self.active_connections:
+            self.reconnects += 1
+        self.active_connections += 1
+        self.last_seen_server_monotonic = time.monotonic()
+
+    def connection_closed(self) -> None:
+        self.active_connections = max(0, self.active_connections - 1)
+        self.last_seen_server_monotonic = time.monotonic()
+
+    def append(self, packet: AudioIngressPacket) -> bool:
+        self.packets_received += 1
+        now = time.monotonic()
+        self.last_seen_server_monotonic = now
+
+        if packet.sample_rate != self.sample_rate:
+            raise ValueError(
+                f"unexpected audio sample rate {packet.sample_rate}; expected {self.sample_rate}"
+            )
+        if len(packet.pcm) % 2:
+            raise ValueError("PCM16 payload byte length must be even")
+
+        if self.last_sequence is not None:
+            if packet.sequence <= self.last_sequence:
+                self.packets_out_of_order += 1
+                return False
+            self.packets_dropped += max(0, packet.sequence - self.last_sequence - 1)
+        self.last_sequence = packet.sequence
+
+        if self.first_client_monotonic_ms is None:
+            self.first_client_monotonic_ms = packet.client_monotonic_ms
+            self.first_server_monotonic_ms = now * 1000
+        self.last_client_monotonic_ms = packet.client_monotonic_ms
+        if self.first_server_monotonic_ms is not None:
+            client_elapsed = packet.client_monotonic_ms - self.first_client_monotonic_ms
+            server_elapsed = now * 1000 - self.first_server_monotonic_ms
+            self.clock_drift_ms = client_elapsed - server_elapsed
+
+        self.chunks.append(packet.pcm)
+        self.buffered_bytes += len(packet.pcm)
+        if packet.voice_active:
+            self.voice_active_packets += 1
+        while self.buffered_bytes > self.max_buffer_bytes and self.chunks:
+            self.buffered_bytes -= len(self.chunks.popleft())
+        self.packets_accepted += 1
+        return True
+
+    def pcm_snapshot(self) -> bytes:
+        return b"".join(self.chunks)
+
+    def status(self) -> dict:
+        return {
+            "session_id": self.session_id,
+            "sample_rate": self.sample_rate,
+            "buffer_limit_seconds": self.buffer_seconds,
+            "buffered_seconds": round(self.buffered_bytes / (self.sample_rate * 2), 3),
+            "packets_received": self.packets_received,
+            "packets_accepted": self.packets_accepted,
+            "packets_dropped": self.packets_dropped,
+            "packets_out_of_order": self.packets_out_of_order,
+            "voice_active_packets": self.voice_active_packets,
+            "reconnects": self.reconnects,
+            "active_connections": self.active_connections,
+            "last_sequence": self.last_sequence,
+            "last_client_monotonic_ms": self.last_client_monotonic_ms,
+            "clock_drift_ms": (
+                round(self.clock_drift_ms, 3)
+                if self.clock_drift_ms is not None
+                else None
+            ),
+        }
+
+
+audio_ingress_sessions: dict[str, AudioIngressSession] = {}
+
+
+def parse_audio_ingress_packet(data: bytes) -> AudioIngressPacket:
+    if len(data) < AUDIO_PACKET_HEADER.size:
+        raise ValueError(
+            f"audio ingress packet shorter than {AUDIO_PACKET_HEADER.size}-byte header"
+        )
+    magic, version, flags, session_id_bytes, sequence, client_ms, sample_rate, sample_count = (
+        AUDIO_PACKET_HEADER.unpack(data[: AUDIO_PACKET_HEADER.size])
+    )
+    if magic != AUDIO_PACKET_MAGIC:
+        raise ValueError("invalid audio ingress packet magic")
+    if version != AUDIO_PACKET_VERSION:
+        raise ValueError(f"unsupported audio ingress packet version {version}")
+    session_start = AUDIO_PACKET_HEADER.size
+    session_end = session_start + session_id_bytes
+    if len(data) < session_end:
+        raise ValueError("audio ingress packet has truncated session_id")
+    try:
+        session_id = data[session_start:session_end].decode("utf-8")
+    except UnicodeDecodeError as err:
+        raise ValueError("audio ingress packet session_id is not UTF-8") from err
+    pcm = data[session_end:]
+    if len(pcm) != sample_count * 2:
+        raise ValueError(
+            f"audio ingress sample count mismatch: header={sample_count}, bytes={len(pcm)}"
+        )
+    return AudioIngressPacket(
+        session_id=session_id,
+        sequence=sequence,
+        client_monotonic_ms=client_ms,
+        sample_rate=sample_rate,
+        pcm=pcm,
+        voice_active=bool(flags & 0x01),
+    )
+
+
+def prune_audio_ingress_sessions() -> None:
+    cutoff = time.monotonic() - AUDIO_INGRESS_SESSION_TTL_SECONDS
+    expired = [
+        session_id
+        for session_id, state in audio_ingress_sessions.items()
+        if not state.active_connections and state.last_seen_server_monotonic < cutoff
+    ]
+    for session_id in expired:
+        audio_ingress_sessions.pop(session_id, None)
+
+
+def get_audio_ingress_session(session_id: str) -> AudioIngressSession:
+    prune_audio_ingress_sessions()
+    state = audio_ingress_sessions.get(session_id)
+    if state is None:
+        state = AudioIngressSession(session_id=session_id)
+        audio_ingress_sessions[session_id] = state
+    return state
+
+
+def get_audio_ingress_pcm(session_id: str) -> bytes:
+    state = audio_ingress_sessions.get(session_id)
+    return state.pcm_snapshot() if state is not None else b""
+
+
+def cleanup_audio_ingress_session(session_id: str) -> bool:
+    return audio_ingress_sessions.pop(session_id, None) is not None
 
 
 def mask_secret(value):
@@ -355,5 +544,102 @@ async def asr_websocket_handler(request):
     return ws
 
 
+async def audio_ingress_websocket_handler(request):
+    ws = web.WebSocketResponse(heartbeat=20, max_msg_size=0)
+    await ws.prepare(request)
+
+    session_id = request.query.get("session_id", "").strip() or uuid.uuid4().hex[:8]
+    state = get_audio_ingress_session(session_id)
+    state.connection_opened()
+    logger.info("[%s] Continuous audio ingress connected", session_id)
+    await send_asr_client_json(
+        ws,
+        {
+            "type": "status",
+            "message": "connected",
+            "sample_rate": state.sample_rate,
+            "packet_ms": 40,
+            "buffer_seconds": state.buffer_seconds,
+        },
+    )
+
+    try:
+        async for msg in ws:
+            if msg.type == web.WSMsgType.BINARY:
+                try:
+                    packet = parse_audio_ingress_packet(msg.data)
+                    if packet.session_id != session_id:
+                        raise ValueError(
+                            "audio ingress packet session_id does not match websocket session"
+                        )
+                    state.append(packet)
+                except ValueError as err:
+                    await send_asr_client_json(
+                        ws,
+                        {"type": "error", "message": str(err)},
+                    )
+            elif msg.type == web.WSMsgType.TEXT:
+                try:
+                    control = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    continue
+                if control.get("type") == "ping":
+                    await send_asr_client_json(
+                        ws,
+                        {
+                            "type": "pong",
+                            "id": control.get("id"),
+                            "client_ts": control.get("client_ts"),
+                            "server_ts": time.time(),
+                            "stats": state.status(),
+                        },
+                    )
+                elif control.get("type") == "end":
+                    break
+            elif msg.type in {
+                web.WSMsgType.CLOSE,
+                web.WSMsgType.CLOSING,
+                web.WSMsgType.CLOSED,
+            }:
+                break
+            elif msg.type == web.WSMsgType.ERROR:
+                raise ws.exception() or RuntimeError("audio ingress websocket error")
+    except Exception:
+        logger.exception("[%s] Continuous audio ingress failed", session_id)
+    finally:
+        state.connection_closed()
+        if not ws.closed:
+            await ws.close()
+        logger.info(
+            "[%s] Continuous audio ingress closed stats=%s",
+            session_id,
+            state.status(),
+        )
+
+    return ws
+
+
+async def audio_ingress_status_handler(request):
+    session_id = request.query.get("session_id", "").strip()
+    if session_id:
+        state = audio_ingress_sessions.get(session_id)
+        if state is None:
+            return web.json_response(
+                {"error": "unknown session_id", "session_id": session_id},
+                status=404,
+            )
+        return web.json_response(state.status())
+    prune_audio_ingress_sessions()
+    return web.json_response(
+        {
+            "sessions": [
+                state.status() for state in audio_ingress_sessions.values()
+            ]
+        }
+    )
+
+
 def setup_asr_routes(app):
     app.router.add_get("/ws/asr", asr_websocket_handler)
+    app.router.add_get("/ws/audio-ingress", audio_ingress_websocket_handler)
+    app.router.add_get("/api/audio-ingress/status", audio_ingress_status_handler)
