@@ -24,7 +24,7 @@ DEFAULT_LABEL_PROMPTS = (
 class ClapAudioEventConfig:
     model: str = "laion/clap-htsat-unfused"
     device: str = "cpu"
-    confidence_threshold: float = 0.55
+    confidence_threshold: float = 0.4
     cooldown_seconds: float = 2.0
     label_prompts: tuple[tuple[str, str], ...] = DEFAULT_LABEL_PROMPTS
 

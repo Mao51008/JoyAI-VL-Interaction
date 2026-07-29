@@ -269,7 +269,7 @@ def configure_continuous_asr_from_env() -> None:
             model=os.getenv("AUDIO_EVENT_CLAP_MODEL", "laion/clap-htsat-unfused"),
             device=os.getenv("AUDIO_EVENT_CLAP_DEVICE", "cpu"),
             confidence_threshold=float(
-                os.getenv("AUDIO_EVENT_CONFIDENCE_THRESHOLD", "0.55")
+                os.getenv("AUDIO_EVENT_CONFIDENCE_THRESHOLD", "0.4")
             ),
             cooldown_seconds=float(os.getenv("AUDIO_EVENT_COOLDOWN_SECONDS", "2")),
         )
