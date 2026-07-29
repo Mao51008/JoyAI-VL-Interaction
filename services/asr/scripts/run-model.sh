@@ -14,6 +14,7 @@ ASR_PORT="${ASR_PORT:-8993}"
 ASR_GPU="${ASR_GPU:-2}"
 ASR_TENSOR_PARALLEL_SIZE="${ASR_TENSOR_PARALLEL_SIZE:-1}"
 ASR_GPU_MEMORY_UTILIZATION="${ASR_GPU_MEMORY_UTILIZATION:-0.3}"
+ASR_MAX_MODEL_LEN="${ASR_MAX_MODEL_LEN:-8192}"
 ASR_MODEL_LOG_FILE=""
 if [[ "${SAVE_SERVICE_LOGS:-0}" == "1" ]]; then
   ASR_LOG_DIR="${ASR_LOG_DIR:-${SERVICE_DIR}/logs}"
@@ -46,4 +47,5 @@ exec env CUDA_VISIBLE_DEVICES="$ASR_GPU" vllm serve "$ASR_MODEL_DIR" \
   --port "$ASR_PORT" \
   --tensor-parallel-size "$ASR_TENSOR_PARALLEL_SIZE" \
   --gpu-memory-utilization "$ASR_GPU_MEMORY_UTILIZATION" \
+  --max-model-len "$ASR_MAX_MODEL_LEN" \
   --trust-remote-code
