@@ -41,7 +41,13 @@ fi
 
 # shellcheck source=/dev/null
 source "$ASR_VENV_DIR/bin/activate"
-exec env CUDA_VISIBLE_DEVICES="$ASR_GPU" vllm serve "$ASR_MODEL_DIR" \
+if command -v qwen-asr-serve >/dev/null 2>&1; then
+  ASR_SERVER_COMMAND=(qwen-asr-serve)
+else
+  ASR_SERVER_COMMAND=(vllm serve)
+fi
+
+exec env CUDA_VISIBLE_DEVICES="$ASR_GPU" "${ASR_SERVER_COMMAND[@]}" "$ASR_MODEL_DIR" \
   --served-model-name "$ASR_MODEL_NAME" \
   --host "$ASR_HOST" \
   --port "$ASR_PORT" \
