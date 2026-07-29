@@ -14,6 +14,8 @@ DEFAULT_LABEL_PROMPTS = (
     ("smoke_alarm", "the sound of a smoke detector alarm"),
     ("glass_break", "the sound of glass breaking"),
     ("explosion", "the sound of an explosion"),
+    ("speech", "a person speaking"),
+    ("music", "music playing"),
     ("background", "ordinary quiet indoor background sound"),
 )
 
@@ -109,7 +111,9 @@ class ClapAudioEventDetector:
 
     async def detect(self, window: AudioWindow) -> list[AudioEventDetection]:
         label, confidence = await asyncio.to_thread(self.backend.classify, window)
-        if label == "background" or confidence < self.config.confidence_threshold:
+        if label in {"background", "speech", "music"} or (
+            confidence < self.config.confidence_threshold
+        ):
             return []
         last_emitted = self._last_emitted_ms.get(label, float("-inf"))
         if window.end_ms - last_emitted < self.config.cooldown_seconds * 1000:
