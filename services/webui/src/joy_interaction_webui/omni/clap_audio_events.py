@@ -45,7 +45,7 @@ class ClapAudioEventBackend:
         self._model = ClapModel.from_pretrained(self.config.model).to(self.config.device)
         self._model.eval()
 
-    def classify(self, window: AudioWindow) -> tuple[str, float]:
+    def score(self, window: AudioWindow) -> list[tuple[str, float]]:
         import torch
 
         waveform = np.frombuffer(window.pcm, dtype="<i2").astype(np.float32) / 32768.0
@@ -61,9 +61,16 @@ class ClapAudioEventBackend:
             )
             inputs = {name: value.to(self.config.device) for name, value in inputs.items()}
             scores = self._model(**inputs).logits_per_audio.softmax(dim=-1)[0]
-            index = int(scores.argmax().item())
-            confidence = float(scores[index].item())
-        return self.config.label_prompts[index][0], confidence
+            confidences = scores.detach().cpu().tolist()
+        return [
+            (label, float(confidence))
+            for (label, _), confidence in zip(
+                self.config.label_prompts, confidences, strict=True
+            )
+        ]
+
+    def classify(self, window: AudioWindow) -> tuple[str, float]:
+        return max(self.score(window), key=lambda item: item[1])
 
 
 class ClapAudioEventDetector:
