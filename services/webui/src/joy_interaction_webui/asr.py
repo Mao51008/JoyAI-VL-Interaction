@@ -110,6 +110,7 @@ class AudioIngressSession:
     first_server_monotonic_ms: float | None = None
     last_client_monotonic_ms: float | None = None
     clock_drift_ms: float | None = None
+    continuous_asr_stats: dict = field(default_factory=dict)
     last_seen_server_monotonic: float = field(default_factory=time.monotonic)
 
     @property
@@ -219,6 +220,7 @@ class AudioIngressSession:
             "clock_drift_ms": (
                 round(self.clock_drift_ms, 3) if self.clock_drift_ms is not None else None
             ),
+            "continuous_asr": dict(self.continuous_asr_stats),
         }
 
 
@@ -675,6 +677,8 @@ async def audio_ingress_websocket_handler(request):
     if audio_ingress_coordinator_factory is not None:
 
         async def emit_audio_event(event):
+            state.continuous_asr_stats = dict(coordinator.stats)
+            state.continuous_asr_stats["last_event"] = event.kind
             if not ws.closed:
                 await send_asr_client_json(ws, event.to_dict())
 
@@ -706,6 +710,8 @@ async def audio_ingress_websocket_handler(request):
                 except json.JSONDecodeError:
                     continue
                 if control.get("type") == "ping":
+                    if coordinator is not None:
+                        state.continuous_asr_stats = dict(coordinator.stats)
                     await send_asr_client_json(
                         ws,
                         {
@@ -731,6 +737,7 @@ async def audio_ingress_websocket_handler(request):
     finally:
         if coordinator is not None:
             await coordinator.stop()
+            state.continuous_asr_stats = dict(coordinator.stats)
         state.connection_closed()
         if not ws.closed:
             await ws.close()
