@@ -13,6 +13,11 @@ from dataclasses import dataclass, field
 import aiohttp
 from aiohttp import web
 
+from joy_interaction_webui.omni.clap_audio_events import (
+    ClapAudioEventBackend,
+    ClapAudioEventConfig,
+    ClapAudioEventDetector,
+)
 from joy_interaction_webui.omni.events import AudioWindow
 from joy_interaction_webui.omni.streaming_asr import (
     StreamingASRConfig,
@@ -257,6 +262,18 @@ def configure_continuous_asr_from_env() -> None:
         ),
         stable_observations=int(os.getenv("CONTINUOUS_ASR_STABLE_OBSERVATIONS", "2")),
     )
+    detector_config = None
+    detector_backend = None
+    if os.getenv("AUDIO_EVENT_DETECTOR", "").lower() == "clap":
+        detector_config = ClapAudioEventConfig(
+            model=os.getenv("AUDIO_EVENT_CLAP_MODEL", "laion/clap-htsat-unfused"),
+            device=os.getenv("AUDIO_EVENT_CLAP_DEVICE", "cpu"),
+            confidence_threshold=float(
+                os.getenv("AUDIO_EVENT_CONFIDENCE_THRESHOLD", "0.55")
+            ),
+            cooldown_seconds=float(os.getenv("AUDIO_EVENT_COOLDOWN_SECONDS", "2")),
+        )
+        detector_backend = ClapAudioEventBackend(detector_config)
 
     def factory(*, session_id, snapshot, emit):
         return StreamingASRCoordinator(
@@ -264,6 +281,11 @@ def configure_continuous_asr_from_env() -> None:
             snapshot,
             VllmWindowTranscriber(transcriber_config),
             emit,
+            detector=(
+                ClapAudioEventDetector(detector_config, detector_backend)
+                if detector_config is not None and detector_backend is not None
+                else None
+            ),
             config=coordinator_config,
         )
 
@@ -275,6 +297,13 @@ def configure_continuous_asr_from_env() -> None:
         coordinator_config.interval_seconds,
         coordinator_config.window_seconds,
     )
+    if detector_config is not None:
+        logger.info(
+            "CLAP audio event detector enabled: model=%s device=%s threshold=%.2f",
+            detector_config.model,
+            detector_config.device,
+            detector_config.confidence_threshold,
+        )
 
 
 configure_continuous_asr_from_env()
@@ -641,7 +670,7 @@ async def asr_websocket_handler(request):
         logger.exception("[%s] ASR websocket failed", session_id)
         try:
             await send_asr_client_json(ws, {"type": "error", "message": f"ASR failed: {err}"})
-        except Exception:
+        except Exception:  # noqa: BLE001,S110
             pass
     finally:
         if asr_ws is not None and not asr_ws.closed:

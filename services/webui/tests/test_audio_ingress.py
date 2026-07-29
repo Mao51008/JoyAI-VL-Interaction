@@ -17,6 +17,10 @@ from joy_interaction_webui.asr import (
     setup_asr_routes,
 )
 from joy_interaction_webui.omni.audio_events import AudioEventDetection
+from joy_interaction_webui.omni.clap_audio_events import (
+    ClapAudioEventConfig,
+    ClapAudioEventDetector,
+)
 from joy_interaction_webui.omni.events import AudioWindow
 from joy_interaction_webui.omni.stable_prefix import StablePrefixTracker
 from joy_interaction_webui.omni.streaming_asr import (
@@ -345,6 +349,40 @@ def test_qwen_asr_language_metadata_is_removed() -> None:
     assert extract_text(
         {"text": "language Chinese<asr_text>甚至出现交易几乎停滞的情况。"}
     ) == "甚至出现交易几乎停滞的情况。"
+
+
+@pytest.mark.asyncio
+async def test_clap_detector_filters_background_threshold_and_cooldown() -> None:
+    class Backend:
+        results = iter(
+            [
+                ("background", 0.99),
+                ("fire_alarm", 0.4),
+                ("fire_alarm", 0.91),
+                ("fire_alarm", 0.95),
+            ]
+        )
+
+        def classify(self, _window):
+            return next(self.results)
+
+    detector = ClapAudioEventDetector(
+        ClapAudioEventConfig(confidence_threshold=0.55, cooldown_seconds=2),
+        Backend(),
+    )
+    windows = [
+        AudioWindow(b"\0\0" * 640, 16000, 0, 400, 1, 0, False),
+        AudioWindow(b"\0\0" * 640, 16000, 400, 800, 2, 0, False),
+        AudioWindow(b"\0\0" * 640, 16000, 800, 1200, 3, 0, False),
+        AudioWindow(b"\0\0" * 640, 16000, 1200, 1600, 4, 0, False),
+    ]
+
+    results = [await detector.detect(window) for window in windows]
+
+    assert results[:2] == [[], []]
+    assert results[2][0].label == "fire_alarm"
+    assert results[2][0].confidence == 0.91
+    assert results[3] == []
 
 
 @pytest.mark.asyncio
