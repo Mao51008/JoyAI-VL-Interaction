@@ -52,10 +52,27 @@ class ClapAudioEventBackend:
         prompts = [prompt for _, prompt in self.config.label_prompts]
         with self._lock, torch.inference_mode():
             self._load()
+            target_rate = int(
+                getattr(self._processor.feature_extractor, "sampling_rate", window.sample_rate)
+            )
+            if target_rate != window.sample_rate and waveform.size:
+                target_samples = round(waveform.size * target_rate / window.sample_rate)
+                source_positions = np.arange(waveform.size, dtype=np.float64)
+                target_positions = np.linspace(
+                    0,
+                    waveform.size - 1,
+                    target_samples,
+                    dtype=np.float64,
+                )
+                waveform = np.interp(
+                    target_positions,
+                    source_positions,
+                    waveform,
+                ).astype(np.float32)
             processor_args = {
                 "text": prompts,
                 "audio": [waveform],
-                "sampling_rate": window.sample_rate,
+                "sampling_rate": target_rate,
                 "return_tensors": "pt",
                 "padding": True,
             }
