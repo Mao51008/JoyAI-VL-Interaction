@@ -297,6 +297,7 @@ def _get_response_frame_indices(messages: list[dict[str, Any]]) -> list[int]:
 
 
 def normalize_model_output(text: str) -> str:
+    """把主模型的原始文本统一整理为 </silence> 或 </response> 格式。"""
     raw = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     if not raw:
         return "</silence>"
@@ -507,6 +508,8 @@ def archive_chunk_response_records(
 
 @dataclass
 class AdapterConfig:
+    """Adapter 的全部运行配置：端口、模型地址、生成参数、分块及摘要策略。"""
+
     host: str = "127.0.0.1"
     port: int = 8070
     adapter_model: str = "streaming-infer-adapter"
@@ -572,6 +575,8 @@ class AdapterConfig:
 
 @dataclass
 class SessionState:
+    """单个视频会话的运行状态，保存当前帧、问题、分块、记忆和输出记录。"""
+
     session_id: str
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     frame_count: int = 0
@@ -608,7 +613,10 @@ class SessionState:
 
 
 class StreamingInferAdapter:
+    """实时推理服务主体：接收 WebUI 请求、维护会话，并转发给 vLLM 模型。"""
+
     def __init__(self, config: AdapterConfig):
+        # 此处只创建 API 客户端，不加载模型权重；权重由独立的 vLLM 进程加载。
         self.config = config
         self.sessions: dict[str, SessionState] = {}
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -671,6 +679,7 @@ class StreamingInferAdapter:
         return self.main_client, self.config.main_model
 
     def get_session(self, session_id: str) -> SessionState:
+        """取得已有会话；首次出现的 session_id 会在这里创建并初始化。"""
         session_id = _safe_session_id(session_id or "default")
         state = self.sessions.get(session_id)
         if state is None:
@@ -725,6 +734,7 @@ class StreamingInferAdapter:
                 LOGGER.exception("session cleanup error")
 
     def start_background_tasks(self) -> None:
+        """服务器启动后创建定时任务，用于清理长时间未访问的会话。"""
         if self._cleanup_task is None:
             self._cleanup_task = asyncio.ensure_future(self._session_cleanup_loop())
 
@@ -745,6 +755,7 @@ class StreamingInferAdapter:
             state.debug_input_dir.mkdir(parents=True, exist_ok=True)
 
     async def handle_models(self, request: web.Request) -> web.Response:
+        """GET /v1/models：返回当前 adapter 可以转发到的主模型列表。"""
         del request
         now = int(time.time())
         data = [
@@ -759,6 +770,7 @@ class StreamingInferAdapter:
         return web.json_response({"object": "list", "data": data})
 
     async def handle_health(self, request: web.Request) -> web.Response:
+        """GET /health：返回服务状态、后端模型、摘要开关和会话数量。"""
         del request
         return web.json_response(
             {
@@ -771,6 +783,7 @@ class StreamingInferAdapter:
         )
 
     async def handle_reset(self, request: web.Request) -> web.Response:
+        """POST /v1/streaming/reset：删除指定会话及其尚未完成的摘要任务。"""
         payload = await _read_json(request)
         session_id = _request_session_id(request, payload)
         session_id = _safe_session_id(session_id)
@@ -783,11 +796,13 @@ class StreamingInferAdapter:
         return web.json_response({"ok": True, "session_id": session_id, "removed": removed})
 
     async def handle_chat_completions(self, request: web.Request) -> web.Response:
+        """POST /v1/chat/completions 的入口：解析请求、定位会话并执行一次推理。"""
         payload = await _read_json(request)
         session_id = _request_session_id(request, payload)
         requested_model = payload.get("model")
         client, model_name = self._resolve_backend(requested_model)
         state = self.get_session(session_id)
+        # 同一会话的帧必须串行处理，否则帧顺序、问题和记忆状态可能相互覆盖。
         async with state.lock:
             try:
                 result = await self._handle_chat_payload(state, payload, request, client=client, model_name=model_name)
@@ -1077,12 +1092,18 @@ class StreamingInferAdapter:
         client: Optional[AsyncOpenAI] = None,
         model_name: Optional[str] = None,
     ) -> dict[str, Any]:
+        """处理一次聊天请求的主流程。
+
+        依次完成：提取文字和图像、更新时间与问题状态、加入当前视频分块、
+        构造带历史记忆的模型输入、调用主模型、记录回答，并按需触发摘要。
+        """
         client = client or self.main_client
         model_name = model_name or self.config.main_model
         t_start = time.perf_counter()
         messages = payload.get("messages") or []
         if not isinstance(messages, list):
             raise web.HTTPBadRequest(text="messages must be a list")
+        # 检查是否要临时切换系统提示词
         header_system_prompt_key = request.headers.get("x-system-prompt-key", "").strip()
         if header_system_prompt_key and not payload.get("system_prompt_key"):
             payload = dict(payload)
@@ -1093,7 +1114,9 @@ class StreamingInferAdapter:
             return await self._forward_text_only(payload, client=client, model_name=model_name)
 
         turn_count = len(state.predictions) + 1
+        # raw是包含时间标记的用户文字
         raw_prompt_text = _extract_user_prompt_text(messages)
+        # 从用户文字中移除时间标记 
         prompt_text = _strip_time_range_from_text(raw_prompt_text)
 
         # Resolve time ranges for all images
@@ -1104,12 +1127,15 @@ class StreamingInferAdapter:
                 single = _extract_time_range_from_text(raw_prompt_text)
             if single:
                 incoming_time_ranges = [single]
+
+        # time_ranges 是每张图各自的时间
         time_ranges: list[str] = []
         for i in range(len(image_refs)):
             if i < len(incoming_time_ranges) and incoming_time_ranges[i]:
                 time_ranges.append(incoming_time_ranges[i])
             else:
                 time_ranges.append(self._time_range_for_frame(state.frame_count + i))
+        # time_range 是本次请求的整体时间
         time_range = _format_turn_time_range(time_ranges)
 
         image_paths = [self._resolve_frame_ref(ref, state) for ref in image_refs]
@@ -1126,15 +1152,31 @@ class StreamingInferAdapter:
 
         query_text = self._update_query_state(state, prompt_text, time_ranges[0])
 
+        # 检查之前后台生成的视频摘要，是否已经到了应该并入当前会话状态的时间点
         await self._commit_required_async_summaries(
             state, state.turn_count, non_blocking=True,
         )
+
+        '''
+        至此已完成：
+            确定模型客户端
+            → 读取 messages
+            → 选择系统提示词
+            → 提取图片
+            → 判断纯文本或视频请求
+            → 提取用户问题
+            → 确定每帧时间
+            → 验证图片引用
+            → 更新当前问题
+            → 检查此前异步摘要
+        '''
 
         if (
             self.config.chunk > 0
             and state.current_chunk["turn_count"] >= self.config.chunk
         ):
             self._execute_pending_qa_archive(state)
+            # 完成了摘要的回答可以归档
             carry_response_records = []
             if self.config.keep_qa_history and state.current_query_text:
                 qa_cutoff = float("inf")
@@ -1182,6 +1224,7 @@ class StreamingInferAdapter:
             state.chunk_index += 1
             state.query_in_current_chunk = bool(query_text)
 
+        # 把本轮图片加入当前分块
         for tr, ip in zip(time_ranges, image_paths):
             state.frame_count += 1
             state.current_chunk["image_paths"].append(str(ip))
@@ -1192,6 +1235,7 @@ class StreamingInferAdapter:
         state.turn_count += 1
         state.current_chunk["turn_count"] += 1
 
+        # 构造本轮用户消息
         user_message = self._build_internal_user_message(
             time_ranges=time_ranges,
             image_paths=[str(ip) for ip in image_paths],
@@ -1206,6 +1250,7 @@ class StreamingInferAdapter:
                 query_text=query_text,
             )
 
+        # 保存调试信息
         turn_input_record = {
             "source_message": messages[-1] if messages else None,
             "vllm_message": user_message,
@@ -1218,6 +1263,7 @@ class StreamingInferAdapter:
             "image_paths": list(state.current_chunk["image_paths"]),
             "frame_time_ranges": list(state.current_chunk["frame_time_ranges"]),
         }
+        # 是否强制沉默
         is_forced_silence = (
             self.config.force_silence_before_query and not state.current_query_text
         )
@@ -1243,11 +1289,16 @@ class StreamingInferAdapter:
             if self.config.save_model_inputs:
                 model_input_record = turn_model_input_record
         else:
+            # 如果不是强制沉默，就进入这里
             t_prompt_build_start = time.perf_counter()
             internal_messages, prefix_content = self._build_main_internal_messages(state)
+            # 将项目内部消息转换成 vLLM 能接收的 OpenAI 消息格式
             api_messages = self._build_cached_api_messages(state, internal_messages)
+            # 准备生成参数
             generation_kwargs = self._main_generation_kwargs(payload)
+            # payload 就是客户端发送过来的 HTTP 请求正文，经过 JSON 解析后得到的 Python 字典
             http_messages = self._build_main_http_messages(api_messages, payload)
+            # 保存“模型最终看到了什么”，方便调试
             turn_model_input_record = build_model_input_record(
                 chunk_index=state.chunk_index,
                 messages=http_messages,
@@ -1268,6 +1319,7 @@ class StreamingInferAdapter:
             )
             t_prompt_build_end = time.perf_counter()
             inference_start = time.time()
+            # 调用模型
             raw_text, usage = await self._call_main_model(
                 payload,
                 api_messages,
@@ -1279,18 +1331,21 @@ class StreamingInferAdapter:
             )
             inference_time = time.time() - inference_start
             t_inference_end = time.perf_counter()
+            # 整理模型输出，即格式化
             generated_text = (
                 normalize_model_output(raw_text)
                 if self.config.normalize_output
                 else (raw_text or "").strip()
             )
 
+        # 把回答加入问答历史
         self._execute_pending_qa_archive(state)
 
         response_payload = extract_response_payload(generated_text)
         if response_payload and state.current_query_text:
             state.current_chunk["response_records"].append((time_range, response_payload))
 
+        # 把模型回答加入当前上下文
         state.current_chunk["messages"].append(
             {"role": "assistant", "content": generated_text}
         )
@@ -1390,6 +1445,7 @@ class StreamingInferAdapter:
         client: Optional[AsyncOpenAI] = None,
         model_name: Optional[str] = None,
     ) -> dict[str, Any]:
+        """没有图像帧时跳过视频状态管理，直接把文本请求转发给主模型。"""
         client = client or self.main_client
         model_name = model_name or self.config.main_model
         generation_kwargs = self._main_generation_kwargs(payload)
@@ -1457,6 +1513,7 @@ class StreamingInferAdapter:
         prompt_text: str,
         time_range: str,
     ) -> Optional[str]:
+        """把本轮非空提示词设为当前问题，并记录问题开始出现的时间。"""
         if not self.config.use_prompt_as_query:
             return None
 
@@ -1527,6 +1584,7 @@ class StreamingInferAdapter:
         self,
         state: SessionState,
     ) -> tuple[list[dict[str, Any]], str]:
+        """将长期记忆、阶段摘要、问答历史和当前视频帧组装成模型上下文。"""
         memory_state = state.memory_state if state.current_query_text else None
         static_content = build_static_system_content(
             memory_state=memory_state,
@@ -1617,6 +1675,7 @@ class StreamingInferAdapter:
         generation_kwargs: Optional[dict[str, Any]] = None,
         http_messages: Optional[list[dict[str, Any]]] = None,
     ) -> tuple[str, Optional[dict[str, Any]]]:
+        """通过 OpenAI 兼容接口调用本机 vLLM，并返回模型原文及 token 用量。"""
         client = client or self.main_client
         model_name = model_name or self.config.main_model
         generation_kwargs = generation_kwargs or self._main_generation_kwargs(inbound_payload)
@@ -1659,6 +1718,7 @@ class StreamingInferAdapter:
         }
 
     async def _flush_chunk(self, state: SessionState, use_async_summary: bool = False) -> None:
+        """结束当前视频分块：生成/提交阶段摘要，然后推进到下一个分块。"""
         current_chunk = state.current_chunk
         if current_chunk["frame_count"] <= 0:
             return
@@ -1739,6 +1799,7 @@ class StreamingInferAdapter:
         return entry, elapsed
 
     def _compress_mid_terms(self, state: SessionState) -> None:
+        """将累计的多个阶段摘要压缩为更短的长期记忆。"""
         assert self.summarizer is not None
         batch_index = state.long_term_compression_next_index
         state.long_term_compression_next_index += 1
@@ -2324,6 +2385,7 @@ def _split_paths(value: str) -> tuple[str, ...]:
 
 
 def parse_args() -> AdapterConfig:
+    """读取命令行参数和环境变量，生成统一的 AdapterConfig。"""
     parser = argparse.ArgumentParser(description="StreamingHarness live OpenAI adapter")
     parser.add_argument("--host", default=os.environ.get("ADAPTER_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=_env_int("ADAPTER_PORT", 8070))
@@ -2727,6 +2789,7 @@ def parse_args() -> AdapterConfig:
 
 
 def create_app(config: AdapterConfig) -> web.Application:
+    """创建 aiohttp 应用，初始化 adapter，并把 URL 注册到对应处理函数。"""
     adapter = StreamingInferAdapter(config)
     app = web.Application(client_max_size=128 * 1024 * 1024)
     app["adapter"] = adapter
@@ -2741,6 +2804,7 @@ def create_app(config: AdapterConfig) -> web.Application:
 
 
 def main() -> None:
+    """程序入口：读取配置、打印启动信息并监听 adapter 的 HTTP 端口。"""
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
