@@ -38,13 +38,19 @@ def pcm16_to_wav(pcm: bytes, sample_rate: int) -> bytes:
 def extract_text(payload: dict[str, Any]) -> str:
     text = payload.get("text")
     if isinstance(text, str):
-        return text.strip()
+        return normalize_qwen_asr_text(text)
     choices = payload.get("choices")
     if isinstance(choices, list) and choices:
         content = (choices[0] or {}).get("message", {}).get("content")
         if isinstance(content, str):
-            return content.strip()
+            return normalize_qwen_asr_text(content)
     return ""
+
+
+def normalize_qwen_asr_text(text: str) -> str:
+    """Remove the language metadata emitted by Qwen3-ASR's vLLM wrapper."""
+    _, marker, transcript = text.partition("<asr_text>")
+    return (transcript if marker else text).strip()
 
 
 def is_pathological_repetition(text: str) -> bool:

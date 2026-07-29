@@ -27,6 +27,7 @@ from joy_interaction_webui.omni.streaming_asr import (
 from joy_interaction_webui.omni.vllm_asr import (
     VllmASRConfig,
     VllmWindowTranscriber,
+    extract_text,
     is_pathological_repetition,
     pcm16_to_wav,
 )
@@ -338,6 +339,12 @@ def test_pathological_asr_repetition_filter() -> None:
     assert is_pathological_repetition("Yeah! " * 20)
     assert is_pathological_repetition("报警" * 10)
     assert not is_pathological_repetition("办公室里有人说发生了火灾，请立即撤离")
+
+
+def test_qwen_asr_language_metadata_is_removed() -> None:
+    assert extract_text(
+        {"text": "language Chinese<asr_text>甚至出现交易几乎停滞的情况。"}
+    ) == "甚至出现交易几乎停滞的情况。"
 
 
 @pytest.mark.asyncio
