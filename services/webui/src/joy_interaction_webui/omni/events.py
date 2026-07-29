@@ -13,6 +13,7 @@ class AudioWindow:
     last_sequence: int
     voice_ratio: float = 0.0
     latest_voice_active: bool = False
+    last_voice_ms: float | None = None
 
 
 @dataclass(frozen=True)

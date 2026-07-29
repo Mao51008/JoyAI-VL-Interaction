@@ -199,6 +199,10 @@ class AudioIngressSession:
         if len(pcm) > byte_limit:
             pcm = pcm[-byte_limit:]
         voice_count = sum(chunk.voice_active for chunk in selected)
+        last_voice_ms = next(
+            (chunk.end_ms for chunk in reversed(selected) if chunk.voice_active),
+            None,
+        )
         return AudioWindow(
             pcm=pcm,
             sample_rate=self.sample_rate,
@@ -207,6 +211,7 @@ class AudioIngressSession:
             last_sequence=selected[-1].sequence,
             voice_ratio=voice_count / len(selected),
             latest_voice_active=selected[-1].voice_active,
+            last_voice_ms=last_voice_ms,
         )
 
     def status(self) -> dict:

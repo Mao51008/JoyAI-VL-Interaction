@@ -51,6 +51,7 @@ class StreamingASRCoordinator:
         self.speech_active = False
         self.speech_start_ms = 0.0
         self.last_voice_ms: float | None = None
+        self.last_observed_voice_ms = float("-inf")
         self.last_sequence = -1
         self.running = False
         self._task: asyncio.Task | None = None
@@ -106,14 +107,26 @@ class StreamingASRCoordinator:
             return
         self.last_sequence = window.last_sequence
 
-        if window.latest_voice_active:
-            self.last_voice_ms = window.end_ms
+        window_last_voice_ms = (
+            window.last_voice_ms
+            if window.last_voice_ms is not None
+            else (window.end_ms if window.latest_voice_active else None)
+        )
+        if (
+            window_last_voice_ms is not None
+            and window_last_voice_ms > self.last_observed_voice_ms
+        ):
+            self.last_observed_voice_ms = window_last_voice_ms
+            self.last_voice_ms = window_last_voice_ms
             if not self.speech_active:
                 self.speech_active = True
-                self.speech_start_ms = window.end_ms
+                self.speech_start_ms = window.start_ms
                 await self._emit(
                     AudioTimelineEvent(
-                        self.session_id, "speech_start", window.end_ms, window.end_ms
+                        self.session_id,
+                        "speech_start",
+                        self.speech_start_ms,
+                        self.speech_start_ms,
                     )
                 )
 
