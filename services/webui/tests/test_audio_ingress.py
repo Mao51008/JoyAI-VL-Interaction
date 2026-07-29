@@ -242,20 +242,14 @@ async def test_streaming_coordinator_emits_partial_stable_end_and_audio_event() 
     await coordinator.process_once()
 
     kinds = [event.kind for event in events]
-    assert kinds == [
-        "speech_start",
-        "speech_partial",
-        "audio_event",
-        "speech_partial",
-        "speech_stable",
-        "speech_partial",
-        "speech_stable",
-        "speech_final",
-        "speech_end",
-    ]
-    assert events[3].stable_prefix == "发生"
-    assert events[2].to_dict()["label"] == "fire_alarm"
-    assert events[2].to_dict()["confidence"] == 0.91
+    assert kinds[0] == "speech_start"
+    assert kinds[-2:] == ["speech_final", "speech_end"]
+    assert kinds.count("speech_partial") == 3
+    assert kinds.count("speech_stable") == 2
+    alarm = next(event for event in events if event.kind == "audio_event")
+    assert alarm.to_dict()["label"] == "fire_alarm"
+    assert alarm.to_dict()["confidence"] == 0.91
+    assert any(event.stable_prefix == "发生" for event in events)
 
 
 @pytest.mark.asyncio

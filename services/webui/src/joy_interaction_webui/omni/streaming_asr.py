@@ -67,6 +67,37 @@ class StreamingASRCoordinator:
         self.stats["events"] += 1
         await self.emit(event)
 
+    async def _detect_and_emit(self, window: AudioWindow) -> None:
+        try:
+            detections = await self.detector.detect(window)
+        except Exception as err:  # noqa: BLE001
+            self.stats["detector_errors"] += 1
+            await self._emit(
+                AudioTimelineEvent(
+                    self.session_id,
+                    "audio_event_error",
+                    window.start_ms,
+                    window.end_ms,
+                    metadata={
+                        "error_type": type(err).__name__,
+                        "message": str(err),
+                    },
+                )
+            )
+            return
+
+        for detection in detections:
+            await self._emit(
+                AudioTimelineEvent(
+                    self.session_id,
+                    "audio_event",
+                    detection.start_ms,
+                    detection.end_ms,
+                    label=detection.label,
+                    confidence=detection.confidence,
+                )
+            )
+
     async def process_once(self) -> None:
         self.stats["ticks"] += 1
         window = self.snapshot(self.config.window_seconds)
@@ -86,35 +117,7 @@ class StreamingASRCoordinator:
                     )
                 )
 
-        try:
-            detections = await self.detector.detect(window)
-        except Exception as err:  # noqa: BLE001
-            self.stats["detector_errors"] += 1
-            await self._emit(
-                AudioTimelineEvent(
-                    self.session_id,
-                    "audio_event_error",
-                    window.start_ms,
-                    window.end_ms,
-                    metadata={
-                        "error_type": type(err).__name__,
-                        "message": str(err),
-                    },
-                )
-            )
-            detections = []
-
-        for detection in detections:
-            await self._emit(
-                AudioTimelineEvent(
-                    self.session_id,
-                    "audio_event",
-                    detection.start_ms,
-                    detection.end_ms,
-                    label=detection.label,
-                    confidence=detection.confidence,
-                )
-            )
+        detector_task = asyncio.create_task(self._detect_and_emit(window))
 
         if self.speech_active:
             self.stats["requests"] += 1
@@ -135,6 +138,7 @@ class StreamingASRCoordinator:
                         },
                     )
                 )
+                await detector_task
                 return
             previous_stable = self.tracker.stable
             stable, _ = self.tracker.update(result.text)
@@ -186,6 +190,7 @@ class StreamingASRCoordinator:
                 self.speech_active = False
                 self.last_voice_ms = None
                 self.tracker.reset()
+        await detector_task
 
     async def _run(self) -> None:
         while self.running:
