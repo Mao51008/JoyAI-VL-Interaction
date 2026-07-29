@@ -43,6 +43,7 @@ from aiortc.contrib.media import MediaRelay
 from .asr import cleanup_audio_ingress_session, setup_asr_routes
 from .background_model import BackgroundModelService
 from .local_file_server import setup_local_file_routes
+from .omni.decision import cleanup_decision_engine, install_fake_decision_engine
 from .omni.orchestrator import cleanup_orchestrator, get_or_create_orchestrator
 from .omni.timeline import TimelineEvent
 from .rtsp_track import RTSPVideoTrack
@@ -190,6 +191,16 @@ def get_or_create_session(session_id: str):
             "show_response_payload": False,
             "show_memory_state": False,
         }
+        if os.getenv("OMNI_DECISION_MODE", "").lower() == "fake":
+            orchestrator = get_or_create_orchestrator(session_id)
+            orchestrator.start()
+            sessions[session_id]["omni_decision_engine"] = install_fake_decision_engine(
+                orchestrator,
+                callback=lambda record, sid=session_id: notify_session_json(
+                    sid,
+                    {"type": "omni_decision", "decision": record.to_dict()},
+                ),
+            )
         logger.info(f"Created new session: {session_id}")
     return sessions[session_id]
 
@@ -304,6 +315,7 @@ async def cleanup_session(session_id: str, reset_adapter: bool = True) -> dict:
         bg_svc = session["background_service"]
         cancelled_background = await bg_svc.cancel_active_requests()
         await bg_svc.close(cancel_requests=False)
+    decision_engine_removed = await cleanup_decision_engine(session_id)
     orchestrator_removed = await cleanup_orchestrator(session_id)
 
     logger.info(
@@ -321,6 +333,7 @@ async def cleanup_session(session_id: str, reset_adapter: bool = True) -> dict:
         "removed": bool(session),
         "audio_ingress_removed": audio_ingress_removed,
         "orchestrator_removed": orchestrator_removed,
+        "decision_engine_removed": decision_engine_removed,
         "websockets_closed": len(session_sockets),
         "peer_connections_closed": len(pcs_for_session),
         "cancelled_vlm_tasks": cancelled,

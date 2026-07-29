@@ -275,6 +275,24 @@ async def run_tts_stream_request(client_ws, data):
         emotion = data.get("emotion") or TTS_EMOTION
         reqid = reqid or f"{data.get('session_id') or 'web'}-{uuid.uuid4().hex[:12]}"
         timeline_start_ms = time.monotonic() * 1000
+        orchestrator = get_or_create_orchestrator(session_id)
+        orchestrator.start()
+        await orchestrator.record_event(
+            TimelineEvent(
+                session_id=session_id,
+                modality="audio",
+                kind="tts_playback",
+                start_ms=timeline_start_ms,
+                end_ms=timeline_start_ms,
+                payload={
+                    "source": "system_output",
+                    "request_id": reqid,
+                    "status": "playing",
+                    "text": timeline_text,
+                },
+                priority=30,
+            )
+        )
 
         await client_ws.send_json(
             {
