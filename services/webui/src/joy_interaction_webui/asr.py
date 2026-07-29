@@ -244,6 +244,8 @@ def configure_continuous_asr_from_env() -> None:
         timeout_seconds=float(os.getenv("CONTINUOUS_ASR_TIMEOUT_SECONDS", "30")),
         retry_attempts=int(os.getenv("CONTINUOUS_ASR_RETRY_ATTEMPTS", "2")),
         retry_delay_seconds=float(os.getenv("CONTINUOUS_ASR_RETRY_DELAY_SECONDS", "0.2")),
+        max_completion_tokens=int(os.getenv("CONTINUOUS_ASR_MAX_COMPLETION_TOKENS", "64")),
+        repetition_penalty=float(os.getenv("CONTINUOUS_ASR_REPETITION_PENALTY", "1.1")),
     )
     coordinator_config = StreamingASRConfig(
         interval_seconds=float(os.getenv("CONTINUOUS_ASR_INTERVAL_SECONDS", "0.4")),

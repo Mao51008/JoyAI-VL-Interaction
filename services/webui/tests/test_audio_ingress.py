@@ -27,6 +27,7 @@ from joy_interaction_webui.omni.streaming_asr import (
 from joy_interaction_webui.omni.vllm_asr import (
     VllmASRConfig,
     VllmWindowTranscriber,
+    is_pathological_repetition,
     pcm16_to_wav,
 )
 
@@ -328,8 +329,15 @@ async def test_vllm_window_transcriber_posts_wav_and_reuses_client() -> None:
     assert len(requests) == 2
     assert all(request.url.path == "/v1/audio/transcriptions" for request, _ in requests)
     assert all(b"test-asr" in body for _, body in requests)
+    assert all(b"max_completion_tokens" in body and b"64" in body for _, body in requests)
     assert pcm16_to_wav(window.pcm, 16000).startswith(b"RIFF")
     await client.aclose()
+
+
+def test_pathological_asr_repetition_filter() -> None:
+    assert is_pathological_repetition("Yeah! " * 20)
+    assert is_pathological_repetition("报警" * 10)
+    assert not is_pathological_repetition("办公室里有人说发生了火灾，请立即撤离")
 
 
 @pytest.mark.asyncio

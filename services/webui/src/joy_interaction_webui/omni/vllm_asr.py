@@ -2,7 +2,9 @@
 
 import asyncio
 import io
+import re
 import wave
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,6 +21,8 @@ class VllmASRConfig:
     timeout_seconds: float = 30.0
     retry_attempts: int = 2
     retry_delay_seconds: float = 0.2
+    max_completion_tokens: int = 64
+    repetition_penalty: float = 1.1
 
 
 def pcm16_to_wav(pcm: bytes, sample_rate: int) -> bytes:
@@ -41,6 +45,19 @@ def extract_text(payload: dict[str, Any]) -> str:
         if isinstance(content, str):
             return content.strip()
     return ""
+
+
+def is_pathological_repetition(text: str) -> bool:
+    tokens = re.findall(r"\w+", text.casefold(), flags=re.UNICODE)
+    if len(tokens) >= 8 and Counter(tokens).most_common(1)[0][1] / len(tokens) >= 0.75:
+        return True
+    compact = re.sub(r"[\W_]+", "", text.casefold(), flags=re.UNICODE)
+    for unit_length in range(1, min(8, len(compact) // 6) + 1):
+        unit = compact[:unit_length]
+        repeats, remainder = divmod(len(compact), unit_length)
+        if remainder == 0 and repeats >= 6 and unit * repeats == compact:
+            return True
+    return False
 
 
 class VllmWindowTranscriber:
@@ -68,11 +85,17 @@ class VllmWindowTranscriber:
             try:
                 response = await self._get_client().post(
                     self.config.url,
-                    data={"model": self.config.model},
+                    data={
+                        "model": self.config.model,
+                        "max_completion_tokens": str(self.config.max_completion_tokens),
+                        "temperature": "0",
+                        "repetition_penalty": str(self.config.repetition_penalty),
+                    },
                     files={"file": ("window.wav", wav_bytes, "audio/wav")},
                 )
                 response.raise_for_status()
-                return TranscriptionResult(extract_text(response.json()))
+                text = extract_text(response.json())
+                return TranscriptionResult("" if is_pathological_repetition(text) else text)
             except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError):
                 if attempt + 1 >= attempts:
                     raise
