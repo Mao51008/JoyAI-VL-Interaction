@@ -52,13 +52,20 @@ class ClapAudioEventBackend:
         prompts = [prompt for _, prompt in self.config.label_prompts]
         with self._lock, torch.inference_mode():
             self._load()
-            inputs = self._processor(
-                text=prompts,
-                audios=[waveform],
-                sampling_rate=window.sample_rate,
-                return_tensors="pt",
-                padding=True,
-            )
+            processor_args = {
+                "text": prompts,
+                "audio": [waveform],
+                "sampling_rate": window.sample_rate,
+                "return_tensors": "pt",
+                "padding": True,
+            }
+            try:
+                inputs = self._processor(**processor_args)
+            except (TypeError, ValueError) as err:
+                if "audio" not in str(err):
+                    raise
+                processor_args["audios"] = processor_args.pop("audio")
+                inputs = self._processor(**processor_args)
             inputs = {name: value.to(self.config.device) for name, value in inputs.items()}
             scores = self._model(**inputs).logits_per_audio.softmax(dim=-1)[0]
             confidences = scores.detach().cpu().tolist()
