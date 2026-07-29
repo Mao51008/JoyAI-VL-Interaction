@@ -412,6 +412,15 @@ async def test_audio_ingress_can_stream_coordinator_events_to_browser() -> None:
             assert start["kind"] == "speech_start"
             assert partial["kind"] == "speech_partial"
             assert partial["text"] == "检测到说话"
+            timeline = await client.get(
+                "/api/timeline?session_id=test-session&lookback_seconds=10"
+            )
+            timeline_payload = await timeline.json()
+            assert [event["kind"] for event in timeline_payload["events"]] == [
+                "speech_start",
+                "speech_partial",
+            ]
+            assert timeline_payload["events"][1]["payload"]["text"] == "检测到说话"
             await ws.close()
     finally:
         set_audio_ingress_coordinator_factory(None)

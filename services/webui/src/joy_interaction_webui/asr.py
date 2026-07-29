@@ -23,6 +23,7 @@ from joy_interaction_webui.omni.streaming_asr import (
     StreamingASRConfig,
     StreamingASRCoordinator,
 )
+from joy_interaction_webui.omni.timeline import TimelineBuffer, TimelineEvent
 from joy_interaction_webui.omni.vllm_asr import VllmASRConfig, VllmWindowTranscriber
 
 # ASR parameters
@@ -116,6 +117,7 @@ class AudioIngressSession:
     last_client_monotonic_ms: float | None = None
     clock_drift_ms: float | None = None
     continuous_asr_stats: dict = field(default_factory=dict)
+    timeline: TimelineBuffer = field(default_factory=TimelineBuffer)
     last_seen_server_monotonic: float = field(default_factory=time.monotonic)
 
     @property
@@ -226,6 +228,7 @@ class AudioIngressSession:
                 round(self.clock_drift_ms, 3) if self.clock_drift_ms is not None else None
             ),
             "continuous_asr": dict(self.continuous_asr_stats),
+            "timeline_events": len(self.timeline),
         }
 
 
@@ -706,6 +709,7 @@ async def audio_ingress_websocket_handler(request):
     if audio_ingress_coordinator_factory is not None:
 
         async def emit_audio_event(event):
+            state.timeline.append(TimelineEvent.from_audio(event))
             state.continuous_asr_stats = dict(coordinator.stats)
             state.continuous_asr_stats["last_event"] = event.kind
             if not ws.closed:
@@ -795,7 +799,30 @@ async def audio_ingress_status_handler(request):
     )
 
 
+async def timeline_handler(request):
+    session_id = request.query.get("session_id", "").strip()
+    state = audio_ingress_sessions.get(session_id)
+    if state is None:
+        return web.json_response(
+            {"error": "unknown session_id", "session_id": session_id},
+            status=404,
+        )
+    try:
+        lookback_seconds = float(request.query.get("lookback_seconds", "120"))
+    except ValueError:
+        return web.json_response({"error": "invalid lookback_seconds"}, status=400)
+    lookback_seconds = min(120, max(0.1, lookback_seconds))
+    events = state.timeline.snapshot(lookback_seconds=lookback_seconds)
+    return web.json_response(
+        {
+            "session_id": session_id,
+            "events": [event.to_dict() for event in events],
+        }
+    )
+
+
 def setup_asr_routes(app):
     app.router.add_get("/ws/asr", asr_websocket_handler)
     app.router.add_get("/ws/audio-ingress", audio_ingress_websocket_handler)
     app.router.add_get("/api/audio-ingress/status", audio_ingress_status_handler)
+    app.router.add_get("/api/timeline", timeline_handler)
