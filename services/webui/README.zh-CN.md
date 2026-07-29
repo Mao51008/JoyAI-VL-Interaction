@@ -94,6 +94,23 @@ A3.1 已加入 400 ms 滑动窗口调度器、stable prefix、`speech_start`、
 `speech_partial`、`speech_stable`、`speech_final`、`speech_end` 事件，以及可插拔的环境声音检测接口。
 浏览器能够直接显示调度器发回的实时转写。
 
-真实 Qwen3-ASR 客户端仍属于 A3.2。它通过
-`set_audio_ingress_coordinator_factory(...)` 注入，以免在没有 ASR 服务时影响
-现有视频和手动语音功能；环境声音分类器将在 A3.3 注入同一事件流。
+真实 Qwen3-ASR 客户端已在 A3.2 接入。启动 WebUI 前设置
+`CONTINUOUS_ASR_ENABLED=1` 后，它会把滑动窗口封装为 WAV 并请求
+`/v1/audio/transcriptions`；Qwen 返回的语言元数据会被清理，异常重复输出也会
+被过滤。ASR 暂时不可用时会产生 `asr_error`，后续窗口继续自动重试，不影响
+视频和手动语音功能。环境声音分类器将在 A3.3 注入同一事件流。
+
+```bash
+CONTINUOUS_ASR_ENABLED=1 \
+CONTINUOUS_ASR_URL=http://127.0.0.1:8993/v1/audio/transcriptions \
+CONTINUOUS_ASR_MODEL=Qwen/Qwen3-ASR-1.7B \
+bash services/webui/scripts/start_server.sh
+```
+
+用 16 kHz、单声道、PCM16 WAV 验证连续链路：
+
+```bash
+PYTHONPATH=services/webui/src services/.venv/bin/python \
+  services/webui/tools/continuous_asr_smoke.py <test.wav> \
+  --url wss://127.0.0.1:8099/ws/audio-ingress
+```
