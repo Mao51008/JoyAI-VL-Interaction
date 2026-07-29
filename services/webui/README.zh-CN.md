@@ -83,6 +83,33 @@ GET /ws/audio-ingress?session_id=<session-id>
 GET /api/audio-ingress/status?session_id=<session-id>
 ```
 
+## Omni 多模态时间轴
+
+A4 将音频转写、环境声音、视频采样帧、用户问题、模型动作和 TTS 播放区间统一
+映射到服务器单调时钟。查询最近事件：
+
+```text
+GET /api/timeline?session_id=<session-id>&lookback_seconds=10
+```
+
+查询固定 tick 或高优先级事件产生的多模态快照：
+
+```text
+GET /api/omni/snapshots?session_id=<session-id>&limit=20
+```
+
+默认每秒生成一次最近 10 秒快照，危险声音会立即生成 `priority` 快照。时间轴
+默认最多保留 120 秒/2000 个事件，快照历史最多 256 份。配置项：
+
+```bash
+OMNI_TICK_SECONDS=1
+OMNI_LOOKBACK_SECONDS=10
+OMNI_URGENT_PRIORITY=80
+OMNI_TIMELINE_SECONDS=120
+OMNI_TIMELINE_MAX_EVENTS=2000
+OMNI_MAX_SNAPSHOTS=256
+```
+
 可以用环境变量调整缓冲长度：
 
 ```bash

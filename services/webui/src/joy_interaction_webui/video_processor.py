@@ -19,14 +19,15 @@ Handles video frames, adds text overlays, and manages VLM processing
 """
 
 import asyncio
-import numpy as np
-from PIL import Image
-from aiortc import VideoStreamTrack
-from aiortc.mediastreams import MediaStreamError
-from typing import Optional
 import logging
 import time
+from typing import Optional
+
 import av
+import numpy as np
+from aiortc import VideoStreamTrack
+from aiortc.mediastreams import MediaStreamError
+from PIL import Image
 
 from .vlm_service import VLMService
 
@@ -68,12 +69,14 @@ class VideoProcessorTrack(VideoStreamTrack):
         vlm_service: VLMService,
         text_callback=None,
         background_service=None,
+        timeline_callback=None,
     ):
         super().__init__()
         self.track = track
         self.vlm_service = vlm_service
         self.text_callback = text_callback  # Callback to send text updates
         self.background_service = background_service
+        self.timeline_callback = timeline_callback
         self.last_frame: Optional[np.ndarray] = None
         self.frame_count = 0
         self.dropped_frames = 0
@@ -210,16 +213,22 @@ class VideoProcessorTrack(VideoStreamTrack):
                             wall_time=now,
                         )
                     if need_conversion:
+                        frame_metadata = {
+                            "timestamp": frame_timestamp,
+                            "timestamp_kind": timestamp_kind,
+                            "pts": frame.pts,
+                            "timestamp_interval_seconds": interval_sec,
+                        }
+                        await self._record_timeline_frame(
+                            frame_metadata,
+                            frame_shape=img.shape,
+                            frames_per_batch=frames_per_batch,
+                        )
                         asyncio.create_task(
                             self.vlm_service.process_frame(
                                 pil_img,
                                 frame_timing_ms=frame_timing_ms,
-                                frame_metadata={
-                                    "timestamp": frame_timestamp,
-                                    "timestamp_kind": timestamp_kind,
-                                    "pts": frame.pts,
-                                    "timestamp_interval_seconds": interval_sec,
-                                },
+                                frame_metadata=frame_metadata,
                             )
                         )
                         self._last_process_time = now
@@ -243,7 +252,7 @@ class VideoProcessorTrack(VideoStreamTrack):
                         logger.info(f"First frame received: {img.shape}")
 
                     if need_capture:
-                        self._frame_buffer.append({
+                        captured_frame = {
                             "image": pil_img,
                             "timestamp": frame_timestamp,
                             "timestamp_kind": timestamp_kind,
@@ -255,7 +264,18 @@ class VideoProcessorTrack(VideoStreamTrack):
                                 "bgr_to_rgb_pil_ms": 1000 * (t4 - t3),
                                 "pre_vlm_total_ms": 1000 * (t4 - t1),
                             },
-                        })
+                        }
+                        self._frame_buffer.append(captured_frame)
+                        await self._record_timeline_frame(
+                            {
+                                "timestamp": frame_timestamp,
+                                "timestamp_kind": timestamp_kind,
+                                "pts": frame.pts,
+                                "timestamp_interval_seconds": interval_sec,
+                            },
+                            frame_shape=img.shape,
+                            frames_per_batch=frames_per_batch,
+                        )
                         self._last_sub_capture_time = now
 
                     if background_needs_frame:
@@ -312,6 +332,30 @@ class VideoProcessorTrack(VideoStreamTrack):
         except Exception as e:
             logger.error(f"Error processing frame: {e}", exc_info=True)
             raise
+
+    async def _record_timeline_frame(
+        self,
+        frame_metadata: dict,
+        *,
+        frame_shape,
+        frames_per_batch: int,
+    ) -> None:
+        if self.timeline_callback is None:
+            return
+        metadata = {
+            **frame_metadata,
+            "server_monotonic_ms": time.monotonic() * 1000,
+            "frame_index": self.frame_count,
+            "height": int(frame_shape[0]),
+            "width": int(frame_shape[1]),
+            "frames_per_batch": frames_per_batch,
+        }
+        try:
+            result = self.timeline_callback(metadata)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            logger.warning("Failed to record video frame on Omni timeline", exc_info=True)
 
     def _background_needs_frame(self, wall_time: float) -> bool:
         if not self.background_service:

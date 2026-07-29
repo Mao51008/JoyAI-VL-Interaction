@@ -22,6 +22,7 @@ from joy_interaction_webui.omni.clap_audio_events import (
     ClapAudioEventDetector,
 )
 from joy_interaction_webui.omni.events import AudioWindow
+from joy_interaction_webui.omni.orchestrator import clear_orchestrators
 from joy_interaction_webui.omni.stable_prefix import StablePrefixTracker
 from joy_interaction_webui.omni.streaming_asr import (
     StreamingASRConfig,
@@ -107,6 +108,14 @@ def test_ring_buffer_is_bounded_and_tracks_sequence_gaps() -> None:
     assert window.start_ms == 120.0
     assert window.end_ms == 160.0
     assert not window.latest_voice_active
+    wider_window = state.window_snapshot(0.08)
+    assert wider_window is not None
+    assert wider_window.last_voice_ms == 120.0
+    assert (
+        state.client_to_server_monotonic_ms(160.0)
+        - state.client_to_server_monotonic_ms(120.0)
+        == 40.0
+    )
 
 
 def test_ring_buffer_rejects_unexpected_sample_rate() -> None:
@@ -144,6 +153,7 @@ def test_thirty_minute_stream_keeps_only_last_thirty_seconds() -> None:
 @pytest.mark.asyncio
 async def test_audio_ingress_websocket_reports_stats_and_reconnects() -> None:
     audio_ingress_sessions.clear()
+    await clear_orchestrators()
     app = web.Application()
     setup_asr_routes(app)
 
@@ -172,6 +182,7 @@ async def test_audio_ingress_websocket_reports_stats_and_reconnects() -> None:
         await ws.close()
 
     audio_ingress_sessions.clear()
+    await clear_orchestrators()
 
 
 def test_stable_prefix_grows_monotonically_for_chinese() -> None:
@@ -391,6 +402,7 @@ async def test_audio_ingress_can_stream_coordinator_events_to_browser() -> None:
         )
 
     audio_ingress_sessions.clear()
+    await clear_orchestrators()
     set_audio_ingress_coordinator_factory(factory)
     app = web.Application()
     setup_asr_routes(app)
@@ -419,3 +431,4 @@ async def test_audio_ingress_can_stream_coordinator_events_to_browser() -> None:
     finally:
         set_audio_ingress_coordinator_factory(None)
         audio_ingress_sessions.clear()
+        await clear_orchestrators()

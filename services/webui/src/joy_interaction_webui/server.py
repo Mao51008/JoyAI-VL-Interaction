@@ -33,20 +33,22 @@ from collections import defaultdict
 import aiohttp
 from aiohttp import web
 from aiortc import (
-    RTCPeerConnection,
-    RTCSessionDescription,
     RTCConfiguration,
     RTCIceServer,
+    RTCPeerConnection,
+    RTCSessionDescription,
 )
 from aiortc.contrib.media import MediaRelay
 
-from .vlm_service import SYSTEM_PROMPT_DEFAULT_KEY, VLMService
-from .video_processor import VideoProcessorTrack
-from .rtsp_track import RTSPVideoTrack
 from .asr import cleanup_audio_ingress_session, setup_asr_routes
-from .tts import setup_tts_routes
 from .background_model import BackgroundModelService
 from .local_file_server import setup_local_file_routes
+from .omni.orchestrator import cleanup_orchestrator, get_or_create_orchestrator
+from .omni.timeline import TimelineEvent
+from .rtsp_track import RTSPVideoTrack
+from .tts import setup_tts_routes
+from .video_processor import VideoProcessorTrack
+from .vlm_service import SYSTEM_PROMPT_DEFAULT_KEY, VLMService
 
 # Configure logging
 logging.basicConfig(
@@ -69,9 +71,61 @@ ws_to_session = {}  # ws -> session_id
 session_peer_connections = defaultdict(set)  # session_id -> set of RTCPeerConnection
 
 
+async def record_session_event(
+    session_id: str,
+    *,
+    modality: str,
+    kind: str,
+    payload: dict | None = None,
+    priority: int = 0,
+    monotonic_ms: float | None = None,
+) -> None:
+    orchestrator = get_or_create_orchestrator(session_id)
+    orchestrator.start()
+    event_ms = time.monotonic() * 1000 if monotonic_ms is None else monotonic_ms
+    await orchestrator.record_event(
+        TimelineEvent(
+            session_id=session_id,
+            modality=modality,
+            kind=kind,
+            start_ms=event_ms,
+            end_ms=event_ms,
+            payload=payload or {},
+            priority=priority,
+        )
+    )
+
+
+def get_video_timeline_callback(session_id: str):
+    async def callback(metadata: dict) -> None:
+        await record_session_event(
+            session_id,
+            modality="video",
+            kind="frame",
+            payload=metadata,
+            priority=10,
+            monotonic_ms=float(metadata["server_monotonic_ms"]),
+        )
+
+    return callback
+
+
 def notify_session_json(session_id: str, payload: dict):
     """Send a JSON payload to WebSocket clients in this session."""
     handle_background_handoff_for_interaction(session_id, payload)
+    if isinstance(payload, dict) and payload.get("type") == "background_result_ready":
+        asyncio.create_task(
+            record_session_event(
+                session_id,
+                modality="model",
+                kind="background_result",
+                payload={
+                    "task_id": str(payload.get("task_id") or ""),
+                    "question": str(payload.get("question") or ""),
+                },
+                priority=40,
+            )
+        )
     send_to_session(session_id, json.dumps(payload, ensure_ascii=False))
 
 
@@ -163,6 +217,20 @@ def get_session_callback(session_id: str):
             )
 
         out = {"type": "vlm_response", "text": display_text, "metrics": metrics}
+        action = "silence" if str(text).strip().startswith("</silence>") else "response"
+        asyncio.create_task(
+            record_session_event(
+                session_id,
+                modality="model",
+                kind="model_action",
+                payload={
+                    "action": action,
+                    "text": display_text,
+                    "inference_count": int(metrics.get("total_inferences") or 0),
+                },
+                priority=50 if action == "response" else 5,
+            )
+        )
         if session and session.get("vlm_service"):
             svc = session["vlm_service"]
             if session.get("show_request_payload"):
@@ -236,6 +304,7 @@ async def cleanup_session(session_id: str, reset_adapter: bool = True) -> dict:
         bg_svc = session["background_service"]
         cancelled_background = await bg_svc.cancel_active_requests()
         await bg_svc.close(cancel_requests=False)
+    orchestrator_removed = await cleanup_orchestrator(session_id)
 
     logger.info(
         "[%s] Session cleanup complete: removed=%s, audio_ingress_removed=%s, websockets=%s, peer_connections=%s, cancelled_vlm_tasks=%s, cancelled_background_tasks=%s",
@@ -251,6 +320,7 @@ async def cleanup_session(session_id: str, reset_adapter: bool = True) -> dict:
         "session_id": session_id,
         "removed": bool(session),
         "audio_ingress_removed": audio_ingress_removed,
+        "orchestrator_removed": orchestrator_removed,
         "websockets_closed": len(session_sockets),
         "peer_connections_closed": len(pcs_for_session),
         "cancelled_vlm_tasks": cancelled,
@@ -517,6 +587,14 @@ async def websocket_handler(request):
                         new_prompt = data.get("prompt", "").strip()
                         if svc:
                             svc.update_prompt(new_prompt)
+                            if new_prompt:
+                                await record_session_event(
+                                    session_id,
+                                    modality="text",
+                                    kind="user_query",
+                                    payload={"text": new_prompt},
+                                    priority=60,
+                                )
                             logger.info(f"[{session_id}] Prompt updated: {new_prompt}")
 
                             await ws.send_json(
@@ -840,6 +918,7 @@ async def offer(request):
                 session_vlm,
                 text_callback=session_callback,
                 background_service=background_service,
+                timeline_callback=get_video_timeline_callback(session_id),
             )
 
             # Add processor directly to peer connection
@@ -866,6 +945,7 @@ async def offer(request):
                     session_vlm,
                     text_callback=session_callback,
                     background_service=background_service,
+                    timeline_callback=get_video_timeline_callback(session_id),
                 )
 
                 # Add processed track back to connection
@@ -961,6 +1041,7 @@ async def rtsp_start(request):
             session_vlm,
             text_callback=session_callback,
             background_service=background_service,
+            timeline_callback=get_video_timeline_callback(session_id),
         )
 
         # Start background task to consume frames
@@ -1224,8 +1305,8 @@ def get_app_config_dir():
 
 def generate_self_signed_cert(cert_path="cert.pem", key_path="key.pem"):
     """Generate a self-signed SSL certificate if it doesn't exist"""
-    import subprocess
     import os
+    import subprocess
 
     if os.path.exists(cert_path) and os.path.exists(key_path):
         return True
@@ -1270,6 +1351,7 @@ def main():
     """Main entry point"""
     import argparse
     import ssl
+
     from . import __version__
 
     parser = argparse.ArgumentParser(

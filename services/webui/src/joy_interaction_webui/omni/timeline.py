@@ -32,7 +32,13 @@ class TimelineEvent:
         }
 
     @classmethod
-    def from_audio(cls, event: AudioTimelineEvent) -> "TimelineEvent":
+    def from_audio(
+        cls,
+        event: AudioTimelineEvent,
+        *,
+        start_ms: float | None = None,
+        end_ms: float | None = None,
+    ) -> "TimelineEvent":
         payload = {
             key: value
             for key, value in (
@@ -44,13 +50,14 @@ class TimelineEvent:
             )
             if value not in ("", None)
         }
+        payload["source"] = "microphone"
         priority = 100 if event.kind == "audio_event" else 20
         return cls(
             session_id=event.session_id,
             modality="audio",
             kind=event.kind,
-            start_ms=event.start_ms,
-            end_ms=event.end_ms,
+            start_ms=event.start_ms if start_ms is None else start_ms,
+            end_ms=event.end_ms if end_ms is None else end_ms,
             payload=payload,
             priority=priority,
         )
@@ -101,6 +108,10 @@ class TimelineBuffer:
 
     def replay(self) -> list[dict[str, Any]]:
         return [event.to_dict() for event in self.snapshot()]
+
+    @property
+    def latest_ms(self) -> float:
+        return self._latest_ms
 
     def __len__(self) -> int:
         return len(self._events)

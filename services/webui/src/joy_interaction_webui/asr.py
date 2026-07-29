@@ -19,11 +19,15 @@ from joy_interaction_webui.omni.clap_audio_events import (
     ClapAudioEventDetector,
 )
 from joy_interaction_webui.omni.events import AudioWindow
+from joy_interaction_webui.omni.orchestrator import (
+    get_or_create_orchestrator,
+    get_orchestrator,
+)
 from joy_interaction_webui.omni.streaming_asr import (
     StreamingASRConfig,
     StreamingASRCoordinator,
 )
-from joy_interaction_webui.omni.timeline import TimelineBuffer, TimelineEvent
+from joy_interaction_webui.omni.timeline import TimelineEvent
 from joy_interaction_webui.omni.vllm_asr import VllmASRConfig, VllmWindowTranscriber
 
 # ASR parameters
@@ -117,7 +121,6 @@ class AudioIngressSession:
     last_client_monotonic_ms: float | None = None
     clock_drift_ms: float | None = None
     continuous_asr_stats: dict = field(default_factory=dict)
-    timeline: TimelineBuffer = field(default_factory=TimelineBuffer)
     last_seen_server_monotonic: float = field(default_factory=time.monotonic)
 
     @property
@@ -183,6 +186,16 @@ class AudioIngressSession:
     def pcm_snapshot(self) -> bytes:
         return b"".join(chunk.pcm for chunk in self.chunks)
 
+    def client_to_server_monotonic_ms(self, client_ms: float) -> float:
+        if (
+            self.first_client_monotonic_ms is None
+            or self.first_server_monotonic_ms is None
+        ):
+            return time.monotonic() * 1000
+        return self.first_server_monotonic_ms + (
+            client_ms - self.first_client_monotonic_ms
+        )
+
     def window_snapshot(self, seconds: float) -> AudioWindow | None:
         if not self.chunks:
             return None
@@ -215,6 +228,7 @@ class AudioIngressSession:
         )
 
     def status(self) -> dict:
+        orchestrator = get_orchestrator(self.session_id)
         return {
             "session_id": self.session_id,
             "sample_rate": self.sample_rate,
@@ -233,7 +247,8 @@ class AudioIngressSession:
                 round(self.clock_drift_ms, 3) if self.clock_drift_ms is not None else None
             ),
             "continuous_asr": dict(self.continuous_asr_stats),
-            "timeline_events": len(self.timeline),
+            "timeline_events": len(orchestrator.timeline) if orchestrator else 0,
+            "orchestrator": orchestrator.status() if orchestrator else None,
         }
 
 
@@ -698,6 +713,8 @@ async def audio_ingress_websocket_handler(request):
 
     session_id = request.query.get("session_id", "").strip() or uuid.uuid4().hex[:8]
     state = get_audio_ingress_session(session_id)
+    orchestrator = get_or_create_orchestrator(session_id)
+    orchestrator.start()
     coordinator: StreamingASRCoordinator | None = None
     state.connection_opened()
     logger.info("[%s] Continuous audio ingress connected", session_id)
@@ -714,7 +731,13 @@ async def audio_ingress_websocket_handler(request):
     if audio_ingress_coordinator_factory is not None:
 
         async def emit_audio_event(event):
-            state.timeline.append(TimelineEvent.from_audio(event))
+            await orchestrator.record_event(
+                TimelineEvent.from_audio(
+                    event,
+                    start_ms=state.client_to_server_monotonic_ms(event.start_ms),
+                    end_ms=state.client_to_server_monotonic_ms(event.end_ms),
+                )
+            )
             state.continuous_asr_stats = dict(coordinator.stats)
             state.continuous_asr_stats["last_event"] = event.kind
             if not ws.closed:
@@ -806,8 +829,8 @@ async def audio_ingress_status_handler(request):
 
 async def timeline_handler(request):
     session_id = request.query.get("session_id", "").strip()
-    state = audio_ingress_sessions.get(session_id)
-    if state is None:
+    orchestrator = get_orchestrator(session_id)
+    if orchestrator is None:
         return web.json_response(
             {"error": "unknown session_id", "session_id": session_id},
             status=404,
@@ -817,11 +840,34 @@ async def timeline_handler(request):
     except ValueError:
         return web.json_response({"error": "invalid lookback_seconds"}, status=400)
     lookback_seconds = min(120, max(0.1, lookback_seconds))
-    events = state.timeline.snapshot(lookback_seconds=lookback_seconds)
+    events = orchestrator.timeline.snapshot(lookback_seconds=lookback_seconds)
     return web.json_response(
         {
             "session_id": session_id,
             "events": [event.to_dict() for event in events],
+        }
+    )
+
+
+async def omni_snapshots_handler(request):
+    session_id = request.query.get("session_id", "").strip()
+    orchestrator = get_orchestrator(session_id)
+    if orchestrator is None:
+        return web.json_response(
+            {"error": "unknown session_id", "session_id": session_id},
+            status=404,
+        )
+    try:
+        limit = min(256, max(1, int(request.query.get("limit", "20"))))
+    except ValueError:
+        return web.json_response({"error": "invalid limit"}, status=400)
+    return web.json_response(
+        {
+            "session_id": session_id,
+            "status": orchestrator.status(),
+            "snapshots": [
+                snapshot.to_dict() for snapshot in list(orchestrator.snapshots)[-limit:]
+            ],
         }
     )
 
@@ -831,3 +877,4 @@ def setup_asr_routes(app):
     app.router.add_get("/ws/audio-ingress", audio_ingress_websocket_handler)
     app.router.add_get("/api/audio-ingress/status", audio_ingress_status_handler)
     app.router.add_get("/api/timeline", timeline_handler)
+    app.router.add_get("/api/omni/snapshots", omni_snapshots_handler)

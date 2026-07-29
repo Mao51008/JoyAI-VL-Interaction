@@ -213,16 +213,26 @@ services/omni/orchestrator.py
 任务：
 
 - [x] 定义统一的 `TimelineEvent` 数据结构。
-- [ ] 所有时间使用同一单调时钟，墙上时间只用于日志展示。
-- [ ] 按固定 tick（建议先用 500 ms 或 1 秒）生成一次多模态快照。
-- [ ] 允许突发高优先级事件绕过普通 tick，立即触发一次决策。
+- [x] 所有时间使用同一服务器单调时钟，墙上时间只用于日志展示。
+- [x] 按固定 tick（默认 1 秒）生成一次多模态快照。
+- [x] 允许突发高优先级事件绕过普通 tick，立即生成一次决策快照。
 - [x] 为过期事件设置窗口和淘汰策略，禁止上下文无限增长。
 
-A4.1 已建立 `TimelineEvent`/`TimelineBuffer` 基础层：默认最多保留最近 120 秒、
-2000 个事件，支持按时间范围和模态生成确定顺序的快照与 JSON 回放。当前 ASR
-和环境声音事件已写入会话时间轴，并可通过
-`GET /api/timeline?session_id=...&lookback_seconds=...` 查询。视频帧、模型动作、
-固定 tick 和高优先级触发仍待后续接入。
+A4 已建立 `TimelineEvent`/`TimelineBuffer`/`OmniOrchestrator`：默认最多保留
+最近 120 秒、2000 个事件和 256 份快照，支持按时间范围和模态生成确定顺序的
+快照与 JSON 回放。浏览器音频时间戳会映射到服务器单调时钟；视频采样帧、
+ASR partial/final、环境声音、用户问题、前后台模型动作和 TTS 播放区间均写入
+同一会话时间轴，并区分 `microphone` 与 `system_output` 音频来源。
+
+调度器默认每 1 秒生成最近 10 秒的多模态快照；优先级达到 80 的事件（当前包括
+危险环境声音）会立即生成 `priority` 快照，不等待下一个 tick。相关接口：
+
+- `GET /api/timeline?session_id=...&lookback_seconds=...`
+- `GET /api/omni/snapshots?session_id=...&limit=...`
+
+可通过 `OMNI_TICK_SECONDS`、`OMNI_LOOKBACK_SECONDS`、
+`OMNI_URGENT_PRIORITY`、`OMNI_TIMELINE_SECONDS`、
+`OMNI_TIMELINE_MAX_EVENTS` 和 `OMNI_MAX_SNAPSHOTS` 调整有界策略。
 
 验收：
 

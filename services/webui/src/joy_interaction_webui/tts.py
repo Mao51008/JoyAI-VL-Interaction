@@ -7,11 +7,15 @@ import io
 import json
 import logging
 import os
+import time
 import uuid
 import wave
 
 import aiohttp
 from aiohttp import web
+
+from .omni.orchestrator import get_or_create_orchestrator
+from .omni.timeline import TimelineEvent
 
 # TTS parameters
 TTS_URL = os.getenv("TTS_URL", "ws://127.0.0.1:8992/ws/tts")
@@ -244,9 +248,14 @@ async def run_tts_stream_request(client_ws, data):
     upstream_session = None
     upstream_ws = None
     reqid = data.get("request_id") or data.get("reqid")
+    session_id = str(data.get("session_id") or "web")
+    timeline_start_ms = None
+    timeline_status = "failed"
+    timeline_text = ""
 
     try:
         text = normalize_tts_text(data.get("text", ""))
+        timeline_text = text
         if not text:
             await client_ws.send_json(
                 {"type": "error", "request_id": reqid, "error": "Missing text"}
@@ -265,6 +274,7 @@ async def run_tts_stream_request(client_ws, data):
         voice = data.get("voice") or TTS_VOICE
         emotion = data.get("emotion") or TTS_EMOTION
         reqid = reqid or f"{data.get('session_id') or 'web'}-{uuid.uuid4().hex[:12]}"
+        timeline_start_ms = time.monotonic() * 1000
 
         await client_ws.send_json(
             {
@@ -301,7 +311,9 @@ async def run_tts_stream_request(client_ws, data):
             }
         )
         logger.info("[tts] stream done reqid=%s audio_bytes=%s", reqid, total_audio_bytes)
+        timeline_status = "done"
     except asyncio.CancelledError:
+        timeline_status = "cancelled"
         logger.info("[tts] stream cancelled reqid=%s", reqid)
         if not client_ws.closed:
             try:
@@ -310,6 +322,7 @@ async def run_tts_stream_request(client_ws, data):
                 pass
         raise
     except asyncio.TimeoutError:
+        timeline_status = "timeout"
         logger.warning("[tts] stream timeout reqid=%s", reqid)
         if not client_ws.closed:
             await client_ws.send_json(
@@ -322,6 +335,25 @@ async def run_tts_stream_request(client_ws, data):
                 {"type": "error", "request_id": reqid, "error": f"TTS failed: {err}"}
             )
     finally:
+        if timeline_start_ms is not None:
+            orchestrator = get_or_create_orchestrator(session_id)
+            orchestrator.start()
+            await orchestrator.record_event(
+                TimelineEvent(
+                    session_id=session_id,
+                    modality="audio",
+                    kind="tts_playback",
+                    start_ms=timeline_start_ms,
+                    end_ms=time.monotonic() * 1000,
+                    payload={
+                        "source": "system_output",
+                        "request_id": reqid,
+                        "status": timeline_status,
+                        "text": timeline_text,
+                    },
+                    priority=30,
+                )
+            )
         if upstream_ws is not None and not upstream_ws.closed:
             await upstream_ws.close()
         if upstream_session is not None:
