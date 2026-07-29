@@ -62,7 +62,7 @@ async def run(args) -> int:
             wav_file.getframerate(),
         ) != (1, 2, 16000):
             raise ValueError("WAV must be mono, PCM16, 16000 Hz")
-        pcm = wav_file.readframes(wav_file.getnframes())
+        pcm = wav_file.readframes(wav_file.getnframes()) * args.repeat
 
     session_id = args.session_id or f"smoke-{uuid.uuid4().hex[:8]}"
     separator = "&" if "?" in args.url else "?"
@@ -123,6 +123,7 @@ def main() -> int:
     parser.add_argument("--url", default="ws://127.0.0.1:8099/ws/audio-ingress")
     parser.add_argument("--session-id", default="")
     parser.add_argument("--speed", type=float, default=1.0)
+    parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--vad-threshold", type=float, default=0.008)
     parser.add_argument("--final-wait", type=float, default=2.0)
     return asyncio.run(run(parser.parse_args()))
