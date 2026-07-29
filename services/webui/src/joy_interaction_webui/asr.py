@@ -1,4 +1,3 @@
-
 """ASR websocket bridge for browser microphone audio."""
 
 import asyncio
@@ -15,7 +14,11 @@ import aiohttp
 from aiohttp import web
 
 from joy_interaction_webui.omni.events import AudioWindow
-from joy_interaction_webui.omni.streaming_asr import StreamingASRCoordinator
+from joy_interaction_webui.omni.streaming_asr import (
+    StreamingASRConfig,
+    StreamingASRCoordinator,
+)
+from joy_interaction_webui.omni.vllm_asr import VllmASRConfig, VllmWindowTranscriber
 
 # ASR parameters
 ASR_URL = os.getenv("ASR_URL", "ws://127.0.0.1:8994/ws/asr")
@@ -55,12 +58,16 @@ ASR_RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 # sliding-window/streaming recognition.
 AUDIO_INGRESS_SAMPLE_RATE = int(os.getenv("AUDIO_INGRESS_SAMPLE_RATE", "16000"))
 AUDIO_INGRESS_BUFFER_SECONDS = float(os.getenv("AUDIO_INGRESS_BUFFER_SECONDS", "30"))
-AUDIO_INGRESS_SESSION_TTL_SECONDS = float(
-    os.getenv("AUDIO_INGRESS_SESSION_TTL_SECONDS", "3600")
-)
+AUDIO_INGRESS_SESSION_TTL_SECONDS = float(os.getenv("AUDIO_INGRESS_SESSION_TTL_SECONDS", "3600"))
 AUDIO_PACKET_MAGIC = b"JAI1"
 AUDIO_PACKET_VERSION = 1
 AUDIO_PACKET_HEADER = struct.Struct(">4sBBHIdII")
+CONTINUOUS_ASR_ENABLED = os.getenv("CONTINUOUS_ASR_ENABLED", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -210,9 +217,7 @@ class AudioIngressSession:
             "last_sequence": self.last_sequence,
             "last_client_monotonic_ms": self.last_client_monotonic_ms,
             "clock_drift_ms": (
-                round(self.clock_drift_ms, 3)
-                if self.clock_drift_ms is not None
-                else None
+                round(self.clock_drift_ms, 3) if self.clock_drift_ms is not None else None
             ),
         }
 
@@ -225,6 +230,50 @@ def set_audio_ingress_coordinator_factory(factory) -> None:
     """Inject the streaming recognizer backend; A3.2 supplies the real ASR client."""
     global audio_ingress_coordinator_factory
     audio_ingress_coordinator_factory = factory
+
+
+def configure_continuous_asr_from_env() -> None:
+    if not CONTINUOUS_ASR_ENABLED:
+        return
+    transcriber_config = VllmASRConfig(
+        url=os.getenv(
+            "CONTINUOUS_ASR_URL",
+            "http://127.0.0.1:8993/v1/audio/transcriptions",
+        ),
+        model=os.getenv("CONTINUOUS_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B"),
+        timeout_seconds=float(os.getenv("CONTINUOUS_ASR_TIMEOUT_SECONDS", "30")),
+        retry_attempts=int(os.getenv("CONTINUOUS_ASR_RETRY_ATTEMPTS", "2")),
+        retry_delay_seconds=float(os.getenv("CONTINUOUS_ASR_RETRY_DELAY_SECONDS", "0.2")),
+    )
+    coordinator_config = StreamingASRConfig(
+        interval_seconds=float(os.getenv("CONTINUOUS_ASR_INTERVAL_SECONDS", "0.4")),
+        window_seconds=float(os.getenv("CONTINUOUS_ASR_WINDOW_SECONDS", "6")),
+        speech_end_silence_seconds=float(
+            os.getenv("CONTINUOUS_ASR_SPEECH_END_SILENCE_SECONDS", "0.8")
+        ),
+        stable_observations=int(os.getenv("CONTINUOUS_ASR_STABLE_OBSERVATIONS", "2")),
+    )
+
+    def factory(*, session_id, snapshot, emit):
+        return StreamingASRCoordinator(
+            session_id,
+            snapshot,
+            VllmWindowTranscriber(transcriber_config),
+            emit,
+            config=coordinator_config,
+        )
+
+    set_audio_ingress_coordinator_factory(factory)
+    logger.info(
+        "Continuous ASR enabled: model=%s url=%s interval=%.3fs window=%.1fs",
+        transcriber_config.model,
+        transcriber_config.url,
+        coordinator_config.interval_seconds,
+        coordinator_config.window_seconds,
+    )
+
+
+configure_continuous_asr_from_env()
 
 
 def parse_audio_ingress_packet(data: bytes) -> AudioIngressPacket:
@@ -529,7 +578,11 @@ async def forward_asr_results(
                 return
             if result["event"] == "IS_IPU_END":
                 ending_mid = result["mid"] or "unknown"
-        elif msg.type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING}:
+        elif msg.type in {
+            aiohttp.WSMsgType.CLOSE,
+            aiohttp.WSMsgType.CLOSED,
+            aiohttp.WSMsgType.CLOSING,
+        }:
             return
         elif msg.type == aiohttp.WSMsgType.ERROR:
             raise asr_ws.exception() or RuntimeError("ASR upstream websocket error")
@@ -618,6 +671,7 @@ async def audio_ingress_websocket_handler(request):
         },
     )
     if audio_ingress_coordinator_factory is not None:
+
         async def emit_audio_event(event):
             if not ws.closed:
                 await send_asr_client_json(ws, event.to_dict())
@@ -699,11 +753,7 @@ async def audio_ingress_status_handler(request):
         return web.json_response(state.status())
     prune_audio_ingress_sessions()
     return web.json_response(
-        {
-            "sessions": [
-                state.status() for state in audio_ingress_sessions.values()
-            ]
-        }
+        {"sessions": [state.status() for state in audio_ingress_sessions.values()]}
     )
 
 

@@ -1,5 +1,6 @@
 import struct
 
+import httpx
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -22,6 +23,11 @@ from joy_interaction_webui.omni.streaming_asr import (
     StreamingASRConfig,
     StreamingASRCoordinator,
     TranscriptionResult,
+)
+from joy_interaction_webui.omni.vllm_asr import (
+    VllmASRConfig,
+    VllmWindowTranscriber,
+    pcm16_to_wav,
 )
 
 
@@ -191,6 +197,17 @@ class AlarmDetector:
         return []
 
 
+class RecoveringTranscriber:
+    def __init__(self):
+        self.calls = 0
+
+    async def transcribe(self, window):
+        self.calls += 1
+        if self.calls == 1:
+            raise httpx.ConnectError("ASR is restarting")
+        return TranscriptionResult("服务已经恢复")
+
+
 @pytest.mark.asyncio
 async def test_streaming_coordinator_emits_partial_stable_end_and_audio_event() -> None:
     windows = iter(
@@ -251,6 +268,68 @@ async def test_streaming_coordinator_skips_unchanged_audio_window() -> None:
     assert coordinator.stats["ticks"] == 2
     assert coordinator.stats["skipped"] == 1
     assert coordinator.stats["requests"] == 0
+
+
+@pytest.mark.asyncio
+async def test_streaming_coordinator_recovers_after_transcriber_error() -> None:
+    windows = iter(
+        [
+            AudioWindow(b"\0\0", 16000, 0, 400, 1, 1.0, True),
+            AudioWindow(b"\0\0", 16000, 0, 800, 2, 1.0, True),
+        ]
+    )
+    events = []
+
+    async def collect(event):
+        events.append(event)
+
+    coordinator = StreamingASRCoordinator(
+        "recover",
+        lambda _: next(windows),
+        RecoveringTranscriber(),
+        collect,
+    )
+
+    await coordinator.process_once()
+    await coordinator.process_once()
+
+    assert [event.kind for event in events] == [
+        "speech_start",
+        "asr_error",
+        "speech_partial",
+    ]
+    assert coordinator.stats["errors"] == 1
+    assert events[-1].text == "服务已经恢复"
+
+
+@pytest.mark.asyncio
+async def test_vllm_window_transcriber_posts_wav_and_reuses_client() -> None:
+    requests = []
+
+    async def handler(request):
+        body = await request.aread()
+        requests.append((request, body))
+        return httpx.Response(200, json={"text": "检测到火警"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transcriber = VllmWindowTranscriber(
+        VllmASRConfig(
+            url="http://asr.test/v1/audio/transcriptions",
+            model="test-asr",
+        ),
+        client=client,
+    )
+    window = AudioWindow(b"\0\0" * 640, 16000, 0, 40, 1, 1.0, True)
+
+    first = await transcriber.transcribe(window)
+    second = await transcriber.transcribe(window)
+
+    assert first.text == second.text == "检测到火警"
+    assert len(requests) == 2
+    assert all(request.url.path == "/v1/audio/transcriptions" for request, _ in requests)
+    assert all(b"test-asr" in body for _, body in requests)
+    assert pcm16_to_wav(window.pcm, 16000).startswith(b"RIFF")
+    await client.aclose()
 
 
 @pytest.mark.asyncio

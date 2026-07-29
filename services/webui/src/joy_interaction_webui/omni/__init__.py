@@ -7,11 +7,14 @@ from .streaming_asr import (
     TranscriptionResult,
     WindowTranscriber,
 )
+from .vllm_asr import VllmASRConfig, VllmWindowTranscriber
 
 __all__ = [
     "AudioTimelineEvent",
     "StreamingASRConfig",
     "StreamingASRCoordinator",
     "TranscriptionResult",
+    "VllmASRConfig",
+    "VllmWindowTranscriber",
     "WindowTranscriber",
 ]

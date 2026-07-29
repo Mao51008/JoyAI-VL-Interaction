@@ -55,6 +55,7 @@ class StreamingASRCoordinator:
         self.running = False
         self._task: asyncio.Task | None = None
         self.stats = {"ticks": 0, "requests": 0, "skipped": 0, "events": 0}
+        self.stats["errors"] = 0
 
     async def _emit(self, event: AudioTimelineEvent) -> None:
         self.stats["events"] += 1
@@ -93,7 +94,24 @@ class StreamingASRCoordinator:
 
         if self.speech_active:
             self.stats["requests"] += 1
-            result = await self.transcriber.transcribe(window)
+            try:
+                result = await self.transcriber.transcribe(window)
+            # A backend outage must not terminate continuous audio ingestion.
+            except Exception as err:  # noqa: BLE001
+                self.stats["errors"] += 1
+                await self._emit(
+                    AudioTimelineEvent(
+                        self.session_id,
+                        "asr_error",
+                        self.speech_start_ms,
+                        window.end_ms,
+                        metadata={
+                            "error_type": type(err).__name__,
+                            "message": str(err),
+                        },
+                    )
+                )
+                return
             previous_stable = self.tracker.stable
             stable, _ = self.tracker.update(result.text)
             await self._emit(
@@ -162,3 +180,6 @@ class StreamingASRCoordinator:
         if self._task is not None:
             await self._task
             self._task = None
+        close = getattr(self.transcriber, "aclose", None)
+        if close is not None:
+            await close()
