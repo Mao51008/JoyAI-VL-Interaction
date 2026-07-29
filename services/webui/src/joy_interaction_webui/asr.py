@@ -14,6 +14,9 @@ from dataclasses import dataclass, field
 import aiohttp
 from aiohttp import web
 
+from joy_interaction_webui.omni.events import AudioWindow
+from joy_interaction_webui.omni.streaming_asr import StreamingASRCoordinator
+
 # ASR parameters
 ASR_URL = os.getenv("ASR_URL", "ws://127.0.0.1:8994/ws/asr")
 ASR_AUTHORIZATION = os.getenv(
@@ -72,12 +75,21 @@ class AudioIngressPacket:
     voice_active: bool = False
 
 
+@dataclass(frozen=True)
+class BufferedAudioChunk:
+    pcm: bytes
+    sequence: int
+    start_ms: float
+    end_ms: float
+    voice_active: bool
+
+
 @dataclass
 class AudioIngressSession:
     session_id: str
     sample_rate: int = AUDIO_INGRESS_SAMPLE_RATE
     buffer_seconds: float = AUDIO_INGRESS_BUFFER_SECONDS
-    chunks: deque[bytes] = field(default_factory=deque)
+    chunks: deque[BufferedAudioChunk] = field(default_factory=deque)
     buffered_bytes: int = 0
     packets_received: int = 0
     packets_accepted: int = 0
@@ -135,17 +147,52 @@ class AudioIngressSession:
             server_elapsed = now * 1000 - self.first_server_monotonic_ms
             self.clock_drift_ms = client_elapsed - server_elapsed
 
-        self.chunks.append(packet.pcm)
+        duration_ms = len(packet.pcm) / (self.sample_rate * 2) * 1000
+        self.chunks.append(
+            BufferedAudioChunk(
+                pcm=packet.pcm,
+                sequence=packet.sequence,
+                start_ms=packet.client_monotonic_ms,
+                end_ms=packet.client_monotonic_ms + duration_ms,
+                voice_active=packet.voice_active,
+            )
+        )
         self.buffered_bytes += len(packet.pcm)
         if packet.voice_active:
             self.voice_active_packets += 1
         while self.buffered_bytes > self.max_buffer_bytes and self.chunks:
-            self.buffered_bytes -= len(self.chunks.popleft())
+            self.buffered_bytes -= len(self.chunks.popleft().pcm)
         self.packets_accepted += 1
         return True
 
     def pcm_snapshot(self) -> bytes:
-        return b"".join(self.chunks)
+        return b"".join(chunk.pcm for chunk in self.chunks)
+
+    def window_snapshot(self, seconds: float) -> AudioWindow | None:
+        if not self.chunks:
+            return None
+        byte_limit = max(2, int(seconds * self.sample_rate) * 2)
+        selected: list[BufferedAudioChunk] = []
+        selected_bytes = 0
+        for chunk in reversed(self.chunks):
+            selected.append(chunk)
+            selected_bytes += len(chunk.pcm)
+            if selected_bytes >= byte_limit:
+                break
+        selected.reverse()
+        pcm = b"".join(chunk.pcm for chunk in selected)
+        if len(pcm) > byte_limit:
+            pcm = pcm[-byte_limit:]
+        voice_count = sum(chunk.voice_active for chunk in selected)
+        return AudioWindow(
+            pcm=pcm,
+            sample_rate=self.sample_rate,
+            start_ms=selected[0].start_ms,
+            end_ms=selected[-1].end_ms,
+            last_sequence=selected[-1].sequence,
+            voice_ratio=voice_count / len(selected),
+            latest_voice_active=selected[-1].voice_active,
+        )
 
     def status(self) -> dict:
         return {
@@ -171,6 +218,13 @@ class AudioIngressSession:
 
 
 audio_ingress_sessions: dict[str, AudioIngressSession] = {}
+audio_ingress_coordinator_factory = None
+
+
+def set_audio_ingress_coordinator_factory(factory) -> None:
+    """Inject the streaming recognizer backend; A3.2 supplies the real ASR client."""
+    global audio_ingress_coordinator_factory
+    audio_ingress_coordinator_factory = factory
 
 
 def parse_audio_ingress_packet(data: bytes) -> AudioIngressPacket:
@@ -550,6 +604,7 @@ async def audio_ingress_websocket_handler(request):
 
     session_id = request.query.get("session_id", "").strip() or uuid.uuid4().hex[:8]
     state = get_audio_ingress_session(session_id)
+    coordinator: StreamingASRCoordinator | None = None
     state.connection_opened()
     logger.info("[%s] Continuous audio ingress connected", session_id)
     await send_asr_client_json(
@@ -562,6 +617,17 @@ async def audio_ingress_websocket_handler(request):
             "buffer_seconds": state.buffer_seconds,
         },
     )
+    if audio_ingress_coordinator_factory is not None:
+        async def emit_audio_event(event):
+            if not ws.closed:
+                await send_asr_client_json(ws, event.to_dict())
+
+        coordinator = audio_ingress_coordinator_factory(
+            session_id=session_id,
+            snapshot=state.window_snapshot,
+            emit=emit_audio_event,
+        )
+        coordinator.start()
 
     try:
         async for msg in ws:
@@ -607,6 +673,8 @@ async def audio_ingress_websocket_handler(request):
     except Exception:
         logger.exception("[%s] Continuous audio ingress failed", session_id)
     finally:
+        if coordinator is not None:
+            await coordinator.stop()
         state.connection_closed()
         if not ws.closed:
             await ws.close()

@@ -12,7 +12,16 @@ from joy_interaction_webui.asr import (
     AudioIngressSession,
     audio_ingress_sessions,
     parse_audio_ingress_packet,
+    set_audio_ingress_coordinator_factory,
     setup_asr_routes,
+)
+from joy_interaction_webui.omni.audio_events import AudioEventDetection
+from joy_interaction_webui.omni.events import AudioWindow
+from joy_interaction_webui.omni.stable_prefix import StablePrefixTracker
+from joy_interaction_webui.omni.streaming_asr import (
+    StreamingASRConfig,
+    StreamingASRCoordinator,
+    TranscriptionResult,
 )
 
 
@@ -80,6 +89,12 @@ def test_ring_buffer_is_bounded_and_tracks_sequence_gaps() -> None:
     assert status["voice_active_packets"] == 1
     assert status["buffered_seconds"] == 0.08
     assert len(state.pcm_snapshot()) == 2560
+    window = state.window_snapshot(0.04)
+    assert window is not None
+    assert window.last_sequence == 4
+    assert window.start_ms == 120.0
+    assert window.end_ms == 160.0
+    assert not window.latest_voice_active
 
 
 def test_ring_buffer_rejects_unexpected_sample_rate() -> None:
@@ -145,3 +160,127 @@ async def test_audio_ingress_websocket_reports_stats_and_reconnects() -> None:
         await ws.close()
 
     audio_ingress_sessions.clear()
+
+
+def test_stable_prefix_grows_monotonically_for_chinese() -> None:
+    tracker = StablePrefixTracker(observations=2)
+
+    assert tracker.update("发生")[0] == ""
+    assert tracker.update("发生火")[0] == "发生"
+    assert tracker.update("发生火灾")[0] == "发生火"
+    stable, unstable = tracker.update("发生火警")[0:2]
+
+    assert stable == "发生火"
+    assert unstable == "警"
+    tracker.reset()
+    assert tracker.update("新的句子")[0] == ""
+
+
+class SequenceTranscriber:
+    def __init__(self, texts):
+        self.texts = iter(texts)
+
+    async def transcribe(self, window):
+        return TranscriptionResult(next(self.texts), confidence=0.9)
+
+
+class AlarmDetector:
+    async def detect(self, window):
+        if window.last_sequence == 2:
+            return [AudioEventDetection("fire_alarm", 0.91, 400.0, 800.0)]
+        return []
+
+
+@pytest.mark.asyncio
+async def test_streaming_coordinator_emits_partial_stable_end_and_audio_event() -> None:
+    windows = iter(
+        [
+            AudioWindow(b"\0\0", 16000, 0, 400, 1, 1.0, True),
+            AudioWindow(b"\0\0", 16000, 0, 800, 2, 1.0, True),
+            AudioWindow(b"\0\0", 16000, 0, 1600, 3, 0.0, False),
+        ]
+    )
+    events = []
+
+    async def collect(event):
+        events.append(event)
+
+    coordinator = StreamingASRCoordinator(
+        "demo",
+        lambda _: next(windows),
+        SequenceTranscriber(["发生", "发生火灾", "发生火灾"]),
+        collect,
+        detector=AlarmDetector(),
+        config=StreamingASRConfig(speech_end_silence_seconds=0.8),
+    )
+
+    await coordinator.process_once()
+    await coordinator.process_once()
+    await coordinator.process_once()
+
+    kinds = [event.kind for event in events]
+    assert kinds == [
+        "speech_start",
+        "speech_partial",
+        "audio_event",
+        "speech_partial",
+        "speech_stable",
+        "speech_partial",
+        "speech_stable",
+        "speech_final",
+        "speech_end",
+    ]
+    assert events[3].stable_prefix == "发生"
+    assert events[2].to_dict()["label"] == "fire_alarm"
+    assert events[2].to_dict()["confidence"] == 0.91
+
+
+@pytest.mark.asyncio
+async def test_streaming_coordinator_skips_unchanged_audio_window() -> None:
+    window = AudioWindow(b"\0\0", 16000, 0, 400, 1, 0.0, False)
+    coordinator = StreamingASRCoordinator(
+        "demo",
+        lambda _: window,
+        SequenceTranscriber([]),
+        lambda event: None,
+    )
+
+    await coordinator.process_once()
+    await coordinator.process_once()
+
+    assert coordinator.stats["ticks"] == 2
+    assert coordinator.stats["skipped"] == 1
+    assert coordinator.stats["requests"] == 0
+
+
+@pytest.mark.asyncio
+async def test_audio_ingress_can_stream_coordinator_events_to_browser() -> None:
+    def factory(*, session_id, snapshot, emit):
+        return StreamingASRCoordinator(
+            session_id,
+            snapshot,
+            SequenceTranscriber(["检测到说话"]),
+            emit,
+            config=StreamingASRConfig(interval_seconds=0.01),
+        )
+
+    audio_ingress_sessions.clear()
+    set_audio_ingress_coordinator_factory(factory)
+    app = web.Application()
+    setup_asr_routes(app)
+    try:
+        async with TestClient(TestServer(app)) as client:
+            ws = await client.ws_connect("/ws/audio-ingress?session_id=test-session")
+            await ws.receive_json()
+            await ws.send_bytes(make_packet(sequence=1, voice_active=True))
+
+            start = await ws.receive_json(timeout=1)
+            partial = await ws.receive_json(timeout=1)
+
+            assert start["kind"] == "speech_start"
+            assert partial["kind"] == "speech_partial"
+            assert partial["text"] == "检测到说话"
+            await ws.close()
+    finally:
+        set_audio_ingress_coordinator_factory(None)
+        audio_ingress_sessions.clear()

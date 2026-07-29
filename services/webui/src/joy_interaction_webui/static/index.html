@@ -3789,6 +3789,9 @@ limitations under the License.
                         <div class="tts-speaking-line" id="ttsSpeakingLine">
                             <strong>Speaking:</strong> <span id="ttsSpeakingText"></span>
                         </div>
+                        <div class="tts-speaking-line" id="asrListeningLine">
+                            <strong>Listening:</strong> <span id="asrListeningText"></span>
+                        </div>
                     </div>
                     <div class="result-header-metrics">
                         <div class="metrics-inline" id="metricsInline" style="display: none;">
@@ -3950,6 +3953,8 @@ limitations under the License.
         const ttsEnabledToggle = document.getElementById('ttsEnabledToggle');
         const ttsSpeakingLine = document.getElementById('ttsSpeakingLine');
         const ttsSpeakingText = document.getElementById('ttsSpeakingText');
+        const asrListeningLine = document.getElementById('asrListeningLine');
+        const asrListeningText = document.getElementById('asrListeningText');
         const systemPromptSelect = document.getElementById('systemPromptSelect');
         const backgroundEnabledToggle = document.getElementById('backgroundEnabledToggle');
         const backgroundFrameMultiplier = document.getElementById('backgroundFrameMultiplier');
@@ -7383,6 +7388,21 @@ limitations under the License.
             return Math.sqrt(sum / Math.max(1, input.length));
         }
 
+        function updateContinuousAsrDisplay(event = null) {
+            const kind = event?.kind || '';
+            const text = String(event?.text || '').trim();
+            const stable = String(event?.stable_prefix || '').trim();
+            if (asrListeningText) {
+                asrListeningText.textContent = text || stable;
+            }
+            if (asrListeningLine) {
+                asrListeningLine.classList.toggle(
+                    'show',
+                    Boolean(text || stable) && !['speech_end'].includes(kind)
+                );
+            }
+        }
+
         function buildContinuousAudioPacket(pcm, sequence, monotonicMs, voiceActive) {
             const sessionBytes = new TextEncoder().encode(sessionId);
             const packet = new ArrayBuffer(
@@ -7463,6 +7483,8 @@ limitations under the License.
                     const data = JSON.parse(event.data);
                     if (data.type === 'error') {
                         console.warn('Continuous audio ingress error:', data.message);
+                    } else if (data.type === 'audio_event') {
+                        updateContinuousAsrDisplay(data);
                     }
                 } catch (error) {
                     console.debug('Ignoring non-JSON audio ingress response', error);
@@ -7595,6 +7617,7 @@ limitations under the License.
             continuousAudioSilence = null;
             continuousAudioPending = new Int16Array(0);
             continuousAudioPendingStartMs = null;
+            updateContinuousAsrDisplay();
         }
 
         function getMicErrorMessage(error) {

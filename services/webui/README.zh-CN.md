@@ -89,5 +89,11 @@ GET /api/audio-ingress/status?session_id=<session-id>
 export AUDIO_INGRESS_BUFFER_SECONDS=30
 ```
 
-该持续入口在 A2 阶段只负责采集、缓存和统计，不会把无限音频直接送入当前
-final-only ASR；滑动窗口 partial ASR 将在 A3 接入。
+持续入口的环形缓冲现在可以按最近若干秒构造带时间戳和 VAD 状态的音频窗口。
+A3.1 已加入 400 ms 滑动窗口调度器、stable prefix、`speech_start`、
+`speech_partial`、`speech_stable`、`speech_final`、`speech_end` 事件，以及可插拔的环境声音检测接口。
+浏览器能够直接显示调度器发回的实时转写。
+
+真实 Qwen3-ASR 客户端仍属于 A3.2。它通过
+`set_audio_ingress_coordinator_factory(...)` 注入，以免在没有 ASR 服务时影响
+现有视频和手动语音功能；环境声音分类器将在 A3.3 注入同一事件流。
