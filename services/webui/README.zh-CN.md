@@ -107,6 +107,28 @@ CONTINUOUS_ASR_MODEL=Qwen/Qwen3-ASR-1.7B \
 bash services/webui/scripts/start_server.sh
 ```
 
+同时启用 A3.3 CLAP 环境声音检测：
+
+```bash
+AUDIO_EVENT_DETECTOR=clap \
+AUDIO_EVENT_CLAP_MODEL=/data/maoyy/models/laion/clap-htsat-unfused \
+AUDIO_EVENT_CLAP_DEVICE=cpu \
+AUDIO_EVENT_CONFIDENCE_THRESHOLD=0.4 \
+AUDIO_EVENT_COOLDOWN_SECONDS=2 \
+CONTINUOUS_ASR_ENABLED=1 \
+bash services/webui/scripts/start_server.sh
+```
+
+CLAP 支路会把 16 kHz 输入重采样到 48 kHz。危险事件会携带相对置信度；
+0.4 是小规模火警/普通语音样本上的原型阈值，不应直接作为生产安全阈值。
+可先查看一个 WAV 对全部候选类别的评分：
+
+```bash
+PYTHONPATH=services/webui/src services/.venv/bin/python \
+  services/webui/tools/audio_event_smoke.py <test.wav> \
+  --model /data/maoyy/models/laion/clap-htsat-unfused
+```
+
 用 16 kHz、单声道、PCM16 WAV 验证连续链路：
 
 ```bash

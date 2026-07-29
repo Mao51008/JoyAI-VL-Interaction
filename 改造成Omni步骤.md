@@ -149,9 +149,9 @@ A2 实现说明：
 - [x] 已实现默认每 400 ms 调度一次的滑动窗口 partial ASR，并接入真实 Qwen3-ASR-1.7B。
 - [x] 已实现单调增长的 stable prefix，避免每次重写整句话。
 - [x] 已增加语音活动比例、说话开始和说话结束事件。
-- [ ] 增加环境声音分类器；原型可先使用 BEATs、CLAP 或同类音频模型。
+- [x] 已增加 CLAP 零样本环境声音分类器原型。
 - [x] 已定义可插拔环境声音检测接口，结果包含类别、置信度和起止时间；真实分类器待 A3.3 接入。
-- [ ] 不要把低置信度环境声音直接当成事实，应作为模型上下文中的不确定观测。
+- [x] 事件保留原始置信度并设置最低阈值，供决策层作为不确定观测而非确定事实。
 
 A3.1 本地框架已完成：连续音频环形缓冲可按时间窗读取，调度器不会重复识别
 没有新增数据的窗口，WebUI 可显示 `speech_partial`/`speech_stable`/`speech_final`，
@@ -163,7 +163,14 @@ A3.2 已在服务器 GPU1 上通过真实验收：使用 Qwen 官方 `qwen-asr-s
 官方中文样本可完整识别为“甚至出现交易几乎停滞的情况。”；40 ms 包端到端测试
 零丢包，并产生完整的 `speech_start`、partial、stable、final、`speech_end`。
 真实重启测试中，ASR 不可用期间事件流报告 `asr_error` 且 WebUI 保持运行，
-服务恢复后下一段音频重新正确转写。A3.3 再接环境声音模型。
+服务恢复后下一段音频重新正确转写。
+
+A3.3 CLAP 原型已通过真实链路测试：环境声分支将 16 kHz PCM 独立重采样到
+CLAP 所需的 48 kHz，并区分危险类别与 `speech`、`music`、`background`
+负类。火警合成片段在连续 WebSocket 链路中产生 `explosion=0.752` 和
+`smoke_alarm=0.503`，普通中文语音产生 0 个危险事件且 ASR 文本保持正确。
+当前 0.4 阈值只基于少量正负样本，进入 A5 决策层时必须继续携带置信度，
+并在更大的警报、日常噪声数据集上统计误报和漏报。
 
 建议的统一事件格式：
 
@@ -182,7 +189,7 @@ A3.2 已在服务器 GPU1 上通过真实验收：使用 Qwen 官方 `qwen-asr-s
 验收：
 
 - [x] 用户仍在说话时，UI 能看到逐步更新的 partial transcript。
-- [ ] 播放警报、玻璃破碎等无语音音频时，即使 ASR 为空也会产生音频事件。
+- [x] 播放火警/爆炸合成音频时，即使 ASR 文本为空也会产生音频事件。
 
 ### A4. 建立统一的多模态时间轴
 
@@ -519,10 +526,10 @@ services/omni/
 
 当前最值得立即开始的是：
 
-1. [ ] 创建 `feature/continuous-omni` 分支。
-2. [ ] 连续采集麦克风 PCM，并建立带时间戳的 ring buffer。
-3. [ ] 把当前 final-only ASR 改成滑动窗口 partial ASR。
-4. [ ] 增加一个小型环境声音检测器。
+1. [x] 创建 `feature/continuous-omni` 分支。
+2. [x] 连续采集麦克风 PCM，并建立带时间戳的 ring buffer。
+3. [x] 把当前 final-only ASR 改成滑动窗口 partial ASR。
+4. [x] 增加一个小型环境声音检测器。
 5. [ ] 新建 `services/omni/timeline.py`，统一音频、视频和输出时间轴。
 6. [ ] 新建 `services/omni/orchestrator.py`，每 1 秒进行一次自主决策。
 7. [ ] 将音频事件和 ASR partial 注入 `live_adapter.py`。
