@@ -217,6 +217,43 @@ async def test_user_speech_during_tts_produces_interrupt_without_response_call()
 
 
 @pytest.mark.asyncio
+async def test_dangerous_audio_during_tts_interrupts_before_emergency_response() -> None:
+    orchestrator = OmniOrchestrator("s", clock=lambda: 10_000)
+    model = FakeResponseModel()
+    engine = OmniDecisionEngine(
+        orchestrator,
+        RuleBasedDecisionGate(),
+        model,
+        clock=lambda: 10_000,
+    )
+    playing = TimelineEvent(
+        "s",
+        "audio",
+        "tts_playback",
+        8000,
+        8000,
+        {"status": "playing", "generation_id": "generation-1"},
+    )
+    fire = TimelineEvent(
+        "s",
+        "audio",
+        "audio_event",
+        9000,
+        9000,
+        {"label": "fire_alarm", "confidence": 0.96},
+        priority=100,
+    )
+
+    record = await engine.evaluate_snapshot(snapshot(1, [playing, fire], trigger="priority"))
+
+    assert record is not None
+    assert record.action.kind == ActionKind.INTERRUPT
+    assert record.trigger_reason == "dangerous_audio_during_tts:fire_alarm"
+    assert record.confidence == pytest.approx(0.96)
+    assert model.calls == []
+
+
+@pytest.mark.asyncio
 async def test_decision_record_is_written_back_to_timeline() -> None:
     orchestrator = OmniOrchestrator("s", clock=lambda: 10_000)
     engine = OmniDecisionEngine(

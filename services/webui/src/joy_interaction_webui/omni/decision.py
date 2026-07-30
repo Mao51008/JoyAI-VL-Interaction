@@ -151,9 +151,12 @@ class SnapshotContextBuilder:
             elif event.kind == "user_query":
                 groups["User queries"].append(f"- {age} {(payload.get('text') or '')!s}")
             elif event.kind == "tts_playback":
+                playback_text = payload.get("played_text") or payload.get("text") or ""
                 groups["System speaking state"].append(
                     f"- {age} status={payload.get('status', '')} "
-                    f"text={(payload.get('text') or '')!s}"
+                    f"generation={payload.get('generation_id', '')} "
+                    f"played_ms={float(payload.get('played_audio_ms') or 0):.0f} "
+                    f"text={playback_text!s}"
                 )
             elif event.modality == "model":
                 groups["Recent model actions"].append(
@@ -205,6 +208,21 @@ class RuleBasedDecisionGate:
                     "user_speech_during_tts",
                     urgent=True,
                 )
+
+        if tts_events and tts_events[-1].payload.get("status") == "playing":
+            latest_tts = tts_events[-1]
+            for event in reversed(snapshot.events):
+                if (
+                    event.kind == "audio_event"
+                    and event.payload.get("label") in self.dangerous_labels
+                    and event.start_ms >= latest_tts.start_ms
+                ):
+                    return GateDecision(
+                        ActionKind.INTERRUPT,
+                        f"dangerous_audio_during_tts:{event.payload.get('label')}",
+                        urgent=True,
+                        confidence=float(event.payload.get("confidence") or 0),
+                    )
 
         for event in reversed(snapshot.events):
             if event.kind == "audio_event" and event.payload.get("label") in self.dangerous_labels:

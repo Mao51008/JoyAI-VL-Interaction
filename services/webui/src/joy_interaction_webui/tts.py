@@ -46,6 +46,29 @@ TTS_TRUST_ENV = os.getenv("TTS_TRUST_ENV", "1").lower() not in {
 
 logger = logging.getLogger(__name__)
 
+_active_tts_generations: dict[str, tuple[str, asyncio.Task]] = {}
+
+
+def register_tts_generation(
+    session_id: str,
+    generation_id: str,
+    task: asyncio.Task,
+) -> None:
+    _active_tts_generations[session_id] = (generation_id, task)
+
+
+def get_active_tts_generation(session_id: str) -> str | None:
+    active = _active_tts_generations.get(session_id)
+    if active is None or active[1].done():
+        return None
+    return active[0]
+
+
+def unregister_tts_generation(session_id: str, generation_id: str) -> None:
+    active = _active_tts_generations.get(session_id)
+    if active is not None and active[0] == generation_id:
+        _active_tts_generations.pop(session_id, None)
+
 
 def iter_text_chunks(text: str, chunk_size: int = TTS_CHUNK_SIZE):
     for start in range(0, len(text), chunk_size):
@@ -249,6 +272,7 @@ async def run_tts_stream_request(client_ws, data):
     upstream_ws = None
     reqid = data.get("request_id") or data.get("reqid")
     session_id = str(data.get("session_id") or "web")
+    generation_id = str(data.get("generation_id") or "").strip()
     timeline_start_ms = None
     timeline_status = "failed"
     timeline_text = ""
@@ -274,6 +298,7 @@ async def run_tts_stream_request(client_ws, data):
         voice = data.get("voice") or TTS_VOICE
         emotion = data.get("emotion") or TTS_EMOTION
         reqid = reqid or f"{data.get('session_id') or 'web'}-{uuid.uuid4().hex[:12]}"
+        generation_id = generation_id or f"{session_id}-{uuid.uuid4().hex}"
         timeline_start_ms = time.monotonic() * 1000
         orchestrator = get_or_create_orchestrator(session_id)
         orchestrator.start()
@@ -287,6 +312,7 @@ async def run_tts_stream_request(client_ws, data):
                 payload={
                     "source": "system_output",
                     "request_id": reqid,
+                    "generation_id": generation_id,
                     "status": "playing",
                     "text": timeline_text,
                 },
@@ -298,6 +324,7 @@ async def run_tts_stream_request(client_ws, data):
             {
                 "type": "start",
                 "request_id": reqid,
+                "generation_id": generation_id,
                 "format": "pcm16",
                 "sample_rate": sample_rate,
                 "channels": 1,
@@ -324,6 +351,7 @@ async def run_tts_stream_request(client_ws, data):
             {
                 "type": "done",
                 "request_id": reqid,
+                "generation_id": generation_id,
                 "reqid": reqid,
                 "audio_bytes": total_audio_bytes,
             }
@@ -335,7 +363,14 @@ async def run_tts_stream_request(client_ws, data):
         logger.info("[tts] stream cancelled reqid=%s", reqid)
         if not client_ws.closed:
             try:
-                await client_ws.send_json({"type": "stopped", "request_id": reqid, "reqid": reqid})
+                await client_ws.send_json(
+                    {
+                        "type": "stopped",
+                        "request_id": reqid,
+                        "reqid": reqid,
+                        "generation_id": generation_id,
+                    }
+                )
             except (ConnectionResetError, RuntimeError):
                 pass
         raise
@@ -366,6 +401,7 @@ async def run_tts_stream_request(client_ws, data):
                     payload={
                         "source": "system_output",
                         "request_id": reqid,
+                        "generation_id": generation_id,
                         "status": timeline_status,
                         "text": timeline_text,
                     },
@@ -376,6 +412,7 @@ async def run_tts_stream_request(client_ws, data):
             await upstream_ws.close()
         if upstream_session is not None:
             await upstream_session.close()
+        unregister_tts_generation(session_id, generation_id)
 
 
 async def cancel_tts_stream_task(task):
@@ -390,11 +427,76 @@ async def cancel_tts_stream_task(task):
         logger.warning("[tts] previous stream did not stop within %.2fs", TTS_CANCEL_TIMEOUT)
 
 
+async def cancel_tts_generation(
+    session_id: str,
+    generation_id: str | None = None,
+) -> dict:
+    active = _active_tts_generations.get(session_id)
+    if active is None:
+        return {
+            "session_id": session_id,
+            "generation_id": generation_id or "",
+            "cancelled": False,
+            "reason": "not_active",
+        }
+    active_generation_id, task = active
+    if generation_id and generation_id != active_generation_id:
+        return {
+            "session_id": session_id,
+            "generation_id": generation_id,
+            "active_generation_id": active_generation_id,
+            "cancelled": False,
+            "reason": "generation_mismatch",
+        }
+    await cancel_tts_stream_task(task)
+    unregister_tts_generation(session_id, active_generation_id)
+    return {
+        "session_id": session_id,
+        "generation_id": active_generation_id,
+        "cancelled": True,
+    }
+
+
+async def cleanup_tts_session(session_id: str) -> bool:
+    result = await cancel_tts_generation(session_id)
+    return bool(result["cancelled"])
+
+
+async def record_tts_playback_progress(data: dict) -> None:
+    session_id = str(data.get("session_id") or "web")
+    now_ms = time.monotonic() * 1000
+    try:
+        played_audio_ms = max(0, float(data.get("played_audio_ms") or 0))
+    except (TypeError, ValueError):
+        played_audio_ms = 0
+    await get_or_create_orchestrator(session_id).record_event(
+        TimelineEvent(
+            session_id=session_id,
+            modality="audio",
+            kind="tts_playback",
+            start_ms=now_ms,
+            end_ms=now_ms,
+            payload={
+                "source": "browser_output",
+                "request_id": str(data.get("request_id") or ""),
+                "generation_id": str(data.get("generation_id") or ""),
+                "status": str(data.get("status") or "progress"),
+                "played_audio_ms": played_audio_ms,
+                "played_text": str(data.get("played_text") or ""),
+                "text": str(data.get("text") or ""),
+            },
+            priority=35,
+        )
+    )
+
+
 async def tts_websocket_handler(request):
     client_ws = web.WebSocketResponse(heartbeat=20, max_msg_size=0)
     await client_ws.prepare(request)
 
     stream_task = None
+    stream_generation_id = ""
+    stream_session_id = ""
 
     try:
         async for msg in client_ws:
@@ -408,10 +510,29 @@ async def tts_websocket_handler(request):
                 message_type = data.get("type") or "speak"
                 if message_type == "speak":
                     await cancel_tts_stream_task(stream_task)
+                    stream_session_id = str(data.get("session_id") or "web")
+                    await cancel_tts_generation(stream_session_id)
+                    stream_generation_id = str(data.get("generation_id") or "").strip()
+                    if not stream_generation_id:
+                        stream_generation_id = f"{stream_session_id}-{uuid.uuid4().hex}"
+                        data["generation_id"] = stream_generation_id
                     stream_task = asyncio.create_task(run_tts_stream_request(client_ws, data))
+                    register_tts_generation(
+                        stream_session_id,
+                        stream_generation_id,
+                        stream_task,
+                    )
                 elif message_type == "stop":
-                    await cancel_tts_stream_task(stream_task)
-                    stream_task = None
+                    requested_generation_id = str(data.get("generation_id") or "").strip()
+                    result = await cancel_tts_generation(
+                        str(data.get("session_id") or stream_session_id or "web"),
+                        requested_generation_id or None,
+                    )
+                    if result["cancelled"]:
+                        stream_task = None
+                    await client_ws.send_json({"type": "stop_ack", **result})
+                elif message_type == "playback_progress":
+                    await record_tts_playback_progress(data)
                 elif message_type == "ping":
                     await client_ws.send_json({"type": "pong", "id": data.get("id")})
                 else:
@@ -424,6 +545,7 @@ async def tts_websocket_handler(request):
         logger.warning("[tts] browser websocket failed: %s", err)
     finally:
         await cancel_tts_stream_task(stream_task)
+        unregister_tts_generation(stream_session_id, stream_generation_id)
         if not client_ws.closed:
             await client_ws.close()
 

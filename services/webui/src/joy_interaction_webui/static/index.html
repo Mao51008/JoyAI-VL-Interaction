@@ -3976,6 +3976,10 @@ limitations under the License.
         let ttsSources = [];
         let ttsPcmRemainder = null;
         let ttsSpeaking = false;
+        let ttsGenerationId = '';
+        let ttsCurrentText = '';
+        let ttsPlaybackStartTime = null;
+        let ttsReceivedDuration = 0;
         let pendingTtsText = '';
         let ttsFinishTimer = null;
         let currentPromptText = '';
@@ -5405,16 +5409,47 @@ limitations under the License.
             }
         }
 
-        function stopTtsPlayback() {
+        function reportTtsPlaybackProgress(status = 'progress') {
+            if (!ttsWs || ttsWs.readyState !== WebSocket.OPEN || !ttsGenerationId) {
+                return;
+            }
+            const elapsedSeconds = ttsPlaybackStartTime == null || !ttsAudioContext
+                ? 0
+                : Math.max(0, ttsAudioContext.currentTime - ttsPlaybackStartTime);
+            const playedSeconds = Math.min(elapsedSeconds, ttsReceivedDuration || elapsedSeconds);
+            const playedRatio = ttsReceivedDuration > 0
+                ? Math.min(1, playedSeconds / ttsReceivedDuration)
+                : 0;
+            const playedText = ttsCurrentText.slice(
+                0,
+                Math.floor(ttsCurrentText.length * playedRatio)
+            );
+            ttsWs.send(JSON.stringify({
+                type: 'playback_progress',
+                session_id: sessionId,
+                request_id: ttsWs._requestId || ttsWs._pendingRequestId || '',
+                generation_id: ttsGenerationId,
+                status,
+                played_audio_ms: Math.round(playedSeconds * 1000),
+                played_text: playedText,
+                text: ttsCurrentText
+            }));
+        }
+
+        function stopTtsPlayback({ sendStop = true, status = 'stopped' } = {}) {
+            reportTtsPlaybackProgress(status);
             ttsRequestToken += 1;
 
             if (ttsWs && ttsWs.readyState === WebSocket.OPEN) {
                 ttsWs._acceptingAudio = false;
                 ttsWs._requestId = '';
-                ttsWs.send(JSON.stringify({
-                    type: 'stop',
-                    request_id: String(ttsRequestToken)
-                }));
+                if (sendStop) {
+                    ttsWs.send(JSON.stringify({
+                        type: 'stop',
+                        session_id: sessionId,
+                        generation_id: ttsGenerationId
+                    }));
+                }
             }
 
             ttsSources.forEach(source => {
@@ -5428,6 +5463,10 @@ limitations under the License.
             ttsNextPlayTime = 0;
             ttsPcmRemainder = null;
             ttsSpeaking = false;
+            ttsGenerationId = '';
+            ttsCurrentText = '';
+            ttsPlaybackStartTime = null;
+            ttsReceivedDuration = 0;
             pendingTtsText = '';
             updateTtsSpeakingDisplay('');
             if (ttsFinishTimer) {
@@ -5504,6 +5543,7 @@ limitations under the License.
                     if (message.type === 'start') {
                         const startedRequestId = String(message.request_id || message.reqid || '');
                         if (startedRequestId === ws._pendingRequestId) {
+                            ttsGenerationId = String(message.generation_id || ws._pendingGenerationId || '');
                             ws._sampleRate = Number(message.sample_rate) || ws._sampleRate || 24000;
                             ws._requestId = startedRequestId;
                             ws._acceptingAudio = true;
@@ -5607,6 +5647,10 @@ limitations under the License.
             source.connect(context.destination);
 
             const startAt = Math.max(context.currentTime + 0.02, ttsNextPlayTime || 0);
+            if (ttsPlaybackStartTime == null) {
+                ttsPlaybackStartTime = startAt;
+            }
+            ttsReceivedDuration += source.buffer.duration;
             ttsNextPlayTime = startAt + source.buffer.duration;
             ttsSources.push(source);
             scheduleTtsFinishCheck(String(requestToken));
@@ -5655,6 +5699,11 @@ limitations under the License.
                 }
                 ttsSpeaking = false;
                 ttsPcmRemainder = null;
+                reportTtsPlaybackProgress('done');
+                ttsGenerationId = '';
+                ttsCurrentText = '';
+                ttsPlaybackStartTime = null;
+                ttsReceivedDuration = 0;
                 updateTtsSpeakingDisplay('');
                 maybeSpeakPendingTts();
             }
@@ -5662,7 +5711,14 @@ limitations under the License.
 
         function startTtsSpeech(speechText) {
             const requestToken = ttsRequestToken;
+            const generationId = typeof window.crypto?.randomUUID === 'function'
+                ? window.crypto.randomUUID()
+                : `${sessionId}-${Date.now()}-${requestToken}`;
             ttsSpeaking = true;
+            ttsGenerationId = generationId;
+            ttsCurrentText = speechText;
+            ttsPlaybackStartTime = null;
+            ttsReceivedDuration = 0;
             updateTtsSpeakingDisplay(speechText);
             ttsPcmRemainder = null;
             ttsNextPlayTime = 0;
@@ -5677,13 +5733,15 @@ limitations under the License.
                 ws._sampleRate = 24000;
                 ws._requestId = '';
                 ws._pendingRequestId = String(requestToken);
+                ws._pendingGenerationId = generationId;
                 ws._acceptingAudio = false;
                 ws._serverDone = false;
                 ws.send(JSON.stringify({
                     type: 'speak',
                     text: speechText,
                     session_id: sessionId,
-                    request_id: String(requestToken)
+                    request_id: String(requestToken),
+                    generation_id: generationId
                 }));
             }).catch(error => {
                 if (requestToken === ttsRequestToken) {
@@ -8357,6 +8415,12 @@ limitations under the License.
                     return;
                 }
                 const data = JSON.parse(event.data);
+
+                if (data.type === 'omni_decision' && data.decision?.action === 'interrupt') {
+                    stopTtsPlayback({ sendStop: false, status: 'interrupted' });
+                    console.info('Omni interruption applied:', data.interruption || data.decision);
+                    return;
+                }
 
                 if (data.type === 'vlm_response') {
                     if (!isAnalysisRunning) {

@@ -47,7 +47,7 @@ from .omni.decision import cleanup_decision_engine, install_fake_decision_engine
 from .omni.orchestrator import cleanup_orchestrator, get_or_create_orchestrator
 from .omni.timeline import TimelineEvent
 from .rtsp_track import RTSPVideoTrack
-from .tts import setup_tts_routes
+from .tts import cancel_tts_generation, cleanup_tts_session, setup_tts_routes
 from .video_processor import VideoProcessorTrack
 from .vlm_service import SYSTEM_PROMPT_DEFAULT_KEY, VLMService
 
@@ -130,6 +130,29 @@ def notify_session_json(session_id: str, payload: dict):
     send_to_session(session_id, json.dumps(payload, ensure_ascii=False))
 
 
+async def handle_omni_decision(session_id: str, record) -> None:
+    payload = {"type": "omni_decision", "decision": record.to_dict()}
+    if record.action.kind.value == "interrupt":
+        try:
+            tts_result = await cancel_tts_generation(session_id)
+        except Exception as err:  # noqa: BLE001
+            logger.exception("[%s] Failed to cancel TTS generation", session_id)
+            tts_result = {"cancelled": False, "reason": f"cancel_error: {err}"}
+        session = sessions.get(session_id)
+        cancelled_vlm = 0
+        if session and session.get("vlm_service"):
+            try:
+                cancelled_vlm = await session["vlm_service"].cancel_active_requests()
+            except Exception:  # noqa: BLE001
+                logger.exception("[%s] Failed to cancel VLM generation", session_id)
+        payload["interruption"] = {
+            "browser_playback": "stop_requested",
+            "tts_generation": tts_result,
+            "cancelled_vlm_tasks": cancelled_vlm,
+        }
+    notify_session_json(session_id, payload)
+
+
 def handle_background_handoff_for_interaction(session_id: str, payload: dict) -> None:
     if not isinstance(payload, dict) or payload.get("type") != "background_result_ready":
         return
@@ -196,10 +219,7 @@ def get_or_create_session(session_id: str):
             orchestrator.start()
             sessions[session_id]["omni_decision_engine"] = install_fake_decision_engine(
                 orchestrator,
-                callback=lambda record, sid=session_id: notify_session_json(
-                    sid,
-                    {"type": "omni_decision", "decision": record.to_dict()},
-                ),
+                callback=lambda record, sid=session_id: handle_omni_decision(sid, record),
             )
         logger.info(f"Created new session: {session_id}")
     return sessions[session_id]
@@ -279,6 +299,7 @@ async def cleanup_session(session_id: str, reset_adapter: bool = True) -> dict:
 
     logger.info("[%s] Cleaning up session", session_id)
     audio_ingress_removed = cleanup_audio_ingress_session(session_id)
+    tts_generation_removed = await cleanup_tts_session(session_id)
 
     session_sockets = list(session_websockets.pop(session_id, set()))
     for ws in session_sockets:
@@ -332,6 +353,7 @@ async def cleanup_session(session_id: str, reset_adapter: bool = True) -> dict:
         "session_id": session_id,
         "removed": bool(session),
         "audio_ingress_removed": audio_ingress_removed,
+        "tts_generation_removed": tts_generation_removed,
         "orchestrator_removed": orchestrator_removed,
         "decision_engine_removed": decision_engine_removed,
         "websockets_closed": len(session_sockets),
