@@ -1,0 +1,13 @@
+{
+  "dataset": "JoyAI-VL-Interaction / CharadesEgo community media reconstruction",
+  "version": "momo321654-Interaction-videos-main-2026-07-30",
+  "source_uri": "https://huggingface.co/datasets/momo321654/Interaction-videos",
+  "license_name": "CharadesEgo non-commercial research terms; community redistribution pending independent review",
+  "license_tier": "research_only",
+  "allows_training": true,
+  "allows_modification": true,
+  "allows_redistribution": false,
+  "allows_commercial_use": false,
+  "teacher_model": "",
+  "teacher_config": {}
+}

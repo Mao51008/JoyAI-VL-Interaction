@@ -43,6 +43,7 @@ models/
 # Local dataset audit inputs, caches, and generated reports
 /datasets/chat_shard_*.json
 /datasets/audit_output/
+/datasets/media_audit_output/
 
 # Runtime logs, pid files, and temporary outputs
 *.log
