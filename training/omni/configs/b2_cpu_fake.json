@@ -1,0 +1,16 @@
+{
+  "step_ms": 1000,
+  "learning_rate": 0.1,
+  "total_steps": 12,
+  "save_every": 6,
+  "fake_audio_encoder": {
+    "hidden_size": 8,
+    "tokens_per_second": 13,
+    "commit_ms": 1000,
+    "active_window_ms": 8000
+  },
+  "fake_model": {
+    "bridge_hidden_size": 6,
+    "seed": 20260730
+  }
+}

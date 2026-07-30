@@ -1,0 +1,272 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://joyai.local/schema/omni-training-v1.schema.json",
+  "title": "JoyAI Omni Training Sample v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "sample_id",
+    "duration_ms",
+    "provenance"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "omni-training-v1"
+    },
+    "sample_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "provenance": {
+      "$ref": "#/$defs/provenance"
+    },
+    "audio": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/audio"
+      },
+      "default": []
+    },
+    "video": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/video"
+      },
+      "default": []
+    },
+    "text": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/text"
+      },
+      "default": []
+    },
+    "targets": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/target"
+      },
+      "default": []
+    },
+    "metadata": {
+      "type": "object",
+      "default": {}
+    }
+  },
+  "anyOf": [
+    {
+      "properties": {
+        "audio": {
+          "minItems": 1
+        }
+      },
+      "required": [
+        "audio"
+      ]
+    },
+    {
+      "properties": {
+        "video": {
+          "minItems": 1
+        }
+      },
+      "required": [
+        "video"
+      ]
+    },
+    {
+      "properties": {
+        "text": {
+          "minItems": 1
+        }
+      },
+      "required": [
+        "text"
+      ]
+    }
+  ],
+  "$defs": {
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dataset",
+        "version",
+        "source_uri",
+        "license_name",
+        "license_tier",
+        "allows_training",
+        "allows_modification",
+        "allows_redistribution",
+        "allows_commercial_use"
+      ],
+      "properties": {
+        "dataset": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_uri": {
+          "type": "string",
+          "minLength": 1
+        },
+        "license_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "license_tier": {
+          "enum": [
+            "redistributable",
+            "research_only"
+          ]
+        },
+        "allows_training": {
+          "const": true
+        },
+        "allows_modification": {
+          "type": "boolean"
+        },
+        "allows_redistribution": {
+          "type": "boolean"
+        },
+        "allows_commercial_use": {
+          "type": "boolean"
+        },
+        "teacher_model": {
+          "type": "string",
+          "default": ""
+        },
+        "teacher_config": {
+          "type": "object",
+          "default": {}
+        }
+      }
+    },
+    "audio": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "start_ms",
+        "end_ms",
+        "sample_rate",
+        "num_samples"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "start_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_ms": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sample_rate": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "num_samples": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "channel": {
+          "type": "string",
+          "default": "user_audio"
+        }
+      }
+    },
+    "video": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "timestamp_ms"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "timestamp_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "text": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "text",
+        "timestamp_ms"
+      ],
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1
+        },
+        "timestamp_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "channel": {
+          "type": "string",
+          "default": "user_text"
+        },
+        "auxiliary": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "timestamp_ms",
+        "action"
+      ],
+      "properties": {
+        "timestamp_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "action": {
+          "enum": [
+            "silence",
+            "response",
+            "delegate",
+            "interrupt"
+          ]
+        },
+        "text": {
+          "type": "string",
+          "default": ""
+        },
+        "semantic_tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 1
+        }
+      }
+    }
+  }
+}
