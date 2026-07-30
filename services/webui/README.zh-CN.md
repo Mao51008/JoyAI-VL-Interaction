@@ -159,6 +159,16 @@ TTS_ECHO_TAIL_SECONDS=1.5
 这是无需 GPU 的文本参考抑制，不替代 WebRTC AEC 或声学参考信号消除。扬声器、房间混响
 和耳机条件下的真实效果仍需在里程碑 A 设备验收中测试。
 
+## A8 无 GPU 场景验收
+
+`tests/test_a8_scenarios.py` 使用假响应模型和合成时间线事件覆盖安静办公室、纯视觉火灾、
+纯音频火警、烟雾与警报融合、变化中的 ASR partial、用户插话、危险事件抢占、回声中
+真实插话、重叠说话不确定性，以及虚拟 30 分钟长流。视觉假事件采用
+`modality="video"`、`kind="visual_event"` 和 `label=fire|flame|smoke|explosion`。
+
+这套测试不启动 GPU，也不代表真实 JoyAI-VL 已能从视频识别火灾。真实视频、麦克风、
+扬声器、ASR、CLAP、JoyAI-VL 和完整 30 分钟实时稳定性将在里程碑 A 集中验收。
+
 可以用环境变量调整缓冲长度：
 
 ```bash

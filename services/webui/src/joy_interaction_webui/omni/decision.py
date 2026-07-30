@@ -134,11 +134,17 @@ class SnapshotContextBuilder:
         for event in snapshot.events:
             age = self._age(snapshot, event)
             payload = event.payload
-            if event.modality == "video" and event.kind == "frame":
-                groups["Video observations"].append(
-                    f"- {age} frame={payload.get('frame_index', '?')} "
-                    f"size={payload.get('width', '?')}x{payload.get('height', '?')}"
-                )
+            if event.modality == "video":
+                if event.kind == "frame":
+                    groups["Video observations"].append(
+                        f"- {age} frame={payload.get('frame_index', '?')} "
+                        f"size={payload.get('width', '?')}x{payload.get('height', '?')}"
+                    )
+                else:
+                    groups["Video observations"].append(
+                        f"- {age} {event.kind} label={payload.get('label', '')} "
+                        f"confidence={float(payload.get('confidence') or 0):.3f}"
+                    )
             elif event.kind == "audio_event":
                 groups["Audio events"].append(
                     f"- {age} label={payload.get('label', '')} "
@@ -154,7 +160,14 @@ class SnapshotContextBuilder:
                         if metadata.get("likely_tts_echo")
                         else ""
                     )
-                    groups["Speech transcript"].append(f"- {age} {event.kind}:{echo_note} {text}")
+                    overlap_note = (
+                        " overlapping_speech uncertain"
+                        if metadata.get("overlapping_speech")
+                        else ""
+                    )
+                    groups["Speech transcript"].append(
+                        f"- {age} {event.kind}:{echo_note}{overlap_note} {text}"
+                    )
             elif event.kind == "user_query":
                 groups["User queries"].append(f"- {age} {(payload.get('text') or '')!s}")
             elif event.kind == "tts_playback":
@@ -194,6 +207,34 @@ class RuleBasedDecisionGate:
         "explosion",
         "glass_break",
     }
+    dangerous_visual_labels: ClassVar[set[str]] = {
+        "explosion",
+        "fire",
+        "flame",
+        "smoke",
+    }
+
+    def _audio_hazards(
+        self,
+        snapshot: MultimodalSnapshot,
+    ) -> list[TimelineEvent]:
+        return [
+            event
+            for event in snapshot.events
+            if event.kind == "audio_event" and event.payload.get("label") in self.dangerous_labels
+        ]
+
+    def _visual_hazards(
+        self,
+        snapshot: MultimodalSnapshot,
+    ) -> list[TimelineEvent]:
+        return [
+            event
+            for event in snapshot.events
+            if event.modality == "video"
+            and event.kind in {"visual_event", "observation"}
+            and event.payload.get("label") in self.dangerous_visual_labels
+        ]
 
     async def decide(
         self,
@@ -202,6 +243,8 @@ class RuleBasedDecisionGate:
     ) -> GateDecision:
         del context
         tts_events = [event for event in snapshot.events if event.kind == "tts_playback"]
+        audio_hazards = self._audio_hazards(snapshot)
+        visual_hazards = self._visual_hazards(snapshot)
         speech_updates = [
             event
             for event in snapshot.events
@@ -225,35 +268,64 @@ class RuleBasedDecisionGate:
 
         if tts_events and tts_events[-1].payload.get("status") == "playing":
             latest_tts = tts_events[-1]
-            for event in reversed(snapshot.events):
-                if (
-                    event.kind == "audio_event"
-                    and event.payload.get("label") in self.dangerous_labels
-                    and event.start_ms >= latest_tts.start_ms
-                ):
-                    return GateDecision(
-                        ActionKind.INTERRUPT,
-                        f"dangerous_audio_during_tts:{event.payload.get('label')}",
-                        urgent=True,
-                        confidence=float(event.payload.get("confidence") or 0),
-                    )
-
-        for event in reversed(snapshot.events):
-            if event.kind == "audio_event" and event.payload.get("label") in self.dangerous_labels:
+            hazards_during_tts = [
+                event
+                for event in (*audio_hazards, *visual_hazards)
+                if event.start_ms >= latest_tts.start_ms
+            ]
+            if hazards_during_tts:
+                event = max(hazards_during_tts, key=lambda item: item.start_ms)
                 return GateDecision(
-                    ActionKind.RESPONSE,
-                    f"dangerous_audio:{event.payload.get('label')}",
+                    ActionKind.INTERRUPT,
+                    f"dangerous_{event.modality}_during_tts:{event.payload.get('label')}",
                     urgent=True,
                     confidence=float(event.payload.get("confidence") or 0),
                 )
+
+        if audio_hazards and visual_hazards:
+            audio_event = audio_hazards[-1]
+            visual_event = visual_hazards[-1]
+            return GateDecision(
+                ActionKind.RESPONSE,
+                f"multimodal_danger:{visual_event.payload.get('label')}+"
+                f"{audio_event.payload.get('label')}",
+                urgent=True,
+                confidence=max(
+                    float(audio_event.payload.get("confidence") or 0),
+                    float(visual_event.payload.get("confidence") or 0),
+                ),
+            )
+        if audio_hazards:
+            event = audio_hazards[-1]
+            return GateDecision(
+                ActionKind.RESPONSE,
+                f"dangerous_audio:{event.payload.get('label')}",
+                urgent=True,
+                confidence=float(event.payload.get("confidence") or 0),
+            )
+        if visual_hazards:
+            event = visual_hazards[-1]
+            return GateDecision(
+                ActionKind.RESPONSE,
+                f"dangerous_video:{event.payload.get('label')}",
+                urgent=True,
+                confidence=float(event.payload.get("confidence") or 0),
+            )
         if any(event.kind == "user_query" for event in snapshot.events):
             return GateDecision(ActionKind.RESPONSE, "user_query")
-        if any(
-            event.kind == "speech_final"
-            and not (event.payload.get("metadata") or {}).get("likely_tts_echo")
-            for event in snapshot.events
-        ):
-            return GateDecision(ActionKind.RESPONSE, "speech_final")
+        for event in reversed(snapshot.events):
+            metadata = event.payload.get("metadata") or {}
+            if event.kind == "speech_final" and not metadata.get("likely_tts_echo"):
+                reason = (
+                    "speech_final_overlapping"
+                    if metadata.get("overlapping_speech")
+                    else "speech_final"
+                )
+                return GateDecision(
+                    ActionKind.RESPONSE,
+                    reason,
+                    confidence=float(event.payload.get("confidence") or 0),
+                )
         return GateDecision(ActionKind.SILENCE, "no_actionable_change")
 
 
@@ -270,10 +342,14 @@ class FakeResponseModel:
         context: DecisionContext,
         gate: GateDecision,
     ) -> str:
-        del snapshot, gate
+        del snapshot
         self.calls.append(context)
         if self.responses:
             return self.responses.popleft()
+        if gate.reason == "speech_final_overlapping":
+            return "</response> 检测到多人重叠说话，内容可能不完整，请分别说。"
+        if "danger" in gate.reason:
+            return "</response> 检测到危险情况，请立即远离并寻求帮助。"
         return "</response> 已检测到需要关注的情况。"
 
 
