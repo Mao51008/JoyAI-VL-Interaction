@@ -22,13 +22,17 @@ from joy_interaction_webui.omni.clap_audio_events import (
     ClapAudioEventDetector,
 )
 from joy_interaction_webui.omni.events import AudioWindow
-from joy_interaction_webui.omni.orchestrator import clear_orchestrators
+from joy_interaction_webui.omni.orchestrator import (
+    clear_orchestrators,
+    get_or_create_orchestrator,
+)
 from joy_interaction_webui.omni.stable_prefix import StablePrefixTracker
 from joy_interaction_webui.omni.streaming_asr import (
     StreamingASRConfig,
     StreamingASRCoordinator,
     TranscriptionResult,
 )
+from joy_interaction_webui.omni.timeline import TimelineEvent
 from joy_interaction_webui.omni.vllm_asr import (
     VllmASRConfig,
     VllmWindowTranscriber,
@@ -112,8 +116,7 @@ def test_ring_buffer_is_bounded_and_tracks_sequence_gaps() -> None:
     assert wider_window is not None
     assert wider_window.last_voice_ms == 120.0
     assert (
-        state.client_to_server_monotonic_ms(160.0)
-        - state.client_to_server_monotonic_ms(120.0)
+        state.client_to_server_monotonic_ms(160.0) - state.client_to_server_monotonic_ms(120.0)
         == 40.0
     )
 
@@ -351,9 +354,10 @@ def test_pathological_asr_repetition_filter() -> None:
 
 
 def test_qwen_asr_language_metadata_is_removed() -> None:
-    assert extract_text(
-        {"text": "language Chinese<asr_text>甚至出现交易几乎停滞的情况。"}
-    ) == "甚至出现交易几乎停滞的情况。"
+    assert (
+        extract_text({"text": "language Chinese<asr_text>甚至出现交易几乎停滞的情况。"})
+        == "甚至出现交易几乎停滞的情况。"
+    )
 
 
 @pytest.mark.asyncio
@@ -418,15 +422,76 @@ async def test_audio_ingress_can_stream_coordinator_events_to_browser() -> None:
             assert start["kind"] == "speech_start"
             assert partial["kind"] == "speech_partial"
             assert partial["text"] == "检测到说话"
-            timeline = await client.get(
-                "/api/timeline?session_id=test-session&lookback_seconds=10"
-            )
+            timeline = await client.get("/api/timeline?session_id=test-session&lookback_seconds=10")
             timeline_payload = await timeline.json()
             assert [event["kind"] for event in timeline_payload["events"]] == [
                 "speech_start",
                 "speech_partial",
             ]
             assert timeline_payload["events"][1]["payload"]["text"] == "检测到说话"
+            await ws.close()
+    finally:
+        set_audio_ingress_coordinator_factory(None)
+        audio_ingress_sessions.clear()
+        await clear_orchestrators()
+
+
+@pytest.mark.asyncio
+async def test_audio_ingress_marks_tts_echo_in_browser_and_timeline() -> None:
+    def factory(*, session_id, snapshot, emit):
+        return StreamingASRCoordinator(
+            session_id,
+            snapshot,
+            SequenceTranscriber(["请立即撤离危险区域"]),
+            emit,
+            config=StreamingASRConfig(interval_seconds=0.01),
+        )
+
+    audio_ingress_sessions.clear()
+    await clear_orchestrators()
+    set_audio_ingress_coordinator_factory(factory)
+    orchestrator = get_or_create_orchestrator("echo-session")
+    now_ms = orchestrator.clock()
+    await orchestrator.record_event(
+        TimelineEvent(
+            "echo-session",
+            "audio",
+            "tts_playback",
+            now_ms,
+            now_ms,
+            {
+                "source": "system_output",
+                "generation_id": "generation-1",
+                "status": "playing",
+                "text": "请立即撤离危险区域",
+            },
+        )
+    )
+    app = web.Application()
+    setup_asr_routes(app)
+    try:
+        async with TestClient(TestServer(app)) as client:
+            ws = await client.ws_connect("/ws/audio-ingress?session_id=echo-session")
+            await ws.receive_json()
+            await ws.send_bytes(
+                make_packet(session_id="echo-session", sequence=1, voice_active=True)
+            )
+
+            await ws.receive_json(timeout=1)
+            partial = await ws.receive_json(timeout=1)
+
+            assert partial["kind"] == "speech_partial"
+            assert partial["metadata"]["likely_tts_echo"] is True
+            timeline = await client.get("/api/timeline?session_id=echo-session&lookback_seconds=10")
+            timeline_payload = await timeline.json()
+            partial_event = next(
+                event for event in timeline_payload["events"] if event["kind"] == "speech_partial"
+            )
+            assert partial_event["payload"]["metadata"]["likely_tts_echo"] is True
+            assert (
+                partial_event["payload"]["metadata"]["echo_reference_generation_id"]
+                == "generation-1"
+            )
             await ws.close()
     finally:
         set_audio_ingress_coordinator_factory(None)

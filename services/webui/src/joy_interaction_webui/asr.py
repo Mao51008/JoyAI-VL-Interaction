@@ -18,6 +18,10 @@ from joy_interaction_webui.omni.clap_audio_events import (
     ClapAudioEventConfig,
     ClapAudioEventDetector,
 )
+from joy_interaction_webui.omni.echo_filter import (
+    TTSEchoFilter,
+    echo_filter_config_from_env,
+)
 from joy_interaction_webui.omni.events import AudioWindow
 from joy_interaction_webui.omni.orchestrator import (
     get_or_create_orchestrator,
@@ -716,6 +720,7 @@ async def audio_ingress_websocket_handler(request):
     orchestrator = get_or_create_orchestrator(session_id)
     orchestrator.start()
     coordinator: StreamingASRCoordinator | None = None
+    echo_filter = TTSEchoFilter(echo_filter_config_from_env())
     state.connection_opened()
     logger.info("[%s] Continuous audio ingress connected", session_id)
     await send_asr_client_json(
@@ -731,6 +736,11 @@ async def audio_ingress_websocket_handler(request):
     if audio_ingress_coordinator_factory is not None:
 
         async def emit_audio_event(event):
+            event = echo_filter.annotate(
+                event,
+                orchestrator.timeline.snapshot(),
+                now_ms=time.monotonic() * 1000,
+            )
             await orchestrator.record_event(
                 TimelineEvent.from_audio(
                     event,

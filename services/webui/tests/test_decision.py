@@ -205,7 +205,14 @@ async def test_user_speech_during_tts_produces_interrupt_without_response_call()
         8000,
         {"status": "playing", "source": "system_output"},
     )
-    speech = TimelineEvent("s", "audio", "speech_start", 9000, 9000)
+    speech = TimelineEvent(
+        "s",
+        "audio",
+        "speech_partial",
+        9000,
+        9200,
+        {"text": "等一下", "metadata": {"echo_checked": True, "likely_tts_echo": False}},
+    )
 
     record = await engine.evaluate_snapshot(snapshot(1, [playing, speech], trigger="priority"))
 
@@ -214,6 +221,44 @@ async def test_user_speech_during_tts_produces_interrupt_without_response_call()
     assert record.trigger_reason == "user_speech_during_tts"
     assert model.calls == []
     assert engine.stats["interrupts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_tts_echo_does_not_interrupt_or_trigger_response() -> None:
+    orchestrator = OmniOrchestrator("s", clock=lambda: 10_000)
+    model = FakeResponseModel()
+    engine = OmniDecisionEngine(
+        orchestrator,
+        RuleBasedDecisionGate(),
+        model,
+        clock=lambda: 10_000,
+    )
+    playing = TimelineEvent(
+        "s",
+        "audio",
+        "tts_playback",
+        8000,
+        8000,
+        {"status": "playing", "text": "请立即撤离", "generation_id": "generation-1"},
+    )
+    echo = TimelineEvent(
+        "s",
+        "audio",
+        "speech_final",
+        9000,
+        9200,
+        {
+            "text": "请立即撤离",
+            "metadata": {"likely_tts_echo": True, "echo_similarity": 1.0},
+        },
+    )
+
+    record = await engine.evaluate_snapshot(snapshot(1, [playing, echo], trigger="priority"))
+
+    assert record is not None
+    assert record.action.kind == ActionKind.SILENCE
+    assert record.trigger_reason == "no_actionable_change"
+    assert model.calls == []
 
 
 @pytest.mark.asyncio

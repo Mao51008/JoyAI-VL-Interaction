@@ -147,7 +147,14 @@ class SnapshotContextBuilder:
             elif event.kind in {"speech_partial", "speech_stable", "speech_final"}:
                 text = str(payload.get("text") or payload.get("stable_prefix") or "")
                 if text:
-                    groups["Speech transcript"].append(f"- {age} {event.kind}: {text}")
+                    metadata = payload.get("metadata") or {}
+                    echo_note = (
+                        f" likely_tts_echo similarity="
+                        f"{float(metadata.get('echo_similarity') or 0):.3f}"
+                        if metadata.get("likely_tts_echo")
+                        else ""
+                    )
+                    groups["Speech transcript"].append(f"- {age} {event.kind}:{echo_note} {text}")
             elif event.kind == "user_query":
                 groups["User queries"].append(f"- {age} {(payload.get('text') or '')!s}")
             elif event.kind == "tts_playback":
@@ -195,19 +202,26 @@ class RuleBasedDecisionGate:
     ) -> GateDecision:
         del context
         tts_events = [event for event in snapshot.events if event.kind == "tts_playback"]
-        speech_starts = [event for event in snapshot.events if event.kind == "speech_start"]
-        if tts_events and speech_starts:
+        speech_updates = [
+            event
+            for event in snapshot.events
+            if event.kind in {"speech_partial", "speech_stable", "speech_final"}
+            and (event.payload.get("text") or event.payload.get("stable_prefix"))
+        ]
+        if tts_events and speech_updates:
             latest_tts = tts_events[-1]
-            latest_speech = speech_starts[-1]
-            if (
-                latest_tts.payload.get("status") == "playing"
-                and latest_speech.start_ms >= latest_tts.start_ms
-            ):
-                return GateDecision(
-                    ActionKind.INTERRUPT,
-                    "user_speech_during_tts",
-                    urgent=True,
-                )
+            if latest_tts.payload.get("status") == "playing":
+                for speech_event in reversed(speech_updates):
+                    metadata = speech_event.payload.get("metadata") or {}
+                    if speech_event.end_ms < latest_tts.start_ms:
+                        break
+                    if metadata.get("likely_tts_echo"):
+                        continue
+                    return GateDecision(
+                        ActionKind.INTERRUPT,
+                        "user_speech_during_tts",
+                        urgent=True,
+                    )
 
         if tts_events and tts_events[-1].payload.get("status") == "playing":
             latest_tts = tts_events[-1]
@@ -234,7 +248,11 @@ class RuleBasedDecisionGate:
                 )
         if any(event.kind == "user_query" for event in snapshot.events):
             return GateDecision(ActionKind.RESPONSE, "user_query")
-        if any(event.kind == "speech_final" for event in snapshot.events):
+        if any(
+            event.kind == "speech_final"
+            and not (event.payload.get("metadata") or {}).get("likely_tts_echo")
+            for event in snapshot.events
+        ):
             return GateDecision(ActionKind.RESPONSE, "speech_final")
         return GateDecision(ActionKind.SILENCE, "no_actionable_change")
 

@@ -141,6 +141,24 @@ A6 为每次浏览器 TTS 播放分配独立 `generation_id`。服务端按会�
 误认为已经播出。该功能已有无 GPU 自动化测试，真实浏览器打断延迟和外放插话仍待
 里程碑 A 集中验收。
 
+## TTS 回声参考过滤
+
+A7 在浏览器 acoustic echo cancellation 之外增加服务端文本参考过滤。连续 ASR 的
+partial、stable 和 final 文本会与当前或刚结束的 TTS 文本比较，高相似结果携带
+`likely_tts_echo`、相似度和参考 `generation_id`，并写入时间线。决策门控忽略纯回声，
+但与 TTS 不同的新增用户内容仍会触发 barge-in；麦克风始终保持开启。
+
+可调参数：
+
+```bash
+TTS_ECHO_SIMILARITY_THRESHOLD=0.82
+TTS_ECHO_MIN_TEXT_CHARS=4
+TTS_ECHO_TAIL_SECONDS=1.5
+```
+
+这是无需 GPU 的文本参考抑制，不替代 WebRTC AEC 或声学参考信号消除。扬声器、房间混响
+和耳机条件下的真实效果仍需在里程碑 A 设备验收中测试。
+
 可以用环境变量调整缓冲长度：
 
 ```bash
