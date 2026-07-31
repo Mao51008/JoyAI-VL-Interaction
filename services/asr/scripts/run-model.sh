@@ -5,7 +5,15 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SERVICE_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd -- "$SERVICE_DIR/../.." && pwd)"
 INSTALL_DIR="$REPO_ROOT/install"
-ASR_VENV_DIR="${ASR_VENV_DIR:-$SERVICE_DIR/.venv}"
+ASR_BACKEND="${ASR_BACKEND:-vllm}"
+ASR_VENV_DIR="${ASR_VENV_DIR:-}"
+if [[ -z "$ASR_VENV_DIR" ]]; then
+  if [[ "$ASR_BACKEND" == "transformers" && -d "$SERVICE_DIR/.venv-cu124" ]]; then
+    ASR_VENV_DIR="$SERVICE_DIR/.venv-cu124"
+  else
+    ASR_VENV_DIR="$SERVICE_DIR/.venv"
+  fi
+fi
 MODEL_ROOT="${MODEL_ROOT:-/tmp/models}"
 ASR_MODEL_DIR="${ASR_MODEL_DIR:-$MODEL_ROOT/Qwen3-ASR-1.7B}"
 ASR_MODEL_NAME="${ASR_MODEL_NAME:-Qwen/Qwen3-ASR-1.7B}"
@@ -41,7 +49,18 @@ fi
 
 # shellcheck source=/dev/null
 source "$ASR_VENV_DIR/bin/activate"
-if command -v qwen-asr-serve >/dev/null 2>&1; then
+if [[ "$ASR_BACKEND" == "transformers" ]]; then
+  exec env \
+    CUDA_VISIBLE_DEVICES="$ASR_GPU" \
+    ASR_MODEL_DIR="$ASR_MODEL_DIR" \
+    ASR_MODEL_NAME="$ASR_MODEL_NAME" \
+    ASR_HOST="$ASR_HOST" \
+    ASR_PORT="$ASR_PORT" \
+    python "$SERVICE_DIR/native_server.py"
+elif [[ "$ASR_BACKEND" != "vllm" ]]; then
+  echo "Unsupported ASR_BACKEND: $ASR_BACKEND; expected vllm or transformers" >&2
+  exit 2
+elif command -v qwen-asr-serve >/dev/null 2>&1; then
   ASR_SERVER_COMMAND=(qwen-asr-serve)
 else
   ASR_SERVER_COMMAND=(vllm serve)

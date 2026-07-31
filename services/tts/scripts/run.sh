@@ -18,9 +18,11 @@ fi
 usage() {
   cat <<'EOF'
 Usage:
-  bash scripts/run.sh model      Start the TTS vLLM Omni service.
+  bash scripts/run.sh model      Start the TTS model service.
   bash scripts/run.sh adapter    Start the TTS adapter.
   bash scripts/run.sh all        Start TTS model in background, then adapter in foreground.
+
+Set TTS_BACKEND=transformers to use the native CUDA-compatible service.
 EOF
 }
 

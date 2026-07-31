@@ -24,9 +24,10 @@ dev = [
 
 [project.scripts]
 joyvl-tts-adapter = "tts_adapter:main"
+joyvl-tts-native = "native_server:main"
 
 [tool.setuptools]
-py-modules = ["tts_adapter"]
+py-modules = ["tts_adapter", "native_server"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

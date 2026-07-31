@@ -5,7 +5,15 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SERVICE_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd -- "$SERVICE_DIR/../.." && pwd)"
 INSTALL_DIR="$REPO_ROOT/install"
-TTS_VENV_DIR="${TTS_VENV_DIR:-$SERVICE_DIR/.venv}"
+TTS_BACKEND="${TTS_BACKEND:-vllm}"
+TTS_VENV_DIR="${TTS_VENV_DIR:-}"
+if [[ -z "$TTS_VENV_DIR" ]]; then
+  if [[ "$TTS_BACKEND" == "transformers" && -d "$SERVICE_DIR/.venv-cu124" ]]; then
+    TTS_VENV_DIR="$SERVICE_DIR/.venv-cu124"
+  else
+    TTS_VENV_DIR="$SERVICE_DIR/.venv"
+  fi
+fi
 MODEL_ROOT="${MODEL_ROOT:-/tmp/models}"
 TTS_MODEL_DIR="${TTS_MODEL_DIR:-$MODEL_ROOT/Qwen3-TTS-12Hz-1.7B-CustomVoice}"
 TTS_MODEL_NAME="${TTS_MODEL_NAME:-Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice}"
@@ -41,6 +49,18 @@ fi
 
 # shellcheck source=/dev/null
 source "$TTS_VENV_DIR/bin/activate"
+
+if [[ "$TTS_BACKEND" == "transformers" ]]; then
+  exec env \
+    CUDA_VISIBLE_DEVICES="$TTS_GPU" \
+    TTS_MODEL_DIR="$TTS_MODEL_DIR" \
+    TTS_MODEL_NAME="$TTS_MODEL_NAME" \
+    TTS_PORT="$TTS_PORT" \
+    python "$SERVICE_DIR/native_server.py"
+elif [[ "$TTS_BACKEND" != "vllm" ]]; then
+  echo "Unsupported TTS_BACKEND: $TTS_BACKEND; expected vllm or transformers" >&2
+  exit 2
+fi
 
 if [ -z "$TTS_DEPLOY_CONFIG" ] && [ "$TTS_LOW_MEMORY_CONFIG" != "0" ]; then
   TTS_DEPLOY_CONFIG="$SERVICE_DIR/config/qwen3_tts_lowmem.yaml"

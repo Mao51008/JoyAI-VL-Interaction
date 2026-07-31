@@ -18,9 +18,11 @@ fi
 usage() {
   cat <<'EOF'
 Usage:
-  bash scripts/run.sh model      Start the ASR vLLM service.
+  bash scripts/run.sh model      Start the ASR model service.
   bash scripts/run.sh adapter    Start the ASR adapter.
   bash scripts/run.sh all        Start ASR model in background, then adapter in foreground.
+
+Set ASR_BACKEND=transformers to use the native CUDA-compatible service.
 EOF
 }
 

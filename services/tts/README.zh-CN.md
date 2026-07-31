@@ -145,3 +145,21 @@ curl http://127.0.0.1:8991/v1/models
 - `TTS_WARMUP_TEXT`：自动预热短文本，默认为一段短问候
 - `TTS_WARMUP_OUTPUT`：自动预热输出文件，默认 `/tmp/joyvl_tts_warmup.pcm`
 - `TTS_WARMUP_TIMEOUT`：一次自动预热冒烟测试的超时时间，默认 `180` 秒
+
+## 原生 Transformers 后端
+
+当驱动无法运行 vLLM-Omni 时，可以使用 `qwen-tts` 原生后端，并保留 adapter 使用的
+`8991/v1/audio/speech/stream` WebSocket 协议：
+
+```bash
+PATH=/data/maoyy/miniforge3/bin:$PATH \
+TTS_BACKEND=transformers \
+TTS_VENV_DIR=services/tts/.venv-cu124 \
+MODEL_ROOT=/data/maoyy/models \
+TTS_GPU=1 \
+bash services/tts/scripts/run.sh all
+```
+
+该后端先生成完整波形，再按 PCM 块发送；`/health` 会返回
+`native_streaming=false` 和 `generation_cancellable=false`。客户端可以停止播放，
+但断开连接不能中止已经进入 Transformers `generate()` 的 GPU 计算。

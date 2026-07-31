@@ -113,3 +113,21 @@ joyvl-asr-adapter smoke --wav <mono-pcm16-wav-file>
 
 - vLLM Qwen3-ASR recipe: https://docs.vllm.ai/projects/recipes/en/latest/Qwen/Qwen3-ASR.html
 - Qwen3-ASR model card: https://huggingface.co/Qwen/Qwen3-ASR-1.7B
+
+## Native Transformers backend
+
+If the installed driver cannot run the current vLLM wheel, use the `qwen-asr`
+Transformers backend while keeping the existing `8993/v1/audio/transcriptions`
+contract:
+
+```bash
+ASR_BACKEND=transformers \
+ASR_VENV_DIR=services/asr/.venv-cu124 \
+MODEL_ROOT=/data/maoyy/models \
+ASR_GPU=1 \
+bash services/asr/scripts/run.sh all
+```
+
+Create the environments with `./install/install-native-transformers-runtime.sh`.
+This backend transcribes a complete request and does not expose model-native
+incremental decoding.

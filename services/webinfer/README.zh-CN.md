@@ -176,3 +176,20 @@ ss -ltnp | rg ':(7060|8065|8070)\b'
 - 中间摘要和长期记忆压缩共用 `SUMMARIZER_API_BASE/SUMMARIZER_MODEL`。如果上下文超过限制，请降低 `LONG_TERM_MAX_TOKENS/LONG_TERM_TARGET_TOKEN_COUNT`，或提高 `SUMMARY_MAX_MODEL_LEN`。
 - `SUMMARIZER_KEY_FRAMES=0` 会将 chunk 中每一帧都发送给摘要模型，chunk 较大时速度更慢，请求也更大。
 - `scripts/start_summary_model.sh` 会覆盖 PID 文件。再次运行前，请检查端口和旧进程。
+
+## 原生 Transformers 主模型后端
+
+驱动无法运行当前 vLLM wheel 时，可以保留原来的 OpenAI API 地址并切换到原生后端：
+
+```bash
+MAIN_BACKEND=transformers \
+VENV_ACTIVATE=services/.venv-cu124/bin/activate \
+PYTHON_BIN=services/.venv-cu124/bin/python \
+MODEL_PATH=/data/maoyy/models/jdopensource/JoyAI-VL-Interaction \
+MAIN_GPU=0 \
+bash services/webinfer/scripts/run.sh models
+```
+
+原生服务实现 `/health`、`/v1/models` 和非 SSE 的 `/v1/chat/completions`，
+支持文本和 `data:`/HTTP(S) 图像。它串行化单卡推理，适合兼容验证，不替代 vLLM
+的吞吐和长上下文验收。

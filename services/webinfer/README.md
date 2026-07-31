@@ -176,3 +176,21 @@ ss -ltnp | rg ':(7060|8065|8070)\b'
 - Intermediate summaries and long-term memory compression share `SUMMARIZER_API_BASE/SUMMARIZER_MODEL`. If the context exceeds the limit, lower `LONG_TERM_MAX_TOKENS/LONG_TERM_TARGET_TOKEN_COUNT` or increase `SUMMARY_MAX_MODEL_LEN`.
 - `SUMMARIZER_KEY_FRAMES=0` sends every frame in the chunk to the summary model, which is slower and creates larger requests when chunks are large.
 - `scripts/start_summary_model.sh` overwrites the PID file. Before running it again, check the port and any old process.
+
+## Native Transformers main-model backend
+
+If the installed driver cannot run the current vLLM wheel, keep the same OpenAI
+API address and select the native backend:
+
+```bash
+MAIN_BACKEND=transformers \
+VENV_ACTIVATE=services/.venv-cu124/bin/activate \
+PYTHON_BIN=services/.venv-cu124/bin/python \
+MODEL_PATH=/data/maoyy/models/jdopensource/JoyAI-VL-Interaction \
+MAIN_GPU=0 \
+bash services/webinfer/scripts/run.sh models
+```
+
+The native service implements `/health`, `/v1/models`, and non-SSE
+`/v1/chat/completions` with text and `data:`/HTTP(S) images. It serializes
+single-GPU inference and is intended as a compatibility fallback.

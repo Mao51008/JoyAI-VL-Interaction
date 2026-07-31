@@ -145,3 +145,21 @@ curl http://127.0.0.1:8991/v1/models
 - `TTS_WARMUP_TEXT`: short text for automatic warmup, default is a short greeting
 - `TTS_WARMUP_OUTPUT`: automatic warmup output file, default `/tmp/joyvl_tts_warmup.pcm`
 - `TTS_WARMUP_TIMEOUT`: timeout for one automatic warmup smoke test, default `180` seconds
+
+## Native Transformers backend
+
+If the installed driver cannot run vLLM-Omni, use the `qwen-tts` native backend
+while preserving the adapter's `8991/v1/audio/speech/stream` WebSocket contract:
+
+```bash
+PATH=/data/maoyy/miniforge3/bin:$PATH \
+TTS_BACKEND=transformers \
+TTS_VENV_DIR=services/tts/.venv-cu124 \
+MODEL_ROOT=/data/maoyy/models \
+TTS_GPU=1 \
+bash services/tts/scripts/run.sh all
+```
+
+This backend generates the complete waveform before sending PCM chunks. Its
+health response reports `native_streaming=false` and
+`generation_cancellable=false`.

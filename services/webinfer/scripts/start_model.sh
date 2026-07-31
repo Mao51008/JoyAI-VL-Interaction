@@ -8,6 +8,7 @@ if [[ -n "${VENV_ACTIVATE:-}" ]]; then
   set -u
 fi
 MAIN_GPU="${MAIN_GPU:-0}"
+MAIN_BACKEND="${MAIN_BACKEND:-vllm}"
 IFS=',' read -ra GPU_LIST <<< "${MAIN_GPU}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-${#GPU_LIST[@]}}"
 DATA_PARALLEL_SIZE="${DATA_PARALLEL_SIZE:-1}"
@@ -37,8 +38,9 @@ if [[ ! -d "${MODEL_PATH}" ]] || [[ -z "$(find "${MODEL_PATH}" -mindepth 1 -prin
 fi
 
 echo "============================================================"
-echo "Starting Main VLM Model (vLLM OpenAI API Server)"
+echo "Starting Main VLM Model (OpenAI-compatible API Server)"
 echo "  Model: ${MODEL_PATH}"
+echo "  Backend: ${MAIN_BACKEND}"
 echo "  Served model name: ${SERVED_MODEL_NAME}"
 echo "  Port:  ${MAIN_MODEL_PORT}"
 echo "  GPU:   ${MAIN_GPU}"
@@ -62,17 +64,29 @@ cleanup() {
 }
 trap cleanup INT TERM
 
-CUDA_VISIBLE_DEVICES="${MAIN_GPU}" "${PYTHON_BIN}" -m vllm.entrypoints.openai.api_server \
-    --model "${MODEL_PATH}" \
-    --served-model-name "${SERVED_MODEL_NAME}" \
-    --port "${MAIN_MODEL_PORT}" \
-    --gpu-memory-utilization "${MAIN_GPU_MEMORY_UTILIZATION}" \
-    --max-model-len "${MAX_MODEL_LEN}" \
-    --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
-    --data-parallel-size "${DATA_PARALLEL_SIZE}" \
-    --data-parallel-size-local "${DATA_PARALLEL_SIZE_LOCAL}" \
-    --enable-prefix-caching \
-    --enable-chunked-prefill &
+if [[ "${MAIN_BACKEND}" == "transformers" ]]; then
+    env \
+        CUDA_VISIBLE_DEVICES="${MAIN_GPU}" \
+        MODEL_PATH="${MODEL_PATH}" \
+        SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
+        MAIN_MODEL_PORT="${MAIN_MODEL_PORT}" \
+        "${PYTHON_BIN}" "${SERVICE_DIR}/transformers_server.py" &
+elif [[ "${MAIN_BACKEND}" == "vllm" ]]; then
+    CUDA_VISIBLE_DEVICES="${MAIN_GPU}" "${PYTHON_BIN}" -m vllm.entrypoints.openai.api_server \
+        --model "${MODEL_PATH}" \
+        --served-model-name "${SERVED_MODEL_NAME}" \
+        --port "${MAIN_MODEL_PORT}" \
+        --gpu-memory-utilization "${MAIN_GPU_MEMORY_UTILIZATION}" \
+        --max-model-len "${MAX_MODEL_LEN}" \
+        --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
+        --data-parallel-size "${DATA_PARALLEL_SIZE}" \
+        --data-parallel-size-local "${DATA_PARALLEL_SIZE_LOCAL}" \
+        --enable-prefix-caching \
+        --enable-chunked-prefill &
+else
+    echo "Unsupported MAIN_BACKEND: ${MAIN_BACKEND}; expected vllm or transformers" >&2
+    exit 2
+fi
 MODEL_PID=$!
 
 if [[ "${MAIN_SMOKE_ENABLE}" != "0" ]]; then
