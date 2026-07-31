@@ -37,6 +37,20 @@ def canonical_video_key(value: str) -> str:
     )
 
 
+def is_media_member_name(value: str) -> bool:
+    """Recognize normal media files and JoyAI's extensionless video members."""
+    path = PurePosixPath(value.replace("\\", "/"))
+    suffix = Path(path.name).suffix.lower()
+    if suffix in MEDIA_SUFFIXES:
+        return True
+    return (
+        not suffix
+        and len(path.parts) >= 3
+        and path.parts[0].casefold() == "videos_pool"
+        and bool(path.name)
+    )
+
+
 def load_annotation_index(
     path: Path,
     *,
@@ -81,8 +95,7 @@ def scan_archive(
         for member in archive:
             if not member.isfile():
                 continue
-            suffix = Path(PurePosixPath(member.name).name).suffix.lower()
-            if suffix not in MEDIA_SUFFIXES:
+            if not is_media_member_name(member.name):
                 continue
             media_members += 1
             key = canonical_video_key(member.name)
@@ -329,7 +342,7 @@ def extract_frames(
     if not _tool_available(ffmpeg):
         return "tool_missing", [], ffmpeg
     frame_dir.mkdir(parents=True, exist_ok=True)
-    pattern = frame_dir / "frame_%06d.jpg"
+    pattern = frame_dir / "frame_%06d.png"
     result = subprocess.run(
         [
             ffmpeg,
@@ -342,8 +355,6 @@ def extract_frames(
             f"fps={fps}",
             "-start_number",
             "0",
-            "-q:v",
-            "5",
             "-y",
             str(pattern),
         ],
@@ -353,9 +364,29 @@ def extract_frames(
     )
     if result.returncode:
         return "failed", [], result.stderr.strip()
+    if not any(frame_dir.glob("frame_*.png")):
+        fallback = subprocess.run(
+            [
+                ffmpeg,
+                "-v",
+                "error",
+                "-nostdin",
+                "-i",
+                str(path),
+                "-frames:v",
+                "1",
+                "-y",
+                str(frame_dir / "frame_000000.png"),
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if fallback.returncode:
+            return "failed", [], fallback.stderr.strip()
     frames = [
         {"path": str(frame.resolve()), "timestamp_ms": round(index * 1000 / fps)}
-        for index, frame in enumerate(sorted(frame_dir.glob("frame_*.jpg")))
+        for index, frame in enumerate(sorted(frame_dir.glob("frame_*.png")))
     ]
     return ("ok", frames, "") if frames else ("failed", [], "no frames extracted")
 

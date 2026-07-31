@@ -36,6 +36,48 @@ class AuditMediaArchiveTest(unittest.TestCase):
             "abc_action_1",
         )
 
+    def test_media_member_recognizes_extensionless_joyai_video(self) -> None:
+        self.assertTrue(
+            AUDIT.is_media_member_name("videos_pool/CharadesEgo/ABC_action_1")
+        )
+        self.assertTrue(
+            AUDIT.is_media_member_name("videos_pool/CharadesEgo/ABC_action_1.MP4")
+        )
+        self.assertFalse(AUDIT.is_media_member_name("ABC_action_1"))
+        self.assertFalse(AUDIT.is_media_member_name("README.txt"))
+
+    def test_scan_matches_extensionless_joyai_video(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive_path = root / "extensionless.tar"
+            content = b"extensionless-video"
+            with tarfile.open(archive_path, "w") as archive:
+                info = tarfile.TarInfo("videos_pool/CharadesEgo/ABC_action_1")
+                info.size = len(content)
+                archive.addfile(info, io.BytesIO(content))
+            annotations = {
+                "abc_action_1": {
+                    "video_name": "ABC_action_1",
+                    "records": [{}],
+                    "max_annotation_time_s": 1.0,
+                }
+            }
+            matches, summary = AUDIT.scan_archive(
+                archive_path,
+                annotations,
+            )
+            self.assertEqual(summary["media_member_count"], 1)
+            self.assertEqual(summary["matched_unique_video_names"], 1)
+            extracted = AUDIT.extract_selected(
+                archive_path,
+                matches,
+                root / "extracted",
+            )
+            self.assertEqual(
+                extracted["ABC_action_1"].read_bytes(),
+                content,
+            )
+
     def test_scan_match_select_and_safe_extract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -74,6 +116,54 @@ class AuditMediaArchiveTest(unittest.TestCase):
         )
         self.assertEqual(selected[0].video_name, "two")
         self.assertEqual(selected[0].selection_reason, "priority_candidate")
+
+    def test_extract_frames_uses_png_for_ffmpeg_8_compatibility(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with (
+                mock.patch.object(AUDIT, "_tool_available", return_value=True),
+                mock.patch.object(
+                    AUDIT.subprocess,
+                    "run",
+                    return_value=SimpleNamespace(
+                        returncode=1,
+                        stderr="expected test failure",
+                    ),
+                ) as run,
+            ):
+                AUDIT.extract_frames(
+                    root / "input.mp4",
+                    root / "frames",
+                )
+            command = run.call_args.args[0]
+            self.assertTrue(str(command[-1]).endswith("frame_%06d.png"))
+            self.assertNotIn("-q:v", command)
+
+    def test_extract_frames_falls_back_to_first_frame_for_short_video(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with (
+                mock.patch.object(AUDIT, "_tool_available", return_value=True),
+                mock.patch.object(
+                    AUDIT.subprocess,
+                    "run",
+                    return_value=SimpleNamespace(returncode=0, stderr=""),
+                ) as run,
+            ):
+                status, frames, error = AUDIT.extract_frames(
+                    root / "input.mp4",
+                    root / "frames",
+                )
+            self.assertEqual(status, "failed")
+            self.assertEqual(frames, [])
+            self.assertEqual(error, "no frames extracted")
+            self.assertEqual(run.call_count, 2)
+            fallback_command = run.call_args_list[1].args[0]
+            frame_count_index = fallback_command.index("-frames:v")
+            self.assertEqual(
+                fallback_command[frame_count_index + 1],
+                "1",
+            )
 
     def test_probe_payload_reports_audio_and_video_contract(self) -> None:
         parsed = AUDIT.parse_probe_payload(
