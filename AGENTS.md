@@ -82,6 +82,9 @@ Pytest 按 `test_*.py`、`Test*` 和 `test_*` 规则发现测试；异步测试�
 
 ## Omni 第一阶段训练约束
 
+- 主力 4090 的 projector-only 训练使用独立环境 `/data/maoyy/joyai-runtime/omni-training/.venv`，由 `/data/maoyy/.local/bin/uv venv --system-site-packages` 创建；该环境仅用于训练与模型 shape probe，绝不得替换、升级或写入 `services/.venv`、vLLM/vLLM-Omni 或线上 WebUI 服务环境。
+- 该训练环境中的 `qwen-asr==0.0.6` 依赖 Transformers 4.x API；固定使用 `transformers<5`。若升级任一方，必须先在该隔离环境重跑真实 checkpoint 加载、单样本 forward 与 projector 梯度验证，禁止直接影响主力推理环境。
+- 训练环境创建、包安装、probe 输出、checkpoint 和日志均只能写入 `/data/maoyy/joyai-runtime/omni-training` 或 `/data/maoyy/datasets/projector_stage1`；不得写入系统目录、模型目录或其他用户目录。
 - 第一阶段定义为音频对齐的 `projector-only` 训练：冻结 Qwen3-ASR Encoder、其原生 projector 以及 JoyAI-VL 全部参数，只训练连接 ASR 音频特征和 JoyAI token embedding 的 `audio_projector`。
 - 当前候选维度 `2048 -> 4096` 仅用于配置占位。开始真实训练前必须运行 `training.omni.probe_models` 并依据服务器本地模型的 config 和真实 forward shape 确认维度，禁止仅凭文档硬编码后直接长训。
 - 冻结 JoyAI-VL 参数时，不得用 `torch.no_grad()` 包裹语言模型 forward；必须保留从语言模型 loss 到 `audio_projector` 输入的梯度图。冻结 Audio Encoder 的特征提取可以使用 `torch.no_grad()` 或离线特征缓存。
