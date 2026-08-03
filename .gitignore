@@ -29,6 +29,10 @@ models/
 *.zip
 *.7z
 *.rar
+datasets/raw/
+datasets/manifests/projector_stage1_*metadata.jsonl
+datasets/manifests/projector_stage1_*samples.jsonl
+datasets/manifests/projector_stage1_*samples.summary.json
 *.npy
 *.npz
 *.parquet

@@ -1,0 +1,13 @@
+{
+  "dataset": "LibriSpeech",
+  "version": "dev-clean",
+  "source_uri": "https://www.openslr.org/12/",
+  "license_name": "CC BY 4.0",
+  "license_tier": "redistributable",
+  "allows_training": true,
+  "allows_modification": true,
+  "allows_redistribution": true,
+  "allows_commercial_use": true,
+  "teacher_model": "",
+  "teacher_config": {}
+}
