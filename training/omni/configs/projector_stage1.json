@@ -16,5 +16,5 @@
   "precision": "bf16",
   "gradient_checkpointing": true,
   "save_projector_only": true,
-  "dimensions_require_probe": true
+  "dimensions_require_probe": false
 }
