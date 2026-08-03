@@ -34,5 +34,5 @@ def main() -> None:
         out=model(audio_features=feature.unsqueeze(0).to(a.device,dtype=torch.bfloat16),audio_attention_mask=torch.ones(1,feature.shape[0],device=a.device,dtype=torch.bool),text_embeddings=text,audio_placeholder_mask=torch.tensor(padded["audio_placeholder_mask"],device=a.device),attention_mask=torch.tensor(padded["attention_mask"],device=a.device),labels=torch.tensor(padded["labels"],device=a.device))
         opt.zero_grad(); out.loss.backward(); assert_projector_gradients(model,model.audio_projector); opt.step()
         torch.save({"format":"projector-stage1-v1","step":step+1,"projector":model.audio_projector.state_dict(),"optimizer":opt.state_dict(),"manifest_sha256":hashlib.sha256(a.manifest.read_bytes()).hexdigest(),"config":config,"joyai_model":a.joyai_model},latest)
-        print(json.dumps({"step":step+1,"loss":float(out.loss)}))
+        print(json.dumps({"step":step+1,"loss":float(out.loss.detach())}))
 if __name__ == "__main__": main()
