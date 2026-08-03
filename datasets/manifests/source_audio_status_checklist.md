@@ -6,9 +6,6 @@
 
 ## 1. 尚未读取、判别
 
-- EgoIT
-- EgoIT-99K
-- EgoLife
 - egoblind
 - Perception Test
 - EgoProceL
@@ -39,8 +36,6 @@
 - UVO
 - OOPS
 - FAVD
-- Kinetics-600
-- Kinetics-700
 - Live-WhisperX
 
 ## 2. 明确有音频
@@ -48,6 +43,8 @@
 - ActivityNet（抽样 8/8）
 - youcook2 / YouCook2（抽样 10/10）
 - Kinetics-400（抽样 9/10；allowlist 已排除 1 条静音）
+- Kinetics-600（抽样 1/2 成功；已确认 1 条 AAC 音频，另 1 条待重试）
+- Kinetics-700（抽样 2/2；均确认 AAC、44.1 kHz、双声道音频）
 - ego4d / ego4d_vqa / egoqa / EgoQA（Ego4D 官方提供 audio availability 元数据）
 - holoassist（官方说明含同步音频流）
 - epickitchens（EPIC-Sounds 明确来自 audio stream）
@@ -65,6 +62,9 @@
 - DiDeMo
 - NExT-QA
 - LSMDC
+- EgoIT（片段名可解析，但母视频媒体当前不可访问）
+- EgoIT-99K（片段名可解析，但母视频媒体当前不可访问）
+- EgoLife（当前没有可直接映射的本地媒体样本）
 - CharadesEgo（已有抽样未发现可用音轨）
 - URL 来源（YouTube/Bilibili，19,680 个具体 URL，需逐条映射）
 
