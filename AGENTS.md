@@ -51,6 +51,18 @@ Pytest 按 `test_*.py`、`Test*` 和 `test_*` 规则发现测试；异步测试�
 备用服务器IP: maoyy@10.11.12.96,CUDA12.4,4张3090
 每次完成新增的功能或者修复了bug请务必同步到github。
 
+## 服务器与工作分支唯一映射
+
+| 服务器 | 硬件与 CUDA | 唯一部署分支 | 后端用途 |
+| --- | --- | --- | --- |
+| 主力服务器 `maoyy@10.11.12.30` | `4×RTX 4090`、CUDA 13 | `feature/continuous-omni` | 原始 vLLM/vLLM-Omni；真实流式、取消、吞吐、设备与训练验收 |
+| 备用服务器 `maoyy@10.11.12.96` | `4×RTX 3090`、CUDA 12.4 | `codex/native-transformers-audio` | Transformers 兼容后端；只做兼容部署和非原生流式验证 |
+
+- 每次连接服务器后、同步代码或启动服务前，必须先运行 `git branch --show-current` 和 `git status --short` 核对分支与工作树。
+- 4090 主力服务器不得切换、拉取或部署 `codex/native-transformers-audio`；3090 备用服务器不得用 `feature/continuous-omni` 的 CUDA 13/vLLM-Omni 环境覆盖其 CUDA 12.4 兼容环境。
+- 需要共享修复时，应先提交到 GitHub，再通过 cherry-pick 或合并把提交同步到目标分支；禁止通过在服务器上直接切换到另一服务器专用分支来共享代码。
+- 如果服务器实际分支与上表不一致，立即停止部署，先保留工作树改动并恢复正确分支，不得继续启动模型服务。
+
 ## 原生 Transformers 兼容分支
 
 - `codex/native-transformers-audio` 仅用于备用 3090 服务器在驱动版本无法运行当前 vLLM/vLLM-Omni wheel 时部署 Transformers 兼容后端；不得在主力 4090 服务器上切换或部署该分支。
