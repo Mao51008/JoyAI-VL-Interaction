@@ -47,6 +47,7 @@ TTS_TRUST_ENV = os.getenv("TTS_TRUST_ENV", "1").lower() not in {
 logger = logging.getLogger(__name__)
 
 _active_tts_generations: dict[str, tuple[str, asyncio.Task]] = {}
+_background_tts_cleanup_tasks: set[asyncio.Task] = set()
 
 
 def register_tts_generation(
@@ -419,6 +420,12 @@ async def cancel_tts_stream_task(task):
     if task is None or task.done():
         return
     task.cancel()
+    await wait_for_tts_stream_task(task)
+
+
+async def wait_for_tts_stream_task(task):
+    if task is None or task.done():
+        return
     try:
         await asyncio.wait_for(task, timeout=TTS_CANCEL_TIMEOUT)
     except asyncio.CancelledError:
@@ -427,34 +434,69 @@ async def cancel_tts_stream_task(task):
         logger.warning("[tts] previous stream did not stop within %.2fs", TTS_CANCEL_TIMEOUT)
 
 
+def request_tts_generation_cancel(
+    session_id: str,
+    generation_id: str | None = None,
+) -> tuple[dict, asyncio.Task | None]:
+    """Cancel a generation synchronously so browser playback can stop immediately."""
+    active = _active_tts_generations.get(session_id)
+    if active is None:
+        return (
+            {
+                "session_id": session_id,
+                "generation_id": generation_id or "",
+                "cancelled": False,
+                "reason": "not_active",
+            },
+            None,
+        )
+
+    active_generation_id, task = active
+    if generation_id and generation_id != active_generation_id:
+        return (
+            {
+                "session_id": session_id,
+                "generation_id": generation_id,
+                "active_generation_id": active_generation_id,
+                "cancelled": False,
+                "reason": "generation_mismatch",
+            },
+            None,
+        )
+
+    task.cancel()
+    unregister_tts_generation(session_id, active_generation_id)
+    return (
+        {
+            "session_id": session_id,
+            "generation_id": active_generation_id,
+            "cancelled": True,
+        },
+        task,
+    )
+
+
+def schedule_tts_task_cleanup(task: asyncio.Task | None) -> None:
+    """Reap a cancelled stream without delaying the browser stop acknowledgement."""
+    if task is None or task.done():
+        return
+
+    async def cleanup() -> None:
+        await wait_for_tts_stream_task(task)
+
+    cleanup_task = asyncio.create_task(cleanup())
+    _background_tts_cleanup_tasks.add(cleanup_task)
+    cleanup_task.add_done_callback(_background_tts_cleanup_tasks.discard)
+
+
 async def cancel_tts_generation(
     session_id: str,
     generation_id: str | None = None,
 ) -> dict:
-    active = _active_tts_generations.get(session_id)
-    if active is None:
-        return {
-            "session_id": session_id,
-            "generation_id": generation_id or "",
-            "cancelled": False,
-            "reason": "not_active",
-        }
-    active_generation_id, task = active
-    if generation_id and generation_id != active_generation_id:
-        return {
-            "session_id": session_id,
-            "generation_id": generation_id,
-            "active_generation_id": active_generation_id,
-            "cancelled": False,
-            "reason": "generation_mismatch",
-        }
-    await cancel_tts_stream_task(task)
-    unregister_tts_generation(session_id, active_generation_id)
-    return {
-        "session_id": session_id,
-        "generation_id": active_generation_id,
-        "cancelled": True,
-    }
+    result, task = request_tts_generation_cancel(session_id, generation_id)
+    if result["cancelled"]:
+        await wait_for_tts_stream_task(task)
+    return result
 
 
 async def cleanup_tts_session(session_id: str) -> bool:
@@ -524,13 +566,14 @@ async def tts_websocket_handler(request):
                     )
                 elif message_type == "stop":
                     requested_generation_id = str(data.get("generation_id") or "").strip()
-                    result = await cancel_tts_generation(
+                    result, cancelled_task = request_tts_generation_cancel(
                         str(data.get("session_id") or stream_session_id or "web"),
                         requested_generation_id or None,
                     )
                     if result["cancelled"]:
                         stream_task = None
                     await client_ws.send_json({"type": "stop_ack", **result})
+                    schedule_tts_task_cleanup(cancelled_task)
                 elif message_type == "playback_progress":
                     await record_tts_playback_progress(data)
                 elif message_type == "ping":

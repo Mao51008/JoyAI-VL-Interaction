@@ -1,8 +1,12 @@
 import asyncio
+import time
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 
 from joy_interaction_webui import server
+from joy_interaction_webui import tts as tts_module
 from joy_interaction_webui.omni.decision import (
     ActionKind,
     DecisionAction,
@@ -41,6 +45,57 @@ async def test_generation_registry_cancels_only_matching_generation() -> None:
     assert cancelled["cancelled"] is True
     assert get_active_tts_generation("s") is None
     assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_stop_ack_is_not_blocked_by_slow_stream_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def slow_stream_cleanup(client_ws, data) -> None:
+        del client_ws, data
+        started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.2)
+            cleanup_finished.set()
+
+    monkeypatch.setattr(tts_module, "run_tts_stream_request", slow_stream_cleanup)
+    app = web.Application()
+    app.router.add_get("/api/tts", tts_module.tts_websocket_handler)
+
+    async with TestClient(TestServer(app)) as client:
+        ws = await client.ws_connect("/api/tts")
+        await ws.send_json(
+            {
+                "type": "speak",
+                "session_id": "fast-stop",
+                "generation_id": "generation-1",
+                "text": "test",
+            }
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        stop_started = time.perf_counter()
+        await ws.send_json(
+            {
+                "type": "stop",
+                "session_id": "fast-stop",
+                "generation_id": "generation-1",
+            }
+        )
+        response = await asyncio.wait_for(ws.receive_json(), timeout=1)
+        stop_elapsed = time.perf_counter() - stop_started
+
+        assert response["type"] == "stop_ack"
+        assert response["cancelled"] is True
+        assert stop_elapsed < 0.1
+        assert not cleanup_finished.is_set()
+        await asyncio.wait_for(cleanup_finished.wait(), timeout=1)
+        await ws.close()
 
 
 @pytest.mark.asyncio

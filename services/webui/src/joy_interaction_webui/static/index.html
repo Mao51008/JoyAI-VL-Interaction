@@ -4027,6 +4027,8 @@ limitations under the License.
         let continuousAudioToken = 0;
         let continuousAudioReconnectTimer = null;
         let continuousAudioReconnectAttempt = 0;
+        let continuousAsrLastSubmittedText = '';
+        let continuousAsrLastSubmittedAt = 0;
         // Multi-session: one ID per page/tab; sent in WebSocket and /offer so this tab gets only its VLM output
         let sessionId = crypto.randomUUID ? crypto.randomUUID() : 'tab-' + Date.now() + '-' + Math.random().toString(36).slice(2);
         let isAnalysisRunning = false;
@@ -5472,6 +5474,12 @@ limitations under the License.
             if (ttsFinishTimer) {
                 clearTimeout(ttsFinishTimer);
                 ttsFinishTimer = null;
+            }
+        }
+
+        function interruptTtsForUserInput() {
+            if (ttsSpeaking || ttsSources.length || pendingTtsText || ttsGenerationId) {
+                stopTtsPlayback({ sendStop: true, status: 'interrupted' });
             }
         }
 
@@ -7304,6 +7312,10 @@ limitations under the License.
 
             const newPrompt = cleanBackgroundQuestionText(promptText.value.trim());
 
+            if (newPrompt) {
+                interruptTtsForUserInput();
+            }
+
             currentPromptText = newPrompt;
             if (newPrompt) {
                 appendPromptHistoryEntry(newPrompt);
@@ -7461,6 +7473,34 @@ limitations under the License.
             }
         }
 
+        function normalizeContinuousAsrText(text) {
+            return String(text || '')
+                .trim()
+                .replace(/[\s，。！？、,.!?；;：:'"“”‘’（）()\[\]【】…~-]+/g, '');
+        }
+
+        function isMeaningfulContinuousAsrText(text) {
+            const normalized = normalizeContinuousAsrText(text);
+            if (!normalized) {
+                return false;
+            }
+            return !/^[嗯啊呃唔哦噢额哼诶欸]+$/.test(normalized);
+        }
+
+        function isDuplicateContinuousAsrFinal(text, now = Date.now()) {
+            const normalized = normalizeContinuousAsrText(text);
+            if (
+                normalized &&
+                normalized === continuousAsrLastSubmittedText &&
+                now - continuousAsrLastSubmittedAt < 5000
+            ) {
+                return true;
+            }
+            continuousAsrLastSubmittedText = normalized;
+            continuousAsrLastSubmittedAt = now;
+            return false;
+        }
+
         function buildContinuousAudioPacket(pcm, sequence, monotonicMs, voiceActive) {
             const sessionBytes = new TextEncoder().encode(sessionId);
             const packet = new ArrayBuffer(
@@ -7543,6 +7583,30 @@ limitations under the License.
                         console.warn('Continuous audio ingress error:', data.message);
                     } else if (data.type === 'audio_event') {
                         updateContinuousAsrDisplay(data);
+                        const kind = String(data.kind || '');
+                        const metadata = data.metadata || {};
+                        const candidateText = String(data.text || data.stable_prefix || '').trim();
+                        if (
+                            ['speech_partial', 'speech_stable'].includes(kind) &&
+                            !metadata.likely_tts_echo &&
+                            isMeaningfulContinuousAsrText(candidateText)
+                        ) {
+                            interruptTtsForUserInput();
+                        } else if (kind === 'speech_final' && !metadata.likely_tts_echo) {
+                            const transcript = String(data.text || data.stable_prefix || '').trim();
+                            if (
+                                isMeaningfulContinuousAsrText(transcript) &&
+                                !isDuplicateContinuousAsrFinal(transcript) &&
+                                isAnalysisRunning
+                            ) {
+                                interruptTtsForUserInput();
+                                promptText.value = transcript;
+                                resizePromptInput();
+                                if (applyPromptSettings()) {
+                                    flashPromptControl(promptText);
+                                }
+                            }
+                        }
                     }
                 } catch (error) {
                     console.debug('Ignoring non-JSON audio ingress response', error);

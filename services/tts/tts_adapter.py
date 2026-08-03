@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -139,6 +140,14 @@ async def send_error(client_ws: WebSocket, message: str) -> None:
     await client_ws.send_text(json_dumps({"type": "error", "error": message}))
 
 
+def abort_upstream_connection(upstream_ws: UpstreamWebSocket) -> None:
+    """Drop the TCP transport so a busy upstream observes cancellation immediately."""
+    transport = getattr(upstream_ws, "transport", None)
+    abort = getattr(transport, "abort", None)
+    if callable(abort):
+        abort()
+
+
 async def recv_json_from_client(client_ws: WebSocket) -> dict[str, Any] | None:
     message = await client_ws.receive()
     if message.get("type") == "websocket.disconnect":
@@ -155,34 +164,63 @@ async def forward_upstream_audio(
     upstream_ws: UpstreamWebSocket,
     idle_timeout: float,
 ) -> None:
-    while True:
-        upstream_message = await asyncio.wait_for(upstream_ws.recv(), timeout=idle_timeout)
-        if isinstance(upstream_message, bytes):
-            if upstream_message:
-                await client_ws.send_bytes(upstream_message)
-            continue
+    disconnect_task = asyncio.create_task(client_ws.receive())
+    try:
+        while True:
+            upstream_task = asyncio.create_task(upstream_ws.recv())
+            done, _ = await asyncio.wait(
+                {upstream_task, disconnect_task},
+                timeout=idle_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                upstream_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await upstream_task
+                raise asyncio.TimeoutError
 
-        try:
-            event = json.loads(upstream_message)
-        except json.JSONDecodeError:
-            logger.debug("Ignoring non-JSON upstream event")
-            continue
+            if disconnect_task in done:
+                upstream_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await upstream_task
+                message = disconnect_task.result()
+                if message.get("type") == "websocket.disconnect":
+                    abort_upstream_connection(upstream_ws)
+                    raise WebSocketDisconnect(code=int(message.get("code") or 1000))
+                disconnect_task = asyncio.create_task(client_ws.receive())
+                continue
 
-        event_type = event.get("type")
-        if event_type == "audio.done":
-            if event.get("error"):
-                await send_error(client_ws, f"vLLM audio generation failed: {event}")
+            upstream_message = upstream_task.result()
+            if isinstance(upstream_message, bytes):
+                if upstream_message:
+                    await client_ws.send_bytes(upstream_message)
+                continue
+
+            try:
+                event = json.loads(upstream_message)
+            except json.JSONDecodeError:
+                logger.debug("Ignoring non-JSON upstream event")
+                continue
+
+            event_type = event.get("type")
+            if event_type == "audio.done":
+                if event.get("error"):
+                    await send_error(client_ws, f"vLLM audio generation failed: {event}")
+                    return
+                continue
+            if event_type == "session.done":
+                await client_ws.send_text(json_dumps({"type": "response.done"}))
                 return
-            continue
-        if event_type == "session.done":
-            await client_ws.send_text(json_dumps({"type": "response.done"}))
-            return
-        if event_type == "error":
-            detail = event.get("error") or event.get("message") or event
-            await send_error(client_ws, f"vLLM upstream error: {detail}")
-            return
+            if event_type == "error":
+                detail = event.get("error") or event.get("message") or event
+                await send_error(client_ws, f"vLLM upstream error: {detail}")
+                return
 
-        logger.debug("Upstream event: %s", event_type)
+            logger.debug("Upstream event: %s", event_type)
+    finally:
+        disconnect_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await disconnect_task
 
 
 async def run_tts_session(
@@ -302,7 +340,7 @@ def create_app(
         finally:
             try:
                 await client_ws.close()
-            except RuntimeError:
+            except (RuntimeError, WebSocketDisconnect):
                 pass
 
     return app
