@@ -18,8 +18,10 @@ def main() -> None:
     from transformers import AutoModelForImageTextToText, AutoTokenizer
     config=json.loads(a.config.read_text(encoding="utf-8")); pc=AudioProjectorConfig(**config["projector"])
     tok=AutoTokenizer.from_pretrained(a.joyai_model,fix_mistral_regex=True); layout=JoyAIStage1TokenLayout.from_tokenizer(tok)
-    llm=AutoModelForImageTextToText.from_pretrained(a.joyai_model,torch_dtype=torch.bfloat16).to(a.device)
-    model=CachedProjectorStage1Model(llm,AudioProjector(pc).to(a.device)); opt=torch.optim.AdamW(trainable_parameters(model),lr=config["optimizer"]["learning_rate"],weight_decay=config["optimizer"]["weight_decay"])
+    llm=AutoModelForImageTextToText.from_pretrained(a.joyai_model,dtype=torch.bfloat16).to(a.device)
+    model=CachedProjectorStage1Model(
+        llm, AudioProjector(pc).to(device=a.device, dtype=torch.bfloat16)
+    ); opt=torch.optim.AdamW(trainable_parameters(model),lr=config["optimizer"]["learning_rate"],weight_decay=config["optimizer"]["weight_decay"])
     samples=load_samples(a.manifest); a.output_dir.mkdir(parents=True,exist_ok=True); start=0
     latest=a.output_dir/"latest.pt"
     if a.resume:
