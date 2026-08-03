@@ -33,6 +33,7 @@ datasets/raw/
 datasets/manifests/projector_stage1_*metadata.jsonl
 datasets/manifests/projector_stage1_*samples.jsonl
 datasets/manifests/projector_stage1_*samples.summary.json
+datasets/manifests/projector_stage1_*_server.jsonl
 *.npy
 *.npz
 *.parquet
