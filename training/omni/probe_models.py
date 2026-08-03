@@ -35,6 +35,31 @@ def inspect_config(model_path: str, *, trust_remote_code: bool) -> dict[str, Any
     }
 
 
+def inspect_tokenizer(model_path: str, *, trust_remote_code: bool) -> dict[str, Any]:
+    """Report special token IDs without loading any model weights."""
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as exc:
+        raise RuntimeError("transformers is required to inspect tokenizer metadata") from exc
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+    added_tokens = tokenizer.get_added_vocab()
+    relevant_tokens = {
+        token: token_id
+        for token, token_id in added_tokens.items()
+        if any(keyword in token.lower() for keyword in ("audio", "vision", "image", "video", "pad"))
+    }
+    return {
+        "tokenizer_class": type(tokenizer).__name__,
+        "pad_token": tokenizer.pad_token,
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token": tokenizer.eos_token,
+        "eos_token_id": tokenizer.eos_token_id,
+        "special_tokens": tokenizer.special_tokens_map,
+        "relevant_added_tokens": relevant_tokens,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--audio-model", required=True)
@@ -47,6 +72,9 @@ def main() -> None:
             args.audio_model, trust_remote_code=args.trust_remote_code
         ),
         "joyai_model": inspect_config(
+            args.joyai_model, trust_remote_code=args.trust_remote_code
+        ),
+        "joyai_tokenizer": inspect_tokenizer(
             args.joyai_model, trust_remote_code=args.trust_remote_code
         ),
     }
