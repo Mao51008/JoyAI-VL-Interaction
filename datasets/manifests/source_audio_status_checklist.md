@@ -43,8 +43,8 @@
 - ActivityNet（抽样 8/8；后续仍需扩大抽样）
 - youcook2 / YouCook2（抽样 10/10；后续仍需扩大抽样）
 - Kinetics-400（抽样 9/10；allowlist 已排除 1 条静音）
-- Kinetics-600（当前仅抽样 1/2 成功；已确认 1 条 AAC 音频，另 1 条因 Googlevideo 连接中断待重试；不能据此代表全源）
-- Kinetics-700（当前仅抽样 2/2；均确认 AAC、44.1 kHz、双声道音频；仍需扩大抽样）
+- Kinetics-600（抽样 5 条成功；均有可解码音频流；仍是抽样结论）
+- Kinetics-700（抽样 5 条成功；均有可解码音频流；仍是抽样结论）
 - ego4d / ego4d_vqa / egoqa / EgoQA（Ego4D 官方提供 audio availability 元数据）
 - holoassist（官方说明含同步音频流）
 - epickitchens（EPIC-Sounds 明确来自 audio stream）
@@ -70,7 +70,7 @@
 
 ## 已生成的逐文件证据
 
-- `datasets/audit_output/multimodal_audio_allowlist.jsonl`：ActivityNet、YouCook2、Kinetics-400 共 28 条抽样，27 条确认有音频流，1 条确认静音。
+- `datasets/audit_output/multimodal_audio_allowlist.jsonl`：ActivityNet、YouCook2、Kinetics-400/600/700 共 38 条抽样，37 条确认有音频流，1 条确认静音。
 - `datasets/audit_output/activitynet10_media/ffprobe_report.csv`
 - `datasets/audit_output/youcook2_10_media/ffprobe_report.csv`
 - `datasets/audit_output/kinetics10_media/ffprobe_report.csv`
