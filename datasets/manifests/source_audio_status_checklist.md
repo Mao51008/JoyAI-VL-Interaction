@@ -40,11 +40,11 @@
 
 ## 2. 明确有音频
 
-- ActivityNet（抽样 8/8）
-- youcook2 / YouCook2（抽样 10/10）
+- ActivityNet（抽样 8/8；后续仍需扩大抽样）
+- youcook2 / YouCook2（抽样 10/10；后续仍需扩大抽样）
 - Kinetics-400（抽样 9/10；allowlist 已排除 1 条静音）
-- Kinetics-600（抽样 1/2 成功；已确认 1 条 AAC 音频，另 1 条待重试）
-- Kinetics-700（抽样 2/2；均确认 AAC、44.1 kHz、双声道音频）
+- Kinetics-600（当前仅抽样 1/2 成功；已确认 1 条 AAC 音频，另 1 条因 Googlevideo 连接中断待重试；不能据此代表全源）
+- Kinetics-700（当前仅抽样 2/2；均确认 AAC、44.1 kHz、双声道音频；仍需扩大抽样）
 - ego4d / ego4d_vqa / egoqa / EgoQA（Ego4D 官方提供 audio availability 元数据）
 - holoassist（官方说明含同步音频流）
 - epickitchens（EPIC-Sounds 明确来自 audio stream）
@@ -57,24 +57,31 @@
 
 ## 4. 无法读取，后续再处理
 
-- WebVid2M
-- WebVid10M
-- DiDeMo
-- NExT-QA
-- LSMDC
+- WebVid2M（官方已停止公开 URL/caption 分发，JoyAI 数字 video_name 无法恢复合法母媒体索引）
+- WebVid10M（官方已停止公开 URL/caption 分发，JoyAI 数字 video_name 无法恢复合法母媒体索引）
+- DiDeMo（母媒体在 Flickr；当前 Flickr API 返回 502，无法取得对应视频）
+- NExT-QA（已找到 VidOR 映射文件，但原始 Google Drive 视频包尚未下载/核验）
+- LSMDC（电影片段媒体访问受控，当前没有可核验的本地母视频）
+- CharadesEgo（当前抽样媒体未发现可用音轨；需先确认 prepared-clip 与 JoyAI 命名映射后再复核）
+- URL 来源（YouTube/Bilibili，19,680 个具体 URL；尚未建立逐 URL 媒体索引，因此不能整体判定）
 - EgoIT（片段名可解析，但母视频媒体当前不可访问）
 - EgoIT-99K（片段名可解析，但母视频媒体当前不可访问）
 - EgoLife（当前没有可直接映射的本地媒体样本）
-- CharadesEgo（已有抽样未发现可用音轨）
-- URL 来源（YouTube/Bilibili，19,680 个具体 URL，需逐条映射）
 
 ## 已生成的逐文件证据
 
 - `datasets/audit_output/multimodal_audio_allowlist.jsonl`：ActivityNet、YouCook2、Kinetics-400 共 28 条抽样，27 条确认有音频流，1 条确认静音。
-- `datasets/manifests/multimodal_audio_allowlist.md`：allowlist 汇总和语义限制。
 - `datasets/audit_output/activitynet10_media/ffprobe_report.csv`
 - `datasets/audit_output/youcook2_10_media/ffprobe_report.csv`
 - `datasets/audit_output/kinetics10_media/ffprobe_report.csv`
+- `datasets/audit_output/kinetics60010_media/ffprobe_report.csv`
+- `datasets/audit_output/kinetics70010_media/ffprobe_report.csv`
+
+## 抽样最低标准
+
+- 可访问 source：每个 source 至少抽样 5 条，优先 10 条；记录成功、失败、音频流和可听内容状态。
+- 只有 1～2 条成功样本时，只能写“初步发现有音频”，不能写成 source 级确认。
+- 媒体访问失败时移动到“无法读取，后续再处理”，并在同一行写明失败原因、访问入口和下一步恢复条件。
 
 ## 更新规则
 
