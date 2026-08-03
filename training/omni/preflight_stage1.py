@@ -14,8 +14,8 @@ def run(config_path: Path, manifest_path: Path, *, check_media: bool = True) -> 
     config = json.loads(config_path.read_text(encoding="utf-8"))
     if config.get("stage") != "projector_only_audio_alignment":
         raise ValueError("config stage is not projector_only_audio_alignment")
-    if not config.get("dimensions_require_probe", False):
-        raise ValueError("config must require a real model shape probe")
+    if config.get("dimensions_require_probe", True):
+        raise ValueError("config still requires a real model shape probe")
 
     samples = load_samples(manifest_path)
     missing_media = []
@@ -37,7 +37,7 @@ def run(config_path: Path, manifest_path: Path, *, check_media: bool = True) -> 
         "samples": len(samples),
         "assistant_targets": len(samples),
         "media_checked": check_media,
-        "dimensions_require_probe": True,
+        "dimensions_require_probe": False,
         "gpu_touched": False,
     }
 
