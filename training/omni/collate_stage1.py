@@ -26,8 +26,8 @@ def main() -> None:
     del qwen_asr
     samples = load_samples(args.manifest)[: args.limit]
     batch = ProjectorStage1Collator(
-        asr_processor=AutoProcessor.from_pretrained(args.audio_model),
-        joyai_tokenizer=AutoTokenizer.from_pretrained(args.joyai_model),
+        asr_processor=AutoProcessor.from_pretrained(args.audio_model, fix_mistral_regex=True),
+        joyai_tokenizer=AutoTokenizer.from_pretrained(args.joyai_model, fix_mistral_regex=True),
     )(samples)
     print(json.dumps({
         "sample_ids": batch["sample_ids"],
