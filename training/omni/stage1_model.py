@@ -93,6 +93,46 @@ class ProjectorStage1Model(nn.Module):
         )
 
 
+class CachedProjectorStage1Model(nn.Module):
+    """Train the projector from frozen, precomputed ASR features.
+
+    Caching is valid for stage one because the ASR encoder and its native
+    projector are frozen.  It lets the GPU training loop load only JoyAI-VL
+    and the small trainable projector.
+    """
+
+    def __init__(self, language_model: nn.Module, audio_projector: AudioProjector) -> None:
+        super().__init__()
+        self.language_model = language_model
+        self.audio_projector = audio_projector
+        freeze_for_projector_training(self, self.audio_projector)
+
+    def forward(
+        self,
+        *,
+        audio_features: Tensor,
+        audio_attention_mask: Tensor,
+        text_embeddings: Tensor,
+        audio_placeholder_mask: Tensor,
+        attention_mask: Tensor,
+        labels: Tensor,
+        **language_model_kwargs: Any,
+    ) -> Any:
+        projected_audio = self.audio_projector(audio_features)
+        inputs_embeds = replace_audio_placeholders(
+            text_embeddings,
+            projected_audio,
+            audio_placeholder_mask.bool(),
+            audio_attention_mask.bool(),
+        )
+        return self.language_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            labels=labels,
+            **language_model_kwargs,
+        )
+
+
 def _last_hidden_state(output: Any) -> Tensor:
     if isinstance(output, Tensor):
         return output

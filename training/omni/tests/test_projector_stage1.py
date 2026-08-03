@@ -24,6 +24,7 @@ class ProjectorDependencyTest(unittest.TestCase):
             trainable_parameters,
         )
         from training.omni.stage1_model import (
+            CachedProjectorStage1Model,
             ProjectorStage1Model,
             replace_audio_placeholders,
         )
@@ -81,6 +82,20 @@ class ProjectorDependencyTest(unittest.TestCase):
         self.assertTrue(
             all(name.startswith("audio_projector.") for name in report.trainable_names)
         )
+
+        cached = CachedProjectorStage1Model(
+            TinyLanguageModel(), AudioProjector(AudioProjectorConfig(input_size=4, output_size=6))
+        )
+        cached_result = cached(
+            audio_features=torch.randn(1, 2, 4),
+            audio_attention_mask=torch.tensor([[True, True]]),
+            text_embeddings=torch.zeros(1, 4, 6),
+            audio_placeholder_mask=torch.tensor([[False, True, True, False]]),
+            attention_mask=torch.ones(1, 4, dtype=torch.long),
+            labels=torch.tensor([[-100, -100, 1, 2]]),
+        )
+        cached_result.loss.backward()
+        assert_projector_gradients(cached, cached.audio_projector)
 
         optimizer = torch.optim.AdamW(trainable_parameters(model), lr=0.05)
         result = model(
