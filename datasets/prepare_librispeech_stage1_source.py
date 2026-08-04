@@ -13,7 +13,7 @@ def _split(speaker: str, validation_percent: int) -> str:
     return "validation" if value < validation_percent else "train"
 
 
-def build(root: Path, output: Path, validation_percent: int) -> dict[str, int]:
+def build(root: Path, output: Path, validation_percent: int, split_filter: str | None) -> dict[str, int]:
     import soundfile as sf
     if not 1 <= validation_percent < 50:
         raise ValueError("validation percent must be between 1 and 49")
@@ -26,10 +26,13 @@ def build(root: Path, output: Path, validation_percent: int) -> dict[str, int]:
                 raise FileNotFoundError(audio)
             info = sf.info(audio)
             speaker = utterance_id.split("-", 1)[0]
+            split = _split(speaker, validation_percent)
+            if split_filter and split != split_filter:
+                continue
             rows.append({"sample_id": f"librispeech-{utterance_id}", "audio_path": str(audio),
                          "target_text": text, "duration_ms": round(info.frames * 1000 / info.samplerate),
                          "sample_rate": info.samplerate, "num_samples": info.frames,
-                         "split": _split(speaker, validation_percent),
+                         "split": split,
                          "source_record": utterance_id, "speaker_id": speaker})
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
@@ -42,8 +45,9 @@ def main() -> None:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--validation-percent", type=int, default=2)
+    parser.add_argument("--split", choices=("train", "validation"))
     args = parser.parse_args()
-    print(json.dumps(build(args.root, args.output, args.validation_percent), indent=2))
+    print(json.dumps(build(args.root, args.output, args.validation_percent, args.split), indent=2))
 
 
 if __name__ == "__main__":
