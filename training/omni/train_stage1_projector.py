@@ -4,6 +4,7 @@ import argparse, hashlib, json, os
 from pathlib import Path
 from .projector import AudioProjector, AudioProjectorConfig, assert_projector_gradients, trainable_parameters
 from .schema import load_samples
+from .stage1_batching import distribute_batches, plan_length_aware_batches
 from .stage1_collator import JoyAIStage1TokenLayout, build_sample_sequence
 from .stage1_data import pad_sequences
 from .stage1_model import CachedProjectorStage1Model
@@ -18,10 +19,13 @@ def main() -> None:
     p.add_argument("--joyai-model", required=True); p.add_argument("--config", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, required=True); p.add_argument("--device", default="cuda:0")
     p.add_argument("--steps", type=int, required=True); p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument("--max-attention-cost", type=int, default=1_000_000,
+                   help="maximum padded audio attention cost per local batch; long samples remain single-item batches")
     p.add_argument("--resume", action="store_true"); p.add_argument("--no-progress", action="store_true")
     p.add_argument("--ddp", action="store_true")
     a = p.parse_args()
-    if a.steps <= 0 or a.batch_size <= 0: raise ValueError("--steps and --batch-size must be positive")
+    if a.steps <= 0 or a.batch_size <= 0 or a.max_attention_cost <= 0:
+        raise ValueError("--steps, --batch-size and --max-attention-cost must be positive")
     import torch
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel
@@ -41,7 +45,17 @@ def main() -> None:
     opt = torch.optim.AdamW(trainable_parameters(core_model), lr=config["optimizer"]["learning_rate"], weight_decay=config["optimizer"]["weight_decay"])
     scheduler = torch.optim.lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=0.1, total_iters=a.steps)
     scaler = torch.amp.GradScaler("cuda", enabled=False)
-    samples = load_samples(a.manifest); samples = samples[rank::world_size]; cache = FeatureCache(a.feature_dir); a.output_dir.mkdir(parents=True, exist_ok=True); latest = a.output_dir / "latest.pt"; start = 0
+    samples = load_samples(a.manifest); cache = FeatureCache(a.feature_dir)
+    token_counts = {sample.sample_id: cache.index[sample.sample_id]["tokens"] for sample in samples}
+    global_batches = plan_length_aware_batches(
+        [sample.sample_id for sample in samples], token_counts,
+        max_batch_size=a.batch_size, max_attention_cost=a.max_attention_cost,
+    )
+    rank_batches = distribute_batches(global_batches, world_size)[rank]
+    sample_by_id = {sample.sample_id: sample for sample in samples}
+    if rank == 0: a.output_dir.mkdir(parents=True, exist_ok=True)
+    if a.ddp: dist.barrier()
+    latest = a.output_dir / "latest.pt"; start = 0
     if a.resume:
         state = torch.load(latest, map_location="cpu", weights_only=True)
         if state["manifest_sha256"] != manifest_hash or state["config_sha256"] != config_hash or state["joyai_model"] != a.joyai_model: raise ValueError("checkpoint provenance mismatch")
@@ -53,7 +67,7 @@ def main() -> None:
     steps = range(start, a.steps)
     progress = None if rank or a.no_progress or tqdm is None else tqdm(steps, total=a.steps, initial=start, unit="step")
     for step in steps if progress is None else progress:
-        batch_samples = [samples[(step * a.batch_size + i) % len(samples)] for i in range(a.batch_size)]
+        batch_samples = [sample_by_id[sample_id] for sample_id in rank_batches[step % len(rank_batches)]]
         features = []; sequences = []
         for sample in batch_samples:
             cached = cache.get(sample.sample_id)
@@ -67,7 +81,11 @@ def main() -> None:
         out = model(audio_features=audio, audio_attention_mask=audio_mask, text_embeddings=text, audio_placeholder_mask=torch.tensor(padded["audio_placeholder_mask"], device=device), attention_mask=torch.tensor(padded["attention_mask"], device=device), labels=torch.tensor(padded["labels"], device=device))
         opt.zero_grad(); out.loss.backward(); assert_projector_gradients(core_model, core_model.audio_projector); opt.step(); scheduler.step()
         if rank == 0: torch.save({"format":"projector-stage1-v2", "step":step + 1, "projector":core_model.audio_projector.state_dict(), "optimizer":opt.state_dict(), "scheduler":scheduler.state_dict(), "scaler":scaler.state_dict(), "manifest_sha256":manifest_hash, "config_sha256":config_hash, "config":config, "joyai_model":a.joyai_model}, latest)
-        record = {"step":step + 1, "loss":float(out.loss.detach()), "batch_size":a.batch_size,
+        loss = out.loss.detach()
+        if a.ddp:
+            dist.all_reduce(loss, op=dist.ReduceOp.AVG)
+        record = {"step":step + 1, "loss":float(loss), "batch_size":len(batch_samples),
+                  "max_attention_cost": a.max_attention_cost, "planned_batches_per_rank": len(rank_batches),
                   "learning_rate": scheduler.get_last_lr()[0]}
         if progress is not None:
             progress.set_postfix(loss=f"{record['loss']:.4f}", lr=f"{record['learning_rate']:.2e}")
