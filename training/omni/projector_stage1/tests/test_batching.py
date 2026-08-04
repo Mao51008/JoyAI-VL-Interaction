@@ -4,6 +4,7 @@ from training.omni.projector_stage1.batching import (
     distribute_batches,
     padded_attention_cost,
     plan_length_aware_batches,
+    shuffled_rank_batches,
 )
 
 
@@ -21,6 +22,12 @@ class Stage1BatchingTest(unittest.TestCase):
         distributed = distribute_batches([["a"], ["b"], ["c"], ["d"], ["e"]], world_size=2)
         self.assertEqual(len(distributed[0]), len(distributed[1]))
         self.assertEqual({item for rank in distributed for batch in rank for item in batch}, {"a", "b", "c", "d", "e"})
+
+    def test_epoch_shuffle_is_reproducible_and_changes_order(self) -> None:
+        batches = [["a"], ["b"], ["c"], ["d"]]
+        first = shuffled_rank_batches(batches, world_size=1, rank=0, seed=7, epoch=0)
+        self.assertEqual(first, shuffled_rank_batches(batches, world_size=1, rank=0, seed=7, epoch=0))
+        self.assertNotEqual(first, shuffled_rank_batches(batches, world_size=1, rank=0, seed=7, epoch=1))
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import random
 
 
 def padded_attention_cost(token_counts: Sequence[int]) -> int:
@@ -65,3 +66,12 @@ def distribute_batches(
         while len(rank_batches) < longest:
             rank_batches.append(list(source[(len(rank_batches) - len(source)) % len(source)]))
     return per_rank
+
+
+def shuffled_rank_batches(
+    batches: Sequence[Sequence[str]], *, world_size: int, rank: int, seed: int, epoch: int
+) -> list[list[str]]:
+    """Shuffle already length-bucketed batches deterministically for one epoch."""
+    shuffled = [list(batch) for batch in batches]
+    random.Random(seed + epoch).shuffle(shuffled)
+    return distribute_batches(shuffled, world_size)[rank]

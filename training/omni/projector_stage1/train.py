@@ -1,10 +1,10 @@
 """Train only audio_projector from cached ASR features; never saves base weights."""
 from __future__ import annotations
-import argparse, hashlib, json, os
+import argparse, hashlib, json, os, random
 from pathlib import Path
 from .projector import AudioProjector, AudioProjectorConfig, assert_projector_gradients, trainable_parameters
 from ..schema import load_samples
-from .batching import distribute_batches, plan_length_aware_batches
+from .batching import distribute_batches, plan_length_aware_batches, shuffled_rank_batches
 from .checkpointing import resume_checkpoint_path, should_save_last
 from .collator import JoyAIStage1TokenLayout, build_sample_sequence
 from .data import pad_sequences
@@ -23,13 +23,20 @@ def main() -> None:
     p.add_argument("--max-attention-cost", type=int, default=1_000_000,
                    help="maximum padded audio attention cost per local batch; long samples remain single-item batches")
     p.add_argument("--checkpoint-every-steps", type=int, default=1_000)
+    p.add_argument("--validate-every-steps", type=int, default=250)
+    p.add_argument("--early-stopping-patience", type=int, default=0)
+    p.add_argument("--warmup-steps", type=int, default=200)
+    p.add_argument("--max-grad-norm", type=float, default=1.0)
+    p.add_argument("--learning-rate", type=float)
+    p.add_argument("--seed", type=int, default=3407)
+    p.add_argument("--init-projector-checkpoint", type=Path)
     p.add_argument("--steps-per-epoch", type=int)
     p.add_argument("--validation-manifest", type=Path)
     p.add_argument("--validation-feature-dir", type=Path)
     p.add_argument("--resume", action="store_true"); p.add_argument("--no-progress", action="store_true")
     p.add_argument("--ddp", action="store_true")
     a = p.parse_args()
-    if min(a.steps, a.batch_size, a.max_attention_cost, a.checkpoint_every_steps) <= 0:
+    if min(a.steps, a.batch_size, a.max_attention_cost, a.checkpoint_every_steps, a.validate_every_steps) <= 0:
         raise ValueError("--steps, --batch-size, --max-attention-cost and checkpoint interval must be positive")
     if (a.validation_manifest is None) != (a.validation_feature_dir is None):
         raise ValueError("validation manifest and feature directory must be supplied together")
@@ -48,13 +55,22 @@ def main() -> None:
         local_rank = int(os.environ["LOCAL_RANK"]); torch.cuda.set_device(local_rank); dist.init_process_group("nccl")
         device = f"cuda:{local_rank}"
     else: device = a.device
+    random.seed(a.seed); torch.manual_seed(a.seed); torch.cuda.manual_seed_all(a.seed)
     config = json.loads(a.config.read_text(encoding="utf-8")); config_hash = _hash(a.config); manifest_hash = _hash(a.manifest)
     tok = AutoTokenizer.from_pretrained(a.joyai_model, fix_mistral_regex=True); layout = JoyAIStage1TokenLayout.from_tokenizer(tok)
     llm = AutoModelForImageTextToText.from_pretrained(a.joyai_model, dtype=torch.bfloat16).to(device)
     core_model = CachedProjectorStage1Model(llm, AudioProjector(AudioProjectorConfig(**config["projector"])).to(device=device, dtype=torch.bfloat16))
+    if a.init_projector_checkpoint is not None:
+        initial = torch.load(a.init_projector_checkpoint, map_location="cpu", weights_only=True)
+        if initial.get("config", {}).get("projector") != config["projector"]: raise ValueError("initial projector config mismatch")
+        core_model.audio_projector.load_state_dict(initial["projector"])
     model = DistributedDataParallel(core_model, device_ids=[local_rank]) if a.ddp else core_model
-    opt = torch.optim.AdamW(trainable_parameters(core_model), lr=config["optimizer"]["learning_rate"], weight_decay=config["optimizer"]["weight_decay"])
-    scheduler = torch.optim.lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=0.1, total_iters=a.steps)
+    learning_rate = a.learning_rate or config["optimizer"]["learning_rate"]
+    opt = torch.optim.AdamW(trainable_parameters(core_model), lr=learning_rate, weight_decay=config["optimizer"]["weight_decay"])
+    def schedule_factor(index: int) -> float:
+        if index < a.warmup_steps: return (index + 1) / max(1, a.warmup_steps)
+        return max(0.1, 1 - 0.9 * (index - a.warmup_steps) / max(1, a.steps - a.warmup_steps))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(opt, schedule_factor)
     scaler = torch.amp.GradScaler("cuda", enabled=False)
     samples = load_samples(a.manifest); cache = FeatureCache(a.feature_dir)
     token_counts = {sample.sample_id: cache.index[sample.sample_id]["tokens"] for sample in samples}
@@ -62,7 +78,9 @@ def main() -> None:
         [sample.sample_id for sample in samples], token_counts,
         max_batch_size=a.batch_size, max_attention_cost=a.max_attention_cost,
     )
-    rank_batches = distribute_batches(global_batches, world_size)[rank]
+    batches_per_rank = len(distribute_batches(global_batches, world_size)[rank])
+    if a.steps_per_epoch is not None and a.steps_per_epoch != batches_per_rank:
+        raise ValueError(f"--steps-per-epoch must equal planned batches per rank ({batches_per_rank})")
     sample_by_id = {sample.sample_id: sample for sample in samples}
     validation_batches = None
     validation_by_id = None
@@ -82,14 +100,18 @@ def main() -> None:
         validation_by_id = {sample.sample_id: sample for sample in validation_samples}
     if rank == 0: a.output_dir.mkdir(parents=True, exist_ok=True)
     if a.ddp: dist.barrier()
-    last = a.output_dir / "last.pt"; best = a.output_dir / "best.pt"; start = 0; best_validation_loss = float("inf")
+    last = a.output_dir / "last.pt"; best = a.output_dir / "best.pt"; initial_path = a.output_dir / "step-0.pt"; metrics_path = a.output_dir / "metrics.jsonl"
+    start = 0; best_validation_loss = float("inf"); bad_validation_checks = 0
     if a.resume:
         state = torch.load(resume_checkpoint_path(a.output_dir), map_location="cpu", weights_only=True)
         if state["manifest_sha256"] != manifest_hash or state["config_sha256"] != config_hash or state["joyai_model"] != a.joyai_model: raise ValueError("checkpoint provenance mismatch")
         core_model.audio_projector.load_state_dict(state["projector"]); opt.load_state_dict(state["optimizer"]); scheduler.load_state_dict(state["scheduler"]); scaler.load_state_dict(state["scaler"]); start = state["step"]
-        best_validation_loss = float(state.get("best_validation_loss", best_validation_loss))
+        best_validation_loss = float(state.get("best_validation_loss", best_validation_loss)); bad_validation_checks = int(state.get("bad_validation_checks", 0))
+    elif rank == 0:
+        torch.save({"format":"projector-stage1-v3", "step":0, "projector":core_model.audio_projector.state_dict(), "config":config, "joyai_model":a.joyai_model, "seed":a.seed}, initial_path)
+    if a.ddp: dist.barrier()
     def make_state(step: int, validation_loss: float | None = None) -> dict:
-        return {"format":"projector-stage1-v3", "step":step, "projector":core_model.audio_projector.state_dict(), "optimizer":opt.state_dict(), "scheduler":scheduler.state_dict(), "scaler":scaler.state_dict(), "manifest_sha256":manifest_hash, "config_sha256":config_hash, "config":config, "joyai_model":a.joyai_model, "best_validation_loss":best_validation_loss, "validation_loss":validation_loss}
+        return {"format":"projector-stage1-v4", "step":step, "projector":core_model.audio_projector.state_dict(), "optimizer":opt.state_dict(), "scheduler":scheduler.state_dict(), "scaler":scaler.state_dict(), "manifest_sha256":manifest_hash, "config_sha256":config_hash, "config":config, "joyai_model":a.joyai_model, "best_validation_loss":best_validation_loss, "bad_validation_checks":bad_validation_checks, "validation_loss":validation_loss, "seed":a.seed, "training_args":vars(a)}
     def forward_batch(batch_samples, source_cache, forward_model):
         features = []; sequences = []
         for sample in batch_samples:
@@ -123,25 +145,40 @@ def main() -> None:
     steps = range(start, a.steps)
     progress = None if rank or a.no_progress or tqdm is None else tqdm(steps, total=a.steps, initial=start, unit="step")
     for step in steps if progress is None else progress:
+        epoch = step // (a.steps_per_epoch or batches_per_rank)
+        rank_batches = shuffled_rank_batches(global_batches, world_size=world_size, rank=rank, seed=a.seed, epoch=epoch)
         batch_samples = [sample_by_id[sample_id] for sample_id in rank_batches[step % len(rank_batches)]]
-        out, _labels = forward_batch(batch_samples, cache, model)
-        opt.zero_grad(); out.loss.backward(); assert_projector_gradients(core_model, core_model.audio_projector); opt.step(); scheduler.step()
+        out, labels = forward_batch(batch_samples, cache, model)
+        local_tokens = (labels != -100).sum().to(dtype=torch.float32)
+        global_tokens = local_tokens.detach().clone()
+        if a.ddp: dist.all_reduce(global_tokens, op=dist.ReduceOp.SUM)
+        weighted_loss = out.loss * (world_size * local_tokens / global_tokens)
+        opt.zero_grad(); weighted_loss.backward(); assert_projector_gradients(core_model, core_model.audio_projector)
+        torch.nn.utils.clip_grad_norm_(trainable_parameters(core_model), a.max_grad_norm); opt.step(); scheduler.step()
         loss = out.loss.detach()
         if a.ddp:
             dist.all_reduce(loss, op=dist.ReduceOp.AVG)
         completed_step = step + 1
         epoch_end = a.steps_per_epoch is not None and completed_step % a.steps_per_epoch == 0
-        validation_loss = evaluate_validation() if epoch_end and validation_batches is not None else None
-        if rank == 0 and validation_loss is not None and validation_loss < best_validation_loss:
-            best_validation_loss = validation_loss; torch.save(make_state(completed_step, validation_loss), best)
-        if rank == 0 and should_save_last(completed_step, total_steps=a.steps, every_steps=a.checkpoint_every_steps, steps_per_epoch=a.steps_per_epoch):
+        validation_due = validation_batches is not None and (completed_step % a.validate_every_steps == 0 or epoch_end or completed_step == a.steps)
+        validation_loss = evaluate_validation() if validation_due else None
+        improved = validation_loss is not None and validation_loss < best_validation_loss
+        if rank == 0 and improved:
+            best_validation_loss = validation_loss; bad_validation_checks = 0; torch.save(make_state(completed_step, validation_loss), best)
+        elif rank == 0 and validation_loss is not None: bad_validation_checks += 1
+        stop = torch.tensor([int(a.early_stopping_patience > 0 and bad_validation_checks >= a.early_stopping_patience)], device=device)
+        if a.ddp: dist.broadcast(stop, src=0)
+        if rank == 0 and (bool(stop.item()) or should_save_last(completed_step, total_steps=a.steps, every_steps=a.checkpoint_every_steps, steps_per_epoch=a.steps_per_epoch)):
             torch.save(make_state(completed_step, validation_loss), last)
         record = {"step":completed_step, "loss":float(loss), "batch_size":len(batch_samples),
-                  "max_attention_cost": a.max_attention_cost, "planned_batches_per_rank": len(rank_batches),
+                  "max_attention_cost": a.max_attention_cost, "planned_batches_per_rank": len(rank_batches), "supervised_tokens": int(global_tokens),
                   "learning_rate": scheduler.get_last_lr()[0]}
         if validation_loss is not None: record["validation_loss"] = validation_loss
         if progress is not None:
             progress.set_postfix(loss=f"{record['loss']:.4f}", lr=f"{record['learning_rate']:.2e}")
-        if rank == 0: print(json.dumps(record))
+        if rank == 0:
+            print(json.dumps(record));
+            with metrics_path.open("a", encoding="utf-8") as metrics: metrics.write(json.dumps(record) + "\n")
+        if bool(stop.item()): break
     if a.ddp: dist.destroy_process_group()
 if __name__ == "__main__": main()
