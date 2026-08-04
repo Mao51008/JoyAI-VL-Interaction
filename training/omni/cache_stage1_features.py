@@ -13,6 +13,7 @@ def main() -> None:
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--limit", type=int)
+    p.add_argument("--shard-size", type=int, default=256)
     a = p.parse_args()
     import torch
     from qwen_asr import Qwen3ASRModel
@@ -22,7 +23,13 @@ def main() -> None:
     processor = AutoProcessor.from_pretrained(a.audio_model, fix_mistral_regex=True)
     samples = load_samples(a.manifest)[:a.limit]
     a.output_dir.mkdir(parents=True, exist_ok=True)
-    records = []
+    if a.shard_size <= 0: raise ValueError("--shard-size must be positive")
+    records = []; shard_samples = []; shard_index = 0
+    def flush() -> None:
+        nonlocal shard_samples, shard_index
+        if not shard_samples: return
+        name = f"shard-{shard_index:05d}.pt"; torch.save({"samples": shard_samples}, a.output_dir / name)
+        shard_samples = []; shard_index += 1
     for sample in samples:
         waveform, rate = _load_mono_audio(sample.audio[0].path)
         if rate != 16000: raise ValueError(f"{sample.sample_id}: expected 16 kHz")
@@ -33,11 +40,13 @@ def main() -> None:
                 input_features=batch["input_features"],
                 feature_attention_mask=batch["feature_attention_mask"],
             ).cpu()
-        path = a.output_dir / f"{sample.sample_id}.pt"
-        torch.save({"sample_id": sample.sample_id, "features": features,
-                    "media_sha256": sample.metadata["media_sha256"]}, path)
-        records.append({"sample_id": sample.sample_id, "path": path.name,
-                        "tokens": int(features.shape[0]), "media_sha256": sample.metadata["media_sha256"]})
+        shard_samples.append({"sample_id": sample.sample_id, "features": features,
+                              "media_sha256": sample.metadata["media_sha256"]})
+        records.append({"sample_id": sample.sample_id, "shard": f"shard-{shard_index:05d}.pt",
+                        "offset": len(shard_samples) - 1, "tokens": int(features.shape[0]),
+                        "media_sha256": sample.metadata["media_sha256"]})
+        if len(shard_samples) == a.shard_size: flush()
+    flush()
     (a.output_dir / "index.json").write_text(json.dumps(records, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({"cached_samples": len(records), "output_dir": str(a.output_dir)}, indent=2))
 if __name__ == "__main__": main()

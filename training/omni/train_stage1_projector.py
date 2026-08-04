@@ -7,6 +7,7 @@ from .schema import load_samples
 from .stage1_collator import JoyAIStage1TokenLayout, build_sample_sequence
 from .stage1_data import pad_sequences
 from .stage1_model import CachedProjectorStage1Model
+from .stage1_feature_cache import FeatureCache
 
 def _hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -30,7 +31,7 @@ def main() -> None:
     opt = torch.optim.AdamW(trainable_parameters(model), lr=config["optimizer"]["learning_rate"], weight_decay=config["optimizer"]["weight_decay"])
     scheduler = torch.optim.lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=0.1, total_iters=a.steps)
     scaler = torch.amp.GradScaler("cuda", enabled=False)
-    samples = load_samples(a.manifest); a.output_dir.mkdir(parents=True, exist_ok=True); latest = a.output_dir / "latest.pt"; start = 0
+    samples = load_samples(a.manifest); cache = FeatureCache(a.feature_dir); a.output_dir.mkdir(parents=True, exist_ok=True); latest = a.output_dir / "latest.pt"; start = 0
     if a.resume:
         state = torch.load(latest, map_location="cpu", weights_only=True)
         if state["manifest_sha256"] != manifest_hash or state["config_sha256"] != config_hash or state["joyai_model"] != a.joyai_model: raise ValueError("checkpoint provenance mismatch")
@@ -45,7 +46,7 @@ def main() -> None:
         batch_samples = [samples[(step * a.batch_size + i) % len(samples)] for i in range(a.batch_size)]
         features = []; sequences = []
         for sample in batch_samples:
-            cached = torch.load(a.feature_dir / f"{sample.sample_id}.pt", map_location="cpu", weights_only=True)
+            cached = cache.get(sample.sample_id)
             if cached["media_sha256"] != sample.metadata["media_sha256"]: raise ValueError("cached feature fingerprint mismatch")
             feature = cached["features"]; features.append(feature)
             sequences.append(build_sample_sequence(sample, tokenizer=tok, layout=layout, audio_token_count=feature.shape[0]))

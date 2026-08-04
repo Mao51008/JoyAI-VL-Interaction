@@ -7,6 +7,7 @@ from .schema import load_samples
 from .stage1_collator import JoyAIStage1TokenLayout, build_sample_sequence
 from .stage1_data import pad_sequences
 from .stage1_model import CachedProjectorStage1Model
+from .stage1_feature_cache import FeatureCache
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
@@ -25,7 +26,7 @@ def main() -> None:
     llm = AutoModelForImageTextToText.from_pretrained(a.joyai_model, dtype=torch.bfloat16).to(a.device)
     projector = AudioProjector(AudioProjectorConfig(**state["config"]["projector"])).to(a.device, dtype=torch.bfloat16)
     projector.load_state_dict(state["projector"]); model = CachedProjectorStage1Model(llm, projector).eval()
-    samples = load_samples(a.manifest); total_loss = 0.0; total_tokens = 0
+    samples = load_samples(a.manifest); cache = FeatureCache(a.feature_dir); total_loss = 0.0; total_tokens = 0
     try:
         from tqdm import tqdm
     except ImportError:
@@ -36,7 +37,7 @@ def main() -> None:
         for offset in offsets if progress is None else progress:
             batch_samples = samples[offset:offset + a.batch_size]; features = []; sequences = []
             for sample in batch_samples:
-                cached = torch.load(a.feature_dir / f"{sample.sample_id}.pt", map_location="cpu", weights_only=True)
+                cached = cache.get(sample.sample_id)
                 if cached["media_sha256"] != sample.metadata["media_sha256"]: raise ValueError("cached feature fingerprint mismatch")
                 feature = cached["features"]; features.append(feature)
                 sequences.append(build_sample_sequence(sample, tokenizer=tok, layout=layout, audio_token_count=feature.shape[0]))
