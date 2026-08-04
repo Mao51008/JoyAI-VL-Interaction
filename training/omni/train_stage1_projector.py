@@ -17,7 +17,7 @@ def main() -> None:
     p.add_argument("--joyai-model", required=True); p.add_argument("--config", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, required=True); p.add_argument("--device", default="cuda:0")
     p.add_argument("--steps", type=int, required=True); p.add_argument("--batch-size", type=int, default=1)
-    p.add_argument("--resume", action="store_true")
+    p.add_argument("--resume", action="store_true"); p.add_argument("--no-progress", action="store_true")
     a = p.parse_args()
     if a.steps <= 0 or a.batch_size <= 0: raise ValueError("--steps and --batch-size must be positive")
     import torch
@@ -35,7 +35,13 @@ def main() -> None:
         state = torch.load(latest, map_location="cpu", weights_only=True)
         if state["manifest_sha256"] != manifest_hash or state["config_sha256"] != config_hash or state["joyai_model"] != a.joyai_model: raise ValueError("checkpoint provenance mismatch")
         model.audio_projector.load_state_dict(state["projector"]); opt.load_state_dict(state["optimizer"]); scheduler.load_state_dict(state["scheduler"]); scaler.load_state_dict(state["scaler"]); start = state["step"]
-    for step in range(start, a.steps):
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        tqdm = None
+    steps = range(start, a.steps)
+    progress = None if a.no_progress or tqdm is None else tqdm(steps, total=a.steps, initial=start, unit="step")
+    for step in steps if progress is None else progress:
         batch_samples = [samples[(step * a.batch_size + i) % len(samples)] for i in range(a.batch_size)]
         features = []; sequences = []
         for sample in batch_samples:
@@ -50,5 +56,9 @@ def main() -> None:
         out = model(audio_features=audio, audio_attention_mask=audio_mask, text_embeddings=text, audio_placeholder_mask=torch.tensor(padded["audio_placeholder_mask"], device=a.device), attention_mask=torch.tensor(padded["attention_mask"], device=a.device), labels=torch.tensor(padded["labels"], device=a.device))
         opt.zero_grad(); out.loss.backward(); assert_projector_gradients(model, model.audio_projector); opt.step(); scheduler.step()
         torch.save({"format":"projector-stage1-v2", "step":step + 1, "projector":model.audio_projector.state_dict(), "optimizer":opt.state_dict(), "scheduler":scheduler.state_dict(), "scaler":scaler.state_dict(), "manifest_sha256":manifest_hash, "config_sha256":config_hash, "config":config, "joyai_model":a.joyai_model}, latest)
-        print(json.dumps({"step":step + 1, "loss":float(out.loss.detach()), "batch_size":a.batch_size}))
+        record = {"step":step + 1, "loss":float(out.loss.detach()), "batch_size":a.batch_size,
+                  "learning_rate": scheduler.get_last_lr()[0]}
+        if progress is not None:
+            progress.set_postfix(loss=f"{record['loss']:.4f}", lr=f"{record['learning_rate']:.2e}")
+        print(json.dumps(record))
 if __name__ == "__main__": main()
