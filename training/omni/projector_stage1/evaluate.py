@@ -1,6 +1,6 @@
 """Evaluate a projector checkpoint on cached, speaker-disjoint stage-one data."""
 from __future__ import annotations
-import argparse, json, math
+import argparse, json, math, random
 from pathlib import Path
 from .projector import AudioProjector, AudioProjectorConfig
 from ..schema import load_samples
@@ -9,11 +9,25 @@ from .data import pad_sequences
 from .model import CachedProjectorStage1Model
 from .feature_cache import FeatureCache
 
+
+def apply_audio_ablation(feature, mode: str, randomizer: random.Random):
+    """Return an unmodified, zeroed, or deterministically time-shuffled feature tensor."""
+    if mode == "none":
+        return feature
+    if mode == "zero":
+        return feature.new_zeros(feature.shape)
+    if mode == "shuffle":
+        order = randomizer.sample(range(feature.shape[0]), feature.shape[0])
+        return feature[order]
+    raise ValueError(f"unknown audio ablation mode: {mode}")
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--manifest", type=Path, required=True); p.add_argument("--feature-dir", type=Path, required=True)
     p.add_argument("--checkpoint", type=Path, required=True); p.add_argument("--joyai-model", required=True)
     p.add_argument("--device", default="cuda:0"); p.add_argument("--batch-size", type=int, default=2)
+    p.add_argument("--audio-ablation", choices=("none", "zero", "shuffle"), default="none")
+    p.add_argument("--seed", type=int, default=3407)
     p.add_argument("--no-progress", action="store_true")
     a = p.parse_args()
     if a.batch_size <= 0: raise ValueError("--batch-size must be positive")
@@ -27,6 +41,7 @@ def main() -> None:
     projector = AudioProjector(AudioProjectorConfig(**state["config"]["projector"])).to(a.device, dtype=torch.bfloat16)
     projector.load_state_dict(state["projector"]); model = CachedProjectorStage1Model(llm, projector).eval()
     samples = load_samples(a.manifest); cache = FeatureCache(a.feature_dir); total_loss = 0.0; total_tokens = 0
+    randomizer = random.Random(a.seed)
     try:
         from tqdm import tqdm
     except ImportError:
@@ -39,7 +54,7 @@ def main() -> None:
             for sample in batch_samples:
                 cached = cache.get(sample.sample_id)
                 if cached["media_sha256"] != sample.metadata["media_sha256"]: raise ValueError("cached feature fingerprint mismatch")
-                feature = cached["features"]; features.append(feature)
+                feature = apply_audio_ablation(cached["features"], a.audio_ablation, randomizer); features.append(feature)
                 sequences.append(build_sample_sequence(sample, tokenizer=tok, layout=layout, audio_token_count=feature.shape[0]))
             padded = pad_sequences(sequences, pad_token_id=layout.pad_token_id)
             audio = pad_sequence(features, batch_first=True).to(a.device, dtype=torch.bfloat16)
@@ -50,5 +65,5 @@ def main() -> None:
             if progress is not None:
                 progress.set_postfix(samples=min(offset + len(batch_samples), len(samples)), loss=f"{total_loss / total_tokens:.4f}")
     loss = total_loss / total_tokens
-    print(json.dumps({"checkpoint": str(a.checkpoint), "samples": len(samples), "supervised_tokens": total_tokens, "loss": loss, "perplexity": math.exp(min(loss, 20.0))}, indent=2))
+    print(json.dumps({"checkpoint": str(a.checkpoint), "audio_ablation": a.audio_ablation, "samples": len(samples), "supervised_tokens": total_tokens, "loss": loss, "perplexity": math.exp(min(loss, 20.0))}, indent=2))
 if __name__ == "__main__": main()

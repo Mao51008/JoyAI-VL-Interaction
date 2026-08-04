@@ -10,8 +10,6 @@ from ..schema import load_samples
 from .collator import JoyAIStage1TokenLayout, build_chat_parts
 from .data import target_text
 from .feature_cache import FeatureCache
-from .model import replace_audio_placeholders
-from .projector import AudioProjector, AudioProjectorConfig
 
 
 def _distance(reference: list[str], hypothesis: list[str]) -> int:
@@ -26,6 +24,29 @@ def _distance(reference: list[str], hypothesis: list[str]) -> int:
 
 def _normalize(value: str) -> str:
     return " ".join("".join(char if char.isalnum() or char.isspace() else " " for char in value.upper()).split())
+
+
+def score_transcript(reference: str, hypothesis: str) -> dict[str, int | float | bool]:
+    """Return normalized transcript metrics used in per-sample evaluation output."""
+    reference_words = reference.split()
+    hypothesis_words = hypothesis.split()
+    reference_chars = list(reference.replace(" ", ""))
+    hypothesis_chars = list(hypothesis.replace(" ", ""))
+    word_errors = _distance(reference_words, hypothesis_words)
+    char_errors = _distance(reference_chars, hypothesis_chars)
+    return {
+        "wer": word_errors / max(1, len(reference_words)),
+        "cer": char_errors / max(1, len(reference_chars)),
+        "word_errors": word_errors,
+        "char_errors": char_errors,
+        "reference_words": len(reference_words),
+        "hypothesis_words": len(hypothesis_words),
+        "exact_match": reference == hypothesis,
+    }
+
+
+def has_eos(generated_tokens, eos_token_id: int | None) -> bool:
+    return eos_token_id is not None and eos_token_id in generated_tokens.tolist()
 
 
 def main() -> None:
@@ -44,6 +65,8 @@ def main() -> None:
     if args.max_samples is not None and args.max_samples <= 0: raise ValueError("--max-samples must be positive")
     import torch
     from transformers import AutoModelForImageTextToText, AutoTokenizer
+    from .model import replace_audio_placeholders
+    from .projector import AudioProjector, AudioProjectorConfig
     state = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     tokenizer = AutoTokenizer.from_pretrained(args.joyai_model, fix_mistral_regex=True)
     layout = JoyAIStage1TokenLayout.from_tokenizer(tokenizer)
@@ -65,9 +88,14 @@ def main() -> None:
             mask = ids.eq(layout.audio_placeholder_id)
             embeds = replace_audio_placeholders(text, audio, mask, torch.ones(audio.shape[:2], device=args.device, dtype=torch.bool))
             generated = llm.generate(inputs_embeds=embeds, attention_mask=torch.ones_like(ids), max_new_tokens=args.max_new_tokens, do_sample=False)
-            hypothesis = _normalize(tokenizer.decode(generated[0], skip_special_tokens=True))
+            generated_tokens = generated[0]
+            hypothesis = _normalize(tokenizer.decode(generated_tokens, skip_special_tokens=True))
             reference = _normalize(target_text(sample))
-            rows.append({"sample_id": sample.sample_id, "reference": reference, "hypothesis": hypothesis})
+            row = {"sample_id": sample.sample_id, "reference": reference, "hypothesis": hypothesis,
+                   "generated_tokens": int(generated_tokens.numel()),
+                   "generated_eos": has_eos(generated_tokens, tokenizer.eos_token_id)}
+            row.update(score_transcript(reference, hypothesis))
+            rows.append(row)
     word_errors = sum(_distance(row["reference"].split(), row["hypothesis"].split()) for row in rows)
     word_total = sum(len(row["reference"].split()) for row in rows)
     char_errors = sum(_distance(list(row["reference"].replace(" ", "")), list(row["hypothesis"].replace(" ", ""))) for row in rows)
