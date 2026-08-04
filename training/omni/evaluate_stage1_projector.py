@@ -13,6 +13,7 @@ def main() -> None:
     p.add_argument("--manifest", type=Path, required=True); p.add_argument("--feature-dir", type=Path, required=True)
     p.add_argument("--checkpoint", type=Path, required=True); p.add_argument("--joyai-model", required=True)
     p.add_argument("--device", default="cuda:0"); p.add_argument("--batch-size", type=int, default=2)
+    p.add_argument("--no-progress", action="store_true")
     a = p.parse_args()
     if a.batch_size <= 0: raise ValueError("--batch-size must be positive")
     import torch
@@ -25,8 +26,14 @@ def main() -> None:
     projector = AudioProjector(AudioProjectorConfig(**state["config"]["projector"])).to(a.device, dtype=torch.bfloat16)
     projector.load_state_dict(state["projector"]); model = CachedProjectorStage1Model(llm, projector).eval()
     samples = load_samples(a.manifest); total_loss = 0.0; total_tokens = 0
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        tqdm = None
+    offsets = range(0, len(samples), a.batch_size)
+    progress = None if a.no_progress or tqdm is None else tqdm(offsets, total=math.ceil(len(samples) / a.batch_size), unit="batch")
     with torch.inference_mode():
-        for offset in range(0, len(samples), a.batch_size):
+        for offset in offsets if progress is None else progress:
             batch_samples = samples[offset:offset + a.batch_size]; features = []; sequences = []
             for sample in batch_samples:
                 cached = torch.load(a.feature_dir / f"{sample.sample_id}.pt", map_location="cpu", weights_only=True)
@@ -39,6 +46,8 @@ def main() -> None:
             ids = torch.tensor(padded["input_ids"], device=a.device); labels = torch.tensor(padded["labels"], device=a.device)
             out = model(audio_features=audio, audio_attention_mask=mask, text_embeddings=llm.get_input_embeddings()(ids), audio_placeholder_mask=torch.tensor(padded["audio_placeholder_mask"], device=a.device), attention_mask=torch.tensor(padded["attention_mask"], device=a.device), labels=labels)
             tokens = int((labels != -100).sum()); total_tokens += tokens; total_loss += float(out.loss) * tokens
+            if progress is not None:
+                progress.set_postfix(samples=min(offset + len(batch_samples), len(samples)), loss=f"{total_loss / total_tokens:.4f}")
     loss = total_loss / total_tokens
     print(json.dumps({"checkpoint": str(a.checkpoint), "samples": len(samples), "supervised_tokens": total_tokens, "loss": loss, "perplexity": math.exp(min(loss, 20.0))}, indent=2))
 if __name__ == "__main__": main()
