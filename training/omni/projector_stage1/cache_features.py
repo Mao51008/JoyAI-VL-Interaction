@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse, json
 from pathlib import Path
 
-from .schema import load_samples
-from .stage1_collator import _load_mono_audio
+from ..schema import load_samples
+from .collator import _load_mono_audio
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)

@@ -1,6 +1,6 @@
 import unittest
 
-from training.omni.stage1_data import IGNORE_INDEX, build_stage1_sequence, pad_sequences
+from training.omni.projector_stage1.data import IGNORE_INDEX, build_stage1_sequence, pad_sequences
 
 
 class Stage1DataTest(unittest.TestCase):

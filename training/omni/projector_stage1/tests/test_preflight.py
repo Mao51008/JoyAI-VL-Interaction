@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from training.omni.preflight_stage1 import run
+from training.omni.projector_stage1.preflight import run
 
 
 class Stage1PreflightTest(unittest.TestCase):

@@ -1,6 +1,6 @@
 import unittest
 
-from training.omni.stage1_batching import (
+from training.omni.projector_stage1.batching import (
     distribute_batches,
     padded_attention_cost,
     plan_length_aware_batches,

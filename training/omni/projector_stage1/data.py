@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
-from .schema import OmniSample
+from ..schema import OmniSample
 
 
 IGNORE_INDEX = -100

@@ -1,5 +1,12 @@
 # Omni B2：无 GPU 数据协议与训练骨架
 
+## Projector 第一阶段
+
+真实音频-文本 projector-only 训练代码统一位于 `projector_stage1/`：训练入口为
+`training.omni.projector_stage1.train`，完整人工操作说明见
+`projector_stage1/Projector第一阶段训练手册.md`。该目录与本 README 说明的 CPU B2
+原型相互独立。
+
 该目录实现里程碑 B2 的 CPU 原型，用来验证多模态样本格式、时间监督、批处理、假音频
 Encoder、可训练 bridge、动作 loss 和断点恢复。它不加载 JoyAI、Qwen3-ASR 或任何
 媒体文件，也不能用于评价真实模型效果。

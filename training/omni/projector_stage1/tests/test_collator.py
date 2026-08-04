@@ -2,8 +2,8 @@ import unittest
 from types import SimpleNamespace
 
 from training.omni.schema import OmniSample
-from training.omni.stage1_collator import JoyAIStage1TokenLayout, build_sample_sequence
-from training.omni.stage1_data import IGNORE_INDEX
+from training.omni.projector_stage1.collator import JoyAIStage1TokenLayout, build_sample_sequence
+from training.omni.projector_stage1.data import IGNORE_INDEX
 
 
 class _Tokenizer:

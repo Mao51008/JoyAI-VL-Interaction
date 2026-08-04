@@ -3,13 +3,13 @@ from __future__ import annotations
 import argparse, hashlib, json, os
 from pathlib import Path
 from .projector import AudioProjector, AudioProjectorConfig, assert_projector_gradients, trainable_parameters
-from .schema import load_samples
-from .stage1_batching import distribute_batches, plan_length_aware_batches
-from .stage1_checkpointing import resume_checkpoint_path, should_save_last
-from .stage1_collator import JoyAIStage1TokenLayout, build_sample_sequence
-from .stage1_data import pad_sequences
-from .stage1_model import CachedProjectorStage1Model
-from .stage1_feature_cache import FeatureCache
+from ..schema import load_samples
+from .batching import distribute_batches, plan_length_aware_batches
+from .checkpointing import resume_checkpoint_path, should_save_last
+from .collator import JoyAIStage1TokenLayout, build_sample_sequence
+from .data import pad_sequences
+from .model import CachedProjectorStage1Model
+from .feature_cache import FeatureCache
 
 def _hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()

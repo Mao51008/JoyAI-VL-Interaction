@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .schema import load_samples
+from ..schema import load_samples
 
 
 def run(config_path: Path, manifest_path: Path, *, check_media: bool = True) -> dict[str, Any]:

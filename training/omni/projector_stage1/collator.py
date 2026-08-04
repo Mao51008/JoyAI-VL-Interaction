@@ -10,8 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
-from .schema import OmniSample
-from .stage1_data import Stage1Sequence, build_stage1_sequence, pad_sequences, target_text
+from ..schema import OmniSample
+from .data import Stage1Sequence, build_stage1_sequence, pad_sequences, target_text
 
 
 SYSTEM_PROMPT = "You are a precise speech transcription assistant."

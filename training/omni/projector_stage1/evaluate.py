@@ -3,11 +3,11 @@ from __future__ import annotations
 import argparse, json, math
 from pathlib import Path
 from .projector import AudioProjector, AudioProjectorConfig
-from .schema import load_samples
-from .stage1_collator import JoyAIStage1TokenLayout, build_sample_sequence
-from .stage1_data import pad_sequences
-from .stage1_model import CachedProjectorStage1Model
-from .stage1_feature_cache import FeatureCache
+from ..schema import load_samples
+from .collator import JoyAIStage1TokenLayout, build_sample_sequence
+from .data import pad_sequences
+from .model import CachedProjectorStage1Model
+from .feature_cache import FeatureCache
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)

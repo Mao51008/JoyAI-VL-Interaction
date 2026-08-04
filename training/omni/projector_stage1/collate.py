@@ -6,8 +6,8 @@ import argparse
 import json
 from pathlib import Path
 
-from .schema import load_samples
-from .stage1_collator import ProjectorStage1Collator
+from ..schema import load_samples
+from .collator import ProjectorStage1Collator
 
 
 def main() -> None:

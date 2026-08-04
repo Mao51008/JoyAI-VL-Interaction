@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from training.omni.stage1_checkpointing import resume_checkpoint_path, should_save_last
+from training.omni.projector_stage1.checkpointing import resume_checkpoint_path, should_save_last
 
 
 class Stage1CheckpointingTest(unittest.TestCase):

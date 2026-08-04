@@ -16,14 +16,14 @@ class ProjectorDependencyTest(unittest.TestCase):
         import torch
         from torch import nn
 
-        from training.omni.projector import (
+        from training.omni.projector_stage1.projector import (
             AudioProjector,
             AudioProjectorConfig,
             assert_projector_gradients,
             parameter_report,
             trainable_parameters,
         )
-        from training.omni.stage1_model import (
+        from training.omni.projector_stage1.model import (
             CachedProjectorStage1Model,
             ProjectorStage1Model,
             replace_audio_placeholders,
