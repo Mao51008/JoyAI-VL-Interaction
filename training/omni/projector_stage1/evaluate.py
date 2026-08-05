@@ -38,13 +38,15 @@ def per_sample_token_losses(logits, labels, eos_token_id: int):
 
     if logits.ndim != 3 or labels.ndim != 2 or logits.shape[:2] != labels.shape:
         raise ValueError("logits and labels have incompatible shapes")
+    shifted_logits = logits[:, :-1]
+    shifted_labels = labels[:, 1:]
     token_losses = F.cross_entropy(
-        logits.float().transpose(1, 2), labels, reduction="none", ignore_index=-100
+        shifted_logits.float().transpose(1, 2), shifted_labels, reduction="none", ignore_index=-100
     )
     rows = []
-    for index in range(labels.shape[0]):
-        supervised = labels[index].ne(-100)
-        eos = labels[index].eq(eos_token_id)
+    for index in range(shifted_labels.shape[0]):
+        supervised = shifted_labels[index].ne(-100)
+        eos = shifted_labels[index].eq(eos_token_id)
         rows.append({
             "supervised_tokens": int(supervised.sum().item()),
             "loss": float(token_losses[index][supervised].mean().item()) if supervised.any() else 0.0,
