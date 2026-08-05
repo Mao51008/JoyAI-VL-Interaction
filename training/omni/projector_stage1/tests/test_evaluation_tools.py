@@ -78,6 +78,18 @@ class EvaluationToolsTest(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec("torch") is not None, "requires PyTorch")
 class AudioAblationTest(unittest.TestCase):
+    def test_per_sample_token_losses_include_eos(self) -> None:
+        import torch
+
+        from training.omni.projector_stage1.evaluate import per_sample_token_losses
+
+        logits = torch.tensor([[[4.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 4.0]]])
+        labels = torch.tensor([[1, 2, -100]])
+        rows = per_sample_token_losses(logits, labels, eos_token_id=2)
+        self.assertEqual(rows[0]["supervised_tokens"], 2)
+        self.assertEqual(rows[0]["eos_tokens"], 1)
+        self.assertIsNotNone(rows[0]["eos_loss"])
+
     def test_feature_zero_is_distinct_from_projected_zero(self) -> None:
         import torch
 
