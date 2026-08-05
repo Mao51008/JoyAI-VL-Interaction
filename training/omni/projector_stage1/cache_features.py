@@ -1,10 +1,13 @@
 """Cache frozen Qwen3-ASR features for projector stage one."""
 from __future__ import annotations
-import argparse, json
+
+import argparse
+import json
 from pathlib import Path
 
 from ..schema import load_samples
 from .collator import _load_mono_audio
+
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
@@ -14,6 +17,11 @@ def main() -> None:
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--limit", type=int)
     p.add_argument("--shard-size", type=int, default=256)
+    p.add_argument(
+        "--waveform-zero",
+        action="store_true",
+        help="replace each waveform with zeros before Qwen3-ASR feature extraction",
+    )
     a = p.parse_args()
     import torch
     from qwen_asr import Qwen3ASRModel
@@ -33,6 +41,8 @@ def main() -> None:
     for sample in samples:
         waveform, rate = _load_mono_audio(sample.audio[0].path)
         if rate != 16000: raise ValueError(f"{sample.sample_id}: expected 16 kHz")
+        if a.waveform_zero:
+            waveform = waveform * 0.0
         batch = processor(text=processor.audio_token, audio=waveform, sampling_rate=16000,
                           return_tensors="pt", padding=True).to(model.device).to(model.dtype)
         with torch.inference_mode():
@@ -44,9 +54,11 @@ def main() -> None:
                               "media_sha256": sample.metadata["media_sha256"]})
         records.append({"sample_id": sample.sample_id, "shard": f"shard-{shard_index:05d}.pt",
                         "offset": len(shard_samples) - 1, "tokens": int(features.shape[0]),
-                        "media_sha256": sample.metadata["media_sha256"]})
+                        "media_sha256": sample.metadata["media_sha256"],
+                        "waveform_zero": a.waveform_zero})
         if len(shard_samples) == a.shard_size: flush()
     flush()
     (a.output_dir / "index.json").write_text(json.dumps(records, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({"cached_samples": len(records), "output_dir": str(a.output_dir)}, indent=2))
+    print(json.dumps({"cached_samples": len(records), "output_dir": str(a.output_dir),
+                      "waveform_zero": a.waveform_zero}, indent=2))
 if __name__ == "__main__": main()
