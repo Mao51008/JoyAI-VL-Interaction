@@ -100,10 +100,11 @@ class AudioAblationTest(unittest.TestCase):
         self.assertTrue(torch.equal(apply_audio_ablation(feature, "projected-zero"), feature))
 
     def test_sample_exchange_is_a_derangement(self) -> None:
-        order = sample_exchange_order(5, random.Random(7))
-        validate_exchange(list(range(5)), order)
-        self.assertEqual(sorted(order), list(range(5)))
-        self.assertTrue(all(index != donor for index, donor in enumerate(order)))
+        for seed in range(20):
+            order = sample_exchange_order(5, random.Random(seed))
+            validate_exchange(list(range(5)), order)
+            self.assertEqual(sorted(order), list(range(5)))
+            self.assertTrue(all(index != donor for index, donor in enumerate(order)))
 
     def test_sample_exchange_requires_two_samples(self) -> None:
         with self.assertRaises(ValueError):

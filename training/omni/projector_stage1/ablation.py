@@ -10,9 +10,13 @@ def sample_exchange_order(sample_count: int, randomizer: random.Random) -> list[
     if sample_count < 2:
         raise ValueError("sample exchange requires at least two samples")
     order = list(range(sample_count))
-    randomizer.shuffle(order)
-    # A cyclic successor in a shuffled cycle cannot map a sample to itself.
-    return order[1:] + order[:1]
+    for _attempt in range(100):
+        randomizer.shuffle(order)
+        if all(index != donor for index, donor in enumerate(order)):
+            return order.copy()
+    # A non-zero cyclic shift is a guaranteed fallback derangement.
+    shift = randomizer.randrange(1, sample_count)
+    return [(index + shift) % sample_count for index in range(sample_count)]
 
 
 def apply_feature_ablation(feature, mode: str):
