@@ -13,6 +13,17 @@ from .data import target_text
 from .feature_cache import FeatureCache
 
 
+def _load_checkpoint(path: Path, torch):
+    """Load trusted stage-one metadata under PyTorch 2.6 weights-only rules."""
+    from pathlib import PosixPath
+
+    safe_globals = getattr(torch.serialization, "safe_globals", None)
+    if safe_globals is None:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    with safe_globals([PosixPath]):
+        return torch.load(path, map_location="cpu", weights_only=True)
+
+
 def _edit_counts(reference: list[str], hypothesis: list[str]) -> tuple[int, int, int]:
     """Return insertion, deletion, substitution counts from a stable alignment."""
     # Each cell stores (total errors, insertions, deletions, substitutions).
@@ -97,7 +108,7 @@ def main() -> None:
 
     from .model import replace_audio_placeholders
     from .projector import AudioProjector, AudioProjectorConfig
-    state = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+    state = _load_checkpoint(args.checkpoint, torch)
     tokenizer = AutoTokenizer.from_pretrained(args.joyai_model, fix_mistral_regex=True)
     layout = JoyAIStage1TokenLayout.from_tokenizer(tokenizer)
     llm = AutoModelForImageTextToText.from_pretrained(args.joyai_model, dtype=torch.bfloat16).to(args.device).eval()

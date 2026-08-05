@@ -16,6 +16,17 @@ from .model import replace_audio_placeholders
 from .projector import AudioProjector, AudioProjectorConfig
 
 
+def _load_checkpoint(path: Path, torch):
+    """Load trusted stage-one metadata under PyTorch 2.6 weights-only rules."""
+    from pathlib import PosixPath
+
+    safe_globals = getattr(torch.serialization, "safe_globals", None)
+    if safe_globals is None:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    with safe_globals([PosixPath]):
+        return torch.load(path, map_location="cpu", weights_only=True)
+
+
 def apply_audio_ablation(feature, mode: str):
     """Apply a feature-space ablation; waveform-zero is supplied by a separate cache."""
     return apply_feature_ablation(feature, mode)
@@ -59,7 +70,7 @@ def main() -> None:
     import torch
     from torch.nn.utils.rnn import pad_sequence
     from transformers import AutoModelForImageTextToText, AutoTokenizer
-    state = torch.load(a.checkpoint, map_location="cpu", weights_only=True)
+    state = _load_checkpoint(a.checkpoint, torch)
     if state.get("joyai_model") != a.joyai_model: raise ValueError("checkpoint JoyAI model mismatch")
     tok = AutoTokenizer.from_pretrained(a.joyai_model, fix_mistral_regex=True); layout = JoyAIStage1TokenLayout.from_tokenizer(tok)
     llm = AutoModelForImageTextToText.from_pretrained(a.joyai_model, dtype=torch.bfloat16).to(a.device)
