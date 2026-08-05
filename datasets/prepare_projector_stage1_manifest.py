@@ -63,6 +63,9 @@ def convert(input_path: Path, output_path: Path, provenance_path: Path) -> dict[
                 continue
             row = json.loads(line)
             try:
+                source_version = row.get("dataset_version")
+                if source_version is not None and source_version != provenance["version"]:
+                    raise ValueError("provenance_version_mismatch")
                 audio_path = Path(str(row["audio_path"])).expanduser().resolve()
                 target_text = str(row["target_text"] if "target_text" in row else row["text"]).strip()
                 input_text = str(row.get("input_text", "")).strip()
@@ -104,6 +107,7 @@ def convert(input_path: Path, output_path: Path, provenance_path: Path) -> dict[
                         "stage": "projector_only_audio_alignment",
                         "target_kind": "assistant_transcription",
                         "assistant_target_text": target_text,
+                        "dataset_version": source_version,
                         "split": str(row.get("split", "train")),
                         "source_record": str(row.get("source_record", "")),
                         "media_sha256": _sha256(audio_path),
@@ -115,6 +119,7 @@ def convert(input_path: Path, output_path: Path, provenance_path: Path) -> dict[
                     "audio_missing",
                     "audio_file_over_1gb",
                     "invalid_audio_text_fields",
+                    "provenance_version_mismatch",
                 } else "invalid_record"
                 skipped[key] = skipped.get(key, 0) + 1
                 continue

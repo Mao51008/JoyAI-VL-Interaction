@@ -84,3 +84,21 @@ def test_convert_skips_missing_audio(tmp_path: Path) -> None:
 
     assert summary["converted_samples"] == 0
     assert summary["skipped"] == {"audio_missing": 1}
+
+
+def test_convert_rejects_provenance_version_mismatch(tmp_path: Path) -> None:
+    audio = tmp_path / "sample.wav"
+    metadata = tmp_path / "metadata.jsonl"
+    provenance = tmp_path / "provenance.json"
+    output = tmp_path / "samples.jsonl"
+    _write_wav(audio)
+    metadata.write_text(json.dumps({
+        "audio_path": str(audio), "text": "hello", "duration_ms": 100,
+        "sample_rate": 16000, "num_samples": 1600, "dataset_version": "train-clean-100",
+    }) + "\n", encoding="utf-8")
+    _provenance(provenance)
+
+    summary = convert(metadata, output, provenance)
+
+    assert summary["converted_samples"] == 0
+    assert summary["skipped"] == {"provenance_version_mismatch": 1}

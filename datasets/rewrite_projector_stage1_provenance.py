@@ -16,6 +16,9 @@ def rewrite(source: Path, output: Path, *, version: str) -> dict[str, int | str]
             row = json.loads(line)
             if row.get("provenance", {}).get("dataset") != "LibriSpeech":
                 raise ValueError(f"{row.get('sample_id')}: expected LibriSpeech provenance")
+            source_version = row.get("metadata", {}).get("dataset_version")
+            if source_version is not None and source_version != version:
+                raise ValueError(f"{row.get('sample_id')}: source/version mismatch")
             row["provenance"]["version"] = version
             writer.write(json.dumps(row, ensure_ascii=False) + "\n")
             count += 1

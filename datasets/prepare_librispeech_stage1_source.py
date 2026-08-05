@@ -13,10 +13,18 @@ def _split(speaker: str, validation_percent: int) -> str:
     return "validation" if value < validation_percent else "train"
 
 
-def build(root: Path, output: Path, validation_percent: int, split_filter: str | None) -> dict[str, int]:
+def build(
+    root: Path,
+    output: Path,
+    validation_percent: int,
+    split_filter: str | None,
+    dataset_version: str,
+) -> dict[str, int]:
     import soundfile as sf
     if not 1 <= validation_percent < 50:
         raise ValueError("validation percent must be between 1 and 49")
+    if not dataset_version.strip():
+        raise ValueError("dataset version must not be empty")
     rows = []
     for transcript in sorted(root.rglob("*.trans.txt")):
         for line in transcript.read_text(encoding="utf-8").splitlines():
@@ -30,6 +38,7 @@ def build(root: Path, output: Path, validation_percent: int, split_filter: str |
             if split_filter and split != split_filter:
                 continue
             rows.append({"sample_id": f"librispeech-{utterance_id}", "audio_path": str(audio),
+                         "dataset_version": dataset_version,
                          "target_text": text, "duration_ms": round(info.frames * 1000 / info.samplerate),
                          "sample_rate": info.samplerate, "num_samples": info.frames,
                          "split": split,
@@ -46,8 +55,11 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--validation-percent", type=int, default=2)
     parser.add_argument("--split", choices=("train", "validation"))
+    parser.add_argument("--dataset-version", required=True,
+                        help="dataset split/version, for example train-clean-100")
     args = parser.parse_args()
-    print(json.dumps(build(args.root, args.output, args.validation_percent, args.split), indent=2))
+    print(json.dumps(build(args.root, args.output, args.validation_percent, args.split,
+                           args.dataset_version), indent=2))
 
 
 if __name__ == "__main__":
