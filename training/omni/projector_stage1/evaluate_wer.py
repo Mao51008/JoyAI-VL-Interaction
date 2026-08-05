@@ -58,7 +58,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--max-new-tokens", type=int, default=256)
-    parser.add_argument("--audio-ablation", choices=("none", "zero", "shuffle"), default="none")
+    parser.add_argument("--audio-ablation", choices=("none", "zero", "projected-zero", "shuffle"), default="none")
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -84,6 +84,7 @@ def main() -> None:
             input_ids = context + [layout.audio_start_id] + [layout.audio_placeholder_id] * feature.shape[1] + [layout.audio_end_id] + assistant_prefix
             ids = torch.tensor([input_ids], device=args.device)
             audio = projector(feature)
+            if args.audio_ablation == "projected-zero": audio.zero_()
             text = llm.get_input_embeddings()(ids)
             mask = ids.eq(layout.audio_placeholder_id)
             embeds = replace_audio_placeholders(text, audio, mask, torch.ones(audio.shape[:2], device=args.device, dtype=torch.bool))

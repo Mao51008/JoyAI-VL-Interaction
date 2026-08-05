@@ -6,7 +6,7 @@ from .projector import AudioProjector, AudioProjectorConfig
 from ..schema import load_samples
 from .collator import JoyAIStage1TokenLayout, build_sample_sequence
 from .data import pad_sequences
-from .model import CachedProjectorStage1Model
+from .model import CachedProjectorStage1Model, replace_audio_placeholders
 from .feature_cache import FeatureCache
 
 
@@ -26,7 +26,7 @@ def main() -> None:
     p.add_argument("--manifest", type=Path, required=True); p.add_argument("--feature-dir", type=Path, required=True)
     p.add_argument("--checkpoint", type=Path, required=True); p.add_argument("--joyai-model", required=True)
     p.add_argument("--device", default="cuda:0"); p.add_argument("--batch-size", type=int, default=2)
-    p.add_argument("--audio-ablation", choices=("none", "zero", "shuffle"), default="none")
+    p.add_argument("--audio-ablation", choices=("none", "zero", "projected-zero", "shuffle"), default="none")
     p.add_argument("--seed", type=int, default=3407)
     p.add_argument("--no-progress", action="store_true")
     a = p.parse_args()
@@ -54,13 +54,18 @@ def main() -> None:
             for sample in batch_samples:
                 cached = cache.get(sample.sample_id)
                 if cached["media_sha256"] != sample.metadata["media_sha256"]: raise ValueError("cached feature fingerprint mismatch")
-                feature = apply_audio_ablation(cached["features"], a.audio_ablation, randomizer); features.append(feature)
+                feature_mode = "none" if a.audio_ablation == "projected-zero" else a.audio_ablation
+                feature = apply_audio_ablation(cached["features"], feature_mode, randomizer); features.append(feature)
                 sequences.append(build_sample_sequence(sample, tokenizer=tok, layout=layout, audio_token_count=feature.shape[0]))
             padded = pad_sequences(sequences, pad_token_id=layout.pad_token_id)
             audio = pad_sequence(features, batch_first=True).to(a.device, dtype=torch.bfloat16)
             mask = torch.arange(audio.shape[1], device=a.device)[None, :] < torch.tensor([x.shape[0] for x in features], device=a.device)[:, None]
             ids = torch.tensor(padded["input_ids"], device=a.device); labels = torch.tensor(padded["labels"], device=a.device)
-            out = model(audio_features=audio, audio_attention_mask=mask, text_embeddings=llm.get_input_embeddings()(ids), audio_placeholder_mask=torch.tensor(padded["audio_placeholder_mask"], device=a.device), attention_mask=torch.tensor(padded["attention_mask"], device=a.device), labels=labels)
+            projected = projector(audio)
+            if a.audio_ablation == "projected-zero":
+                projected = torch.zeros_like(projected)
+            embeds = replace_audio_placeholders(llm.get_input_embeddings()(ids), projected, torch.tensor(padded["audio_placeholder_mask"], device=a.device), mask)
+            out = llm(inputs_embeds=embeds, attention_mask=torch.tensor(padded["attention_mask"], device=a.device), labels=labels)
             tokens = int((labels != -100).sum()); total_tokens += tokens; total_loss += float(out.loss) * tokens
             if progress is not None:
                 progress.set_postfix(samples=min(offset + len(batch_samples), len(samples)), loss=f"{total_loss / total_tokens:.4f}")

@@ -73,6 +73,14 @@ class AudioAblationTest(unittest.TestCase):
         self.assertEqual(sorted(shuffled[:, 0].tolist()), [1.0, 2.0, 3.0])
         self.assertFalse(torch.equal(shuffled, feature))
 
+    def test_projected_zero_is_distinct_from_input_zero(self) -> None:
+        import torch
+        from training.omni.projector_stage1.evaluate import apply_audio_ablation
+        feature = torch.tensor([[1.0], [2.0]])
+        projected = torch.tensor([[3.0], [4.0]])
+        self.assertTrue(torch.equal(apply_audio_ablation(feature, "none", random.Random(1)), feature))
+        self.assertTrue(torch.equal(projected.new_zeros(projected.shape), torch.zeros_like(projected)))
+
 
 if __name__ == "__main__":
     unittest.main()
