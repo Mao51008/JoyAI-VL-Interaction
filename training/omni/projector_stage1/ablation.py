@@ -19,6 +19,19 @@ def sample_exchange_order(sample_count: int, randomizer: random.Random) -> list[
     return [(index + shift) % sample_count for index in range(sample_count)]
 
 
+def sample_temporal_order(frame_count: int, randomizer: random.Random) -> list[int]:
+    """Return a deterministic derangement for within-sample time-axis shuffling."""
+    if frame_count < 2:
+        raise ValueError("temporal shuffle requires at least two frames")
+    return sample_exchange_order(frame_count, randomizer)
+
+
+def apply_temporal_shuffle(feature, randomizer: random.Random):
+    """Permute only the time axis while preserving shape, dtype, and values."""
+    order = sample_temporal_order(feature.shape[0], randomizer)
+    return feature[order]
+
+
 def apply_feature_ablation(feature, mode: str):
     """Apply feature-space ablations; waveform-zero is intentionally separate."""
     if mode == "none":

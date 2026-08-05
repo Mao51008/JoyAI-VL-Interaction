@@ -1,11 +1,14 @@
 import importlib.util
+import pickle
 import random
 import tempfile
 import unittest
 from pathlib import Path
 
 from training.omni.projector_stage1.ablation import (
+    apply_temporal_shuffle,
     sample_exchange_order,
+    sample_temporal_order,
     validate_exchange,
 )
 from training.omni.projector_stage1.compare_wer import compare_results
@@ -58,8 +61,8 @@ class EvaluationToolsTest(unittest.TestCase):
         result = compare_results(normal, zero, shuffle, typical_count=1)
         self.assertEqual(result["normal_shuffle_identical_rate"], 0.5)
         self.assertEqual(result["generation_summary"]["normal"]["average_generated_tokens"], 3.0)
-        self.assertEqual(result["generation_summary"]["zero"]["eos_rate"], 0.5)
-        self.assertEqual(result["rows"][0]["shuffle_minus_normal_wer"], 1.0)
+        self.assertEqual(result["generation_summary"]["waveform_zero"]["eos_rate"], 0.5)
+        self.assertEqual(result["rows"][0]["cross_sample_shuffle_minus_normal_wer"], 1.0)
         self.assertEqual(result["typical_failures"][0]["sample_id"], "a")
 
     def test_metrics_loading_and_best_validation_summary(self) -> None:
@@ -74,6 +77,66 @@ class EvaluationToolsTest(unittest.TestCase):
             summary = best_validation_summary(load_metrics(metrics))
         self.assertEqual(summary["best_validation_step"], 2)
         self.assertEqual(summary["best_validation_loss"], 1.2)
+
+    def test_trusted_checkpoint_loader_uses_narrow_safe_load(self) -> None:
+        from training.omni.projector_stage1.checkpoint_loading import load_trusted_checkpoint
+
+        class FakeSerialization:
+            class _Scope:
+                def __enter__(self): return self
+                def __exit__(self, *_): return False
+            def safe_globals(self, values):
+                self.values = values
+                return self._Scope()
+
+        class FakeTorch:
+            serialization = FakeSerialization()
+
+            @staticmethod
+            def load(path, *, map_location, weights_only):
+                self = FakeTorch.serialization
+                assert map_location == "cpu"
+                assert weights_only is True
+                assert self.values == [__import__("pathlib").PosixPath]
+                with path.open("rb") as handle:
+                    return pickle.load(handle)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trusted.pt"
+            with path.open("wb") as handle:
+                pickle.dump({"value": 3}, handle)
+            self.assertEqual(load_trusted_checkpoint(path, FakeTorch)["value"], 3)
+
+    def test_temporal_shuffle_is_reproducible_and_preserves_layout_without_torch(self) -> None:
+        from training.omni.projector_stage1.ablation import apply_temporal_shuffle, sample_temporal_order
+
+        class Feature:
+            shape = (3, 2)
+            dtype = "bf16"
+
+            def __init__(self, rows): self.rows = rows
+            def __getitem__(self, order): return Feature([self.rows[index] for index in order])
+
+        feature = Feature([[1, 2], [3, 4], [5, 6]])
+        first = apply_temporal_shuffle(feature, random.Random(7))
+        second = apply_temporal_shuffle(feature, random.Random(7))
+        self.assertEqual(first.rows, second.rows)
+        self.assertEqual(first.shape, feature.shape)
+        self.assertEqual(first.dtype, feature.dtype)
+        self.assertCountEqual(first.rows, feature.rows)
+        order = sample_temporal_order(3, random.Random(7))
+        self.assertTrue(all(index != donor for index, donor in enumerate(order)))
+
+    def test_temporal_shuffle_short_sequence_boundary_without_torch(self) -> None:
+        from training.omni.projector_stage1.ablation import apply_temporal_shuffle
+
+        class Feature:
+            def __init__(self, rows): self.rows = rows; self.shape = (len(rows), 1)
+            def __getitem__(self, order): return Feature([self.rows[index] for index in order])
+
+        with self.assertRaises(ValueError):
+            apply_temporal_shuffle(Feature([[1]]), random.Random(1))
+        self.assertEqual(apply_temporal_shuffle(Feature([[1], [2]]), random.Random(1)).rows, [[2], [1]])
 
 
 @unittest.skipUnless(importlib.util.find_spec("torch") is not None, "requires PyTorch")
@@ -109,6 +172,39 @@ class AudioAblationTest(unittest.TestCase):
     def test_sample_exchange_requires_two_samples(self) -> None:
         with self.assertRaises(ValueError):
             sample_exchange_order(1, random.Random(1))
+
+    def test_temporal_shuffle_is_reproducible_derangement_and_preserves_layout(self) -> None:
+        import torch
+
+        feature = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+        first = apply_temporal_shuffle(feature, random.Random(7))
+        second = apply_temporal_shuffle(feature, random.Random(7))
+        self.assertTrue(torch.equal(first, second))
+        self.assertEqual(first.shape, feature.shape)
+        self.assertEqual(first.dtype, feature.dtype)
+        self.assertCountEqual(first.tolist(), feature.tolist())
+        order = sample_temporal_order(3, random.Random(7))
+        self.assertTrue(all(index != donor for index, donor in enumerate(order)))
+
+    def test_temporal_shuffle_short_sequence_boundary(self) -> None:
+        import torch
+
+        with self.assertRaises(ValueError):
+            apply_temporal_shuffle(torch.ones(1, 2), random.Random(1))
+        swapped = apply_temporal_shuffle(torch.tensor([[1], [2]]), random.Random(1))
+        self.assertEqual(swapped.tolist(), [[2], [1]])
+
+    def test_checkpoint_loader_allowlists_only_posix_path(self) -> None:
+        import torch
+
+        from training.omni.projector_stage1.evaluate import _load_checkpoint
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trusted.pt"
+            torch.save({"path": Path("sample.pt"), "value": 3}, path)
+            loaded = _load_checkpoint(path, torch)
+        self.assertEqual(loaded["path"], Path("sample.pt"))
+        self.assertEqual(loaded["value"], 3)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,8 @@ import random
 from pathlib import Path
 
 from ..schema import load_samples
-from .ablation import apply_feature_ablation, sample_exchange_order, validate_exchange
+from .ablation import apply_feature_ablation, apply_temporal_shuffle, sample_exchange_order, validate_exchange
+from .checkpoint_loading import load_trusted_checkpoint
 from .collator import JoyAIStage1TokenLayout, build_sample_sequence
 from .data import pad_sequences
 from .feature_cache import FeatureCache
@@ -16,20 +17,15 @@ from .model import replace_audio_placeholders
 from .projector import AudioProjector, AudioProjectorConfig
 
 
-def _load_checkpoint(path: Path, torch):
-    """Load trusted stage-one metadata under PyTorch 2.6 weights-only rules."""
-    from pathlib import PosixPath
-
-    safe_globals = getattr(torch.serialization, "safe_globals", None)
-    if safe_globals is None:
-        return torch.load(path, map_location="cpu", weights_only=False)
-    with safe_globals([PosixPath]):
-        return torch.load(path, map_location="cpu", weights_only=True)
-
-
 def apply_audio_ablation(feature, mode: str):
     """Apply a feature-space ablation; waveform-zero is supplied by a separate cache."""
     return apply_feature_ablation(feature, mode)
+
+
+def canonical_ablation(mode: str) -> str:
+    return {"none": "none", "zero": "waveform-zero", "feature-zero": "feature-zero",
+            "projected-zero": "projected-zero", "shuffle": "cross-sample-shuffle",
+            "temporal-shuffle": "within-sample-temporal-shuffle"}[mode]
 
 
 def per_sample_token_losses(logits, labels, eos_token_id: int):
@@ -61,7 +57,7 @@ def main() -> None:
     p.add_argument("--manifest", type=Path, required=True); p.add_argument("--feature-dir", type=Path, required=True)
     p.add_argument("--checkpoint", type=Path, required=True); p.add_argument("--joyai-model", required=True)
     p.add_argument("--device", default="cuda:0"); p.add_argument("--batch-size", type=int, default=2)
-    p.add_argument("--audio-ablation", choices=("none", "zero", "feature-zero", "projected-zero", "shuffle"), default="none")
+    p.add_argument("--audio-ablation", choices=("none", "zero", "waveform-zero", "feature-zero", "projected-zero", "shuffle", "temporal-shuffle"), default="none")
     p.add_argument("--zero-feature-dir", type=Path,
                    help="feature cache extracted from zero waveforms; required for --audio-ablation zero")
     p.add_argument("--seed", type=int, default=3407)
@@ -72,7 +68,7 @@ def main() -> None:
     import torch
     from torch.nn.utils.rnn import pad_sequence
     from transformers import AutoModelForImageTextToText, AutoTokenizer
-    state = _load_checkpoint(a.checkpoint, torch)
+    state = load_trusted_checkpoint(a.checkpoint, torch)
     if state.get("joyai_model") != a.joyai_model: raise ValueError("checkpoint JoyAI model mismatch")
     tok = AutoTokenizer.from_pretrained(a.joyai_model, fix_mistral_regex=True); layout = JoyAIStage1TokenLayout.from_tokenizer(tok)
     llm = AutoModelForImageTextToText.from_pretrained(a.joyai_model, dtype=torch.bfloat16).to(a.device)
@@ -80,7 +76,7 @@ def main() -> None:
     projector.load_state_dict(state["projector"])
     samples = load_samples(a.manifest); cache = FeatureCache(a.feature_dir)
     zero_cache = FeatureCache(a.zero_feature_dir) if a.zero_feature_dir is not None else None
-    if a.audio_ablation == "zero" and zero_cache is None:
+    if a.audio_ablation in {"zero", "waveform-zero"} and zero_cache is None:
         raise ValueError("--zero-feature-dir is required for waveform-zero evaluation")
     normal_features = [cache.get(sample.sample_id) for sample in samples]
     sample_indices = {sample.sample_id: index for index, sample in enumerate(samples)}
@@ -102,7 +98,7 @@ def main() -> None:
             batch_samples = samples[offset:offset + a.batch_size]; features = []; sequences = []
             for sample in batch_samples:
                 sample_index = sample_indices[sample.sample_id]
-                if a.audio_ablation == "zero":
+                if a.audio_ablation in {"zero", "waveform-zero"}:
                     cached = zero_cache.get(sample.sample_id)
                     if not zero_cache.index[sample.sample_id].get("waveform_zero", False):
                         raise ValueError("zero feature cache was not extracted from zero waveforms")
@@ -114,6 +110,9 @@ def main() -> None:
                     cached = normal_features[sample_index]
                 feature_mode = "feature-zero" if a.audio_ablation == "feature-zero" else "none"
                 feature = apply_audio_ablation(cached["features"], feature_mode); features.append(feature)
+                if a.audio_ablation == "temporal-shuffle":
+                    feature = apply_temporal_shuffle(feature, random.Random(a.seed + sample_index))
+                features[-1] = feature
                 sequences.append(build_sample_sequence(sample, tokenizer=tok, layout=layout, audio_token_count=feature.shape[0]))
             padded = pad_sequences(sequences, pad_token_id=layout.pad_token_id)
             audio = pad_sequence(features, batch_first=True).to(a.device, dtype=torch.bfloat16)
@@ -135,7 +134,7 @@ def main() -> None:
             if progress is not None:
                 progress.set_postfix(samples=min(offset + len(batch_samples), len(samples)), loss=f"{total_loss / total_tokens:.4f}")
     loss = total_loss / total_tokens
-    result = {"checkpoint": str(a.checkpoint), "audio_ablation": a.audio_ablation,
+    result = {"checkpoint": str(a.checkpoint), "audio_ablation": canonical_ablation(a.audio_ablation),
               "samples": len(samples), "supervised_tokens": total_tokens,
               "loss": loss, "perplexity": math.exp(min(loss, 20.0)), "rows": rows}
     print(json.dumps(result, indent=2))
