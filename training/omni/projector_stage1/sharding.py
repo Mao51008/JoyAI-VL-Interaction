@@ -38,9 +38,10 @@ def load_sharded_samples(manifest: Path, max_samples: int | None, num_shards: in
     if max_samples is not None and max_samples <= 0:
         raise ValueError("max_samples must be positive")
     manifest_samples = load_samples(manifest)
-    samples = manifest_samples if max_samples is None else manifest_samples[:max_samples]
-    indices = shard_indices(len(samples), num_shards, shard_index)
-    return manifest_samples, samples, indices
+    evaluation_samples = manifest_samples if max_samples is None else manifest_samples[:max_samples]
+    indices = shard_indices(len(evaluation_samples), num_shards, shard_index)
+    selected_samples = [evaluation_samples[index] for index in indices]
+    return manifest_samples, selected_samples, indices
 
 
 def global_exchange_order(sample_count: int, seed: int) -> list[int]:

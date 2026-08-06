@@ -2,12 +2,15 @@ import json
 import random
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
+from unittest.mock import patch
 
 from training.omni.projector_stage1.ablation import apply_temporal_shuffle
 from training.omni.projector_stage1.merge_shards import merge_shard_results
 from training.omni.projector_stage1.sharding import (
     global_exchange_order,
+    load_sharded_samples,
     result_metadata,
     shard_indices,
     temporal_seed,
@@ -57,6 +60,29 @@ class ShardingTest(unittest.TestCase):
         self.assertEqual([len(part) for part in parts], [174] * 4)
         self.assertEqual(sorted(index for part in parts for index in part), list(range(696)))
         self.assertEqual(shard_indices(8, 1, 0), list(range(8)))
+
+    def test_load_sharded_samples_selects_696_rows_by_global_index(self):
+        all_samples = [SimpleNamespace(sample_id=f"s{i}") for i in range(696)]
+        with patch("training.omni.projector_stage1.sharding.load_samples", return_value=all_samples):
+            parts = [load_sharded_samples(self.manifest, None, 4, index) for index in range(4)]
+        self.assertEqual([len(part[1]) for part in parts], [174] * 4)
+        for manifest_samples, selected, indices in parts:
+            self.assertIs(manifest_samples, all_samples)
+            self.assertEqual([sample.sample_id for sample in selected], [f"s{i}" for i in indices])
+        self.assertEqual(sorted(index for part in parts for index in part[2]), list(range(696)))
+
+    def test_load_sharded_samples_max_prefix_and_default_one_zero(self):
+        all_samples = [SimpleNamespace(sample_id=f"s{i}") for i in range(10)]
+        with patch("training.omni.projector_stage1.sharding.load_samples", return_value=all_samples):
+            default = load_sharded_samples(self.manifest, None, 1, 0)
+            parts = [load_sharded_samples(self.manifest, 10, 4, index) for index in range(4)]
+        self.assertEqual([sample.sample_id for sample in default[1]], [f"s{i}" for i in range(10)])
+        self.assertEqual(default[2], list(range(10)))
+        self.assertEqual(sorted(i for part in parts for i in part[2]), list(range(10)))
+        self.assertEqual(
+            sorted(sample.sample_id for part in parts for sample in part[1]),
+            [f"s{i}" for i in range(10)],
+        )
 
     def test_invalid_shard_parameters(self):
         with self.assertRaises(ValueError): validate_shard_args(0, 0)

@@ -180,7 +180,8 @@ def main() -> None:
     char_total = sum(len(row["reference"].replace(" ", "")) for row in rows)
     result = result_metadata(
         manifest=args.manifest, manifest_sample_count=len(manifest_samples),
-        evaluation_sample_count=len(samples), indices=global_indices,
+        evaluation_sample_count=(len(manifest_samples) if args.max_samples is None
+                                 else min(args.max_samples, len(manifest_samples))), indices=global_indices,
         num_shards=args.num_shards, shard_index=args.shard_index,
         checkpoint=args.checkpoint, ablation=canonical_ablation(args.audio_ablation), seed=args.seed,
     )
