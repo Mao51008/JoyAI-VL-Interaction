@@ -14,12 +14,14 @@ class FakeChild:
         self.status = status
         self.signals = []
         self.poll_count = 0
+        self.wait_count = 0
 
     def poll(self):
         self.poll_count += 1
         return None if self.poll_count < 3 else self.status
 
     def wait(self):
+        self.wait_count += 1
         self.status = self.status
         return self.status
 
@@ -74,6 +76,7 @@ class RunShardedWerTest(unittest.TestCase):
                 child = FakeChild()
                 children.append(child)
                 launches.append((command, kwargs["env"]))
+                Path(command[command.index("--output") + 1]).write_text("{}", encoding="utf-8")
                 return child
 
             def merge(paths, output):
@@ -83,7 +86,26 @@ class RunShardedWerTest(unittest.TestCase):
             result = run_sharded(args, popen_factory=popen, merge_runner=merge, sleep_fn=lambda _: None)
             self.assertEqual(result["samples"], 4)
             self.assertEqual([env["CUDA_VISIBLE_DEVICES"] for _, env in launches], ["0", "1", "2", "3"])
+            self.assertTrue(all("PATH" in env for _, env in launches))
             self.assertEqual([command[command.index("--shard-index") + 1] for command, _ in launches], ["0", "1", "2", "3"])
+
+    def test_child_environment_inherits_sentinel_without_mutating_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self._args(root)
+            args.environment = {"RUNNER_SENTINEL": "kept"}
+            parent_value = __import__("os").environ.get("RUNNER_SENTINEL")
+            environments = []
+
+            def popen(_command, **kwargs):
+                environments.append(kwargs["env"])
+                Path(_command[_command.index("--output") + 1]).write_text("{}", encoding="utf-8")
+                return FakeChild()
+
+            run_sharded(args, popen_factory=popen, merge_runner=lambda paths, output: output.write_text("{}"),
+                        sleep_fn=lambda _: None)
+            self.assertEqual([env["RUNNER_SENTINEL"] for env in environments], ["kept"] * 4)
+            self.assertEqual(__import__("os").environ.get("RUNNER_SENTINEL"), parent_value)
 
     def test_failure_waits_for_all_children_and_does_not_merge(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -113,6 +135,7 @@ class RunShardedWerTest(unittest.TestCase):
             args = self._args(root)
             children = []
             captured = {}
+            signal_calls = []
 
             def popen(_command, **_kwargs):
                 child = FakeChild()
@@ -120,6 +143,7 @@ class RunShardedWerTest(unittest.TestCase):
                 return child
 
             def fake_signal(sig, handler):
+                signal_calls.append((sig, handler))
                 captured[sig] = handler
                 return signal.SIG_DFL
 
@@ -129,13 +153,52 @@ class RunShardedWerTest(unittest.TestCase):
                 nonlocal calls
                 calls += 1
                 if calls == 1:
-                    captured[signal.SIGTERM](signal.SIGTERM)
+                    captured[signal.SIGTERM](signal.SIGTERM, None)
 
             with patch("training.omni.projector_stage1.run_sharded_wer.signal.signal", side_effect=fake_signal):
                 with self.assertRaises(RuntimeError):
                     run_sharded(args, popen_factory=popen, merge_runner=lambda *_: None,
                                 sleep_fn=interrupt_once)
             self.assertEqual([child.signals for child in children], [[signal.SIGTERM]] * 4)
+            self.assertTrue(all(child.wait_count >= 1 for child in children))
+            registered_count = 3 if hasattr(signal, "SIGHUP") else 2
+            registered = [sig for sig, _handler in signal_calls[:registered_count]]
+            self.assertEqual([sig for sig, _handler in signal_calls[-registered_count:]], registered)
+
+    def test_merged_output_appearing_during_run_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self._args(root)
+            original = "existing"
+            merged = False
+
+            def appear(_seconds):
+                args.merged_output.write_text(original, encoding="utf-8")
+
+            def merge(_paths, _output):
+                nonlocal merged
+                merged = True
+
+            with self.assertRaises(FileExistsError):
+                run_sharded(args, popen_factory=lambda *_args, **_kwargs: FakeChild(),
+                            merge_runner=merge, sleep_fn=appear)
+            self.assertFalse(merged)
+            self.assertEqual(args.merged_output.read_text(encoding="utf-8"), original)
+
+    def test_missing_shard_output_does_not_merge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self._args(root)
+            merged = False
+
+            def merge(_paths, _output):
+                nonlocal merged
+                merged = True
+
+            with self.assertRaisesRegex(RuntimeError, "missing shard outputs"):
+                run_sharded(args, popen_factory=lambda *_args, **_kwargs: FakeChild(),
+                            merge_runner=merge, sleep_fn=lambda _: None)
+            self.assertFalse(merged)
 
 
 if __name__ == "__main__":

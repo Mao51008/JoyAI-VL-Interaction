@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import signal
 import subprocess
@@ -100,7 +101,7 @@ def run_sharded(
     log_handles = []
     stopping = False
 
-    def stop_children(signum: int = signal.SIGTERM) -> None:
+    def stop_children(signum: int = signal.SIGTERM, _frame=None) -> None:
         nonlocal stopping
         stopping = True
         for child in children:
@@ -126,7 +127,8 @@ def run_sharded(
             handle = log_path.open("w", encoding="utf-8")
             log_handles.append(handle)
             command = _build_child_command(args, shard, output)
-            environment = dict(getattr(args, "environment", {}))
+            environment = os.environ.copy()
+            environment.update(getattr(args, "environment", {}))
             environment["CUDA_VISIBLE_DEVICES"] = gpu
             children.append(popen_factory(command, stdout=handle, stderr=subprocess.STDOUT, env=environment))
             shard_outputs.append(output)
@@ -153,6 +155,9 @@ def run_sharded(
             raise RuntimeError("one or more WER shards failed; refusing to merge")
         if args.merged_output.exists():
             raise FileExistsError("merged-output appeared during evaluation; refusing to overwrite")
+        missing = [path for path in shard_outputs if not path.is_file()]
+        if missing:
+            raise RuntimeError(f"missing shard outputs; refusing to merge: {missing}")
         if merge_runner is None:
             from .merge_shards import merge_shard_results
 
@@ -192,7 +197,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    args.environment = dict()
     run_sharded(args)
 
 
