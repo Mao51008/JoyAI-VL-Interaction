@@ -10,6 +10,7 @@ from .collator import JoyAIStage1TokenLayout, build_sample_sequence
 from .data import pad_sequences
 from .model import CachedProjectorStage1Model
 from .feature_cache import FeatureCache
+from .observability import validation_is_due, write_loss_curve
 
 def _hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -161,8 +162,9 @@ def main() -> None:
         if a.ddp:
             dist.all_reduce(loss, op=dist.ReduceOp.AVG)
         completed_step = step + 1
-        epoch_end = a.steps_per_epoch is not None and completed_step % a.steps_per_epoch == 0
-        validation_due = validation_batches is not None and (completed_step % a.validate_every_steps == 0 or epoch_end or completed_step == a.steps)
+        validation_due = validation_is_due(
+            completed_step, a.validate_every_steps, a.steps_per_epoch, validation_batches is not None
+        ) or (validation_batches is not None and completed_step == a.steps)
         validation_loss = evaluate_validation() if validation_due else None
         improved = validation_loss is not None and validation_loss < best_validation_loss
         if rank == 0 and improved:
@@ -183,4 +185,6 @@ def main() -> None:
             with metrics_path.open("a", encoding="utf-8") as metrics: metrics.write(json.dumps(record) + "\n")
         if bool(stop.item()): break
     if a.ddp: dist.destroy_process_group()
+    if rank == 0:
+        write_loss_curve(metrics_path, a.output_dir / "loss_curve.svg")
 if __name__ == "__main__": main()
