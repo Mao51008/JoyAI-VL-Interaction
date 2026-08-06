@@ -8,13 +8,19 @@ import random
 from pathlib import Path
 
 from ..schema import load_samples
-from .ablation import apply_feature_ablation, apply_temporal_shuffle, sample_exchange_order, validate_exchange
+from .ablation import apply_feature_ablation, apply_temporal_shuffle
 from .checkpoint_loading import load_trusted_checkpoint
 from .collator import JoyAIStage1TokenLayout, build_sample_sequence
 from .data import pad_sequences
 from .feature_cache import FeatureCache
 from .model import replace_audio_placeholders
 from .projector import AudioProjector, AudioProjectorConfig
+from .sharding import (
+    global_exchange_order,
+    load_sharded_samples,
+    result_metadata,
+    temporal_seed,
+)
 
 
 def apply_audio_ablation(feature, mode: str):
@@ -61,6 +67,8 @@ def main() -> None:
     p.add_argument("--zero-feature-dir", type=Path,
                    help="feature cache extracted from zero waveforms; required for --audio-ablation zero")
     p.add_argument("--seed", type=int, default=3407)
+    p.add_argument("--num-shards", type=int, default=1)
+    p.add_argument("--shard-index", type=int, default=0)
     p.add_argument("--output", type=Path)
     p.add_argument("--no-progress", action="store_true")
     a = p.parse_args()
@@ -74,18 +82,20 @@ def main() -> None:
     llm = AutoModelForImageTextToText.from_pretrained(a.joyai_model, dtype=torch.bfloat16).to(a.device)
     projector = AudioProjector(AudioProjectorConfig(**state["config"]["projector"])).to(a.device, dtype=torch.bfloat16)
     projector.load_state_dict(state["projector"])
-    samples = load_samples(a.manifest); cache = FeatureCache(a.feature_dir)
+    manifest_samples, samples, global_indices = load_sharded_samples(
+        a.manifest, None, a.num_shards, a.shard_index
+    )
+    cache = FeatureCache(a.feature_dir)
     zero_cache = FeatureCache(a.zero_feature_dir) if a.zero_feature_dir is not None else None
     if a.audio_ablation in {"zero", "waveform-zero"} and zero_cache is None:
         raise ValueError("--zero-feature-dir is required for waveform-zero evaluation")
-    normal_features = [cache.get(sample.sample_id) for sample in samples]
-    sample_indices = {sample.sample_id: index for index, sample in enumerate(samples)}
-    if any(item["media_sha256"] != sample.metadata["media_sha256"] for item, sample in zip(normal_features, samples)):
+    all_features = [cache.get(sample.sample_id) for sample in manifest_samples]
+    sample_indices = {sample.sample_id: index for index, sample in enumerate(manifest_samples)}
+    if any(item["media_sha256"] != sample.metadata["media_sha256"] for item, sample in zip(all_features, manifest_samples)):
         raise ValueError("cached feature fingerprint mismatch")
     exchange_order = None
     if a.audio_ablation == "shuffle":
-        exchange_order = sample_exchange_order(len(samples), random.Random(a.seed))
-        validate_exchange(normal_features, exchange_order)
+        exchange_order = global_exchange_order(len(manifest_samples), a.seed)
     total_loss = 0.0; total_tokens = 0; rows = []
     try:
         from tqdm import tqdm
@@ -105,13 +115,13 @@ def main() -> None:
                     if cached["media_sha256"] != sample.metadata["media_sha256"]:
                         raise ValueError("zero feature cache fingerprint mismatch")
                 elif a.audio_ablation == "shuffle":
-                    cached = normal_features[exchange_order[sample_index]]
+                    cached = all_features[exchange_order[sample_index]]
                 else:
-                    cached = normal_features[sample_index]
+                    cached = all_features[sample_index]
                 feature_mode = "feature-zero" if a.audio_ablation == "feature-zero" else "none"
                 feature = apply_audio_ablation(cached["features"], feature_mode); features.append(feature)
                 if a.audio_ablation == "temporal-shuffle":
-                    feature = apply_temporal_shuffle(feature, random.Random(a.seed + sample_index))
+                    feature = apply_temporal_shuffle(feature, random.Random(temporal_seed(a.seed, sample_index)))
                 features[-1] = feature
                 sequences.append(build_sample_sequence(sample, tokenizer=tok, layout=layout, audio_token_count=feature.shape[0]))
             padded = pad_sequences(sequences, pad_token_id=layout.pad_token_id)
@@ -127,6 +137,7 @@ def main() -> None:
             for sample, metrics in zip(batch_samples, per_sample_token_losses(out.logits, labels, layout.eos_token_id)):
                 rows.append({
                     "sample_id": sample.sample_id,
+                    "global_index": sample_indices[sample.sample_id],
                     "speaker": str(sample.metadata.get("speaker") or sample.sample_id.split("-")[1]),
                     "duration_ms": sample.duration_ms,
                     **metrics,
@@ -134,9 +145,14 @@ def main() -> None:
             if progress is not None:
                 progress.set_postfix(samples=min(offset + len(batch_samples), len(samples)), loss=f"{total_loss / total_tokens:.4f}")
     loss = total_loss / total_tokens
-    result = {"checkpoint": str(a.checkpoint), "audio_ablation": canonical_ablation(a.audio_ablation),
-              "samples": len(samples), "supervised_tokens": total_tokens,
+    result = result_metadata(
+              manifest=a.manifest, manifest_sample_count=len(manifest_samples),
+              evaluation_sample_count=len(manifest_samples), indices=global_indices,
+              num_shards=a.num_shards, shard_index=a.shard_index, checkpoint=a.checkpoint,
+              ablation=canonical_ablation(a.audio_ablation), seed=a.seed)
+    result.update({"samples": len(samples), "supervised_tokens": total_tokens,
               "loss": loss, "perplexity": math.exp(min(loss, 20.0)), "rows": rows}
+              )
     print(json.dumps(result, indent=2))
     if a.output is not None:
         a.output.parent.mkdir(parents=True, exist_ok=True)
