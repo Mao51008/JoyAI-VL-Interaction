@@ -29,7 +29,7 @@ def apply_audio_ablation(feature, mode: str):
 
 
 def canonical_ablation(mode: str) -> str:
-    return {"none": "none", "zero": "waveform-zero", "feature-zero": "feature-zero",
+    return {"none": "none", "zero": "waveform-zero", "waveform-zero": "waveform-zero", "feature-zero": "feature-zero",
             "projected-zero": "projected-zero", "shuffle": "cross-sample-shuffle",
             "temporal-shuffle": "within-sample-temporal-shuffle"}[mode]
 
