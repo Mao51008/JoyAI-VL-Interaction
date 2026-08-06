@@ -7,6 +7,7 @@ from pathlib import Path
 
 from ..schema import load_samples
 from .collator import _load_mono_audio
+from .progress import progress_iter
 
 
 def main() -> None:
@@ -22,6 +23,7 @@ def main() -> None:
         action="store_true",
         help="replace each waveform with zeros before Qwen3-ASR feature extraction",
     )
+    p.add_argument("--no-progress", action="store_true")
     a = p.parse_args()
     import torch
     from qwen_asr import Qwen3ASRModel
@@ -38,7 +40,14 @@ def main() -> None:
         if not shard_samples: return
         name = f"shard-{shard_index:05d}.pt"; torch.save({"samples": shard_samples}, a.output_dir / name)
         shard_samples = []; shard_index += 1
-    for sample in samples:
+    progress = progress_iter(
+        samples,
+        total=len(samples),
+        description="cache features",
+        unit="sample",
+        no_progress=a.no_progress,
+    )
+    for sample in progress:
         waveform, rate = _load_mono_audio(sample.audio[0].path)
         if rate != 16000: raise ValueError(f"{sample.sample_id}: expected 16 kHz")
         if a.waveform_zero:

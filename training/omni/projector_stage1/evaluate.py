@@ -102,7 +102,14 @@ def main() -> None:
     except ImportError:
         tqdm = None
     offsets = range(0, len(samples), a.batch_size)
-    progress = None if a.no_progress or tqdm is None else tqdm(offsets, total=math.ceil(len(samples) / a.batch_size), unit="batch")
+    progress = None if a.no_progress or tqdm is None else tqdm(
+        offsets,
+        total=math.ceil(len(samples) / a.batch_size),
+        desc=f"shard {a.shard_index + 1}/{a.num_shards}",
+        unit="batch",
+        mininterval=1.0,
+        dynamic_ncols=False,
+    )
     with torch.inference_mode():
         for offset in offsets if progress is None else progress:
             batch_samples = samples[offset:offset + a.batch_size]; features = []; sequences = []

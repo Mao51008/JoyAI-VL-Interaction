@@ -143,7 +143,9 @@ def main() -> None:
     except ImportError:
         tqdm = None
     steps = range(start, a.steps)
-    progress = None if rank or a.no_progress or tqdm is None else tqdm(steps, total=a.steps, initial=start, unit="step")
+    progress = None if rank or a.no_progress or tqdm is None else tqdm(
+        steps, total=a.steps, initial=start, desc="train", unit="step", mininterval=1.0, dynamic_ncols=False
+    )
     for step in steps if progress is None else progress:
         epoch = step // (a.steps_per_epoch or batches_per_rank)
         rank_batches = shuffled_rank_batches(global_batches, world_size=world_size, rank=rank, seed=a.seed, epoch=epoch)

@@ -12,6 +12,7 @@ from .checkpoint_loading import load_trusted_checkpoint
 from .collator import JoyAIStage1TokenLayout, build_chat_parts
 from .data import target_text
 from .feature_cache import FeatureCache
+from .progress import progress_iter
 from .sharding import (
     global_exchange_order,
     load_sharded_samples,
@@ -105,6 +106,7 @@ def main() -> None:
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--no-progress", action="store_true")
     args = parser.parse_args()
     if args.max_samples is not None and args.max_samples <= 0: raise ValueError("--max-samples must be positive")
     import torch
@@ -134,8 +136,15 @@ def main() -> None:
     if args.audio_ablation == "shuffle":
         exchange_order = global_exchange_order(len(manifest_samples), args.seed)
     rows = []
+    progress = progress_iter(
+        samples,
+        total=len(samples),
+        description=f"shard {args.shard_index + 1}/{args.num_shards}",
+        unit="sample",
+        no_progress=args.no_progress,
+    )
     with torch.inference_mode():
-        for index, sample in enumerate(samples):
+        for index, sample in enumerate(progress):
             global_index = global_indices[index]
             if args.audio_ablation in {"zero", "waveform-zero"}:
                 cached = zero_cache.get(sample.sample_id)
@@ -174,6 +183,8 @@ def main() -> None:
                 row["feature_donor_sample_id"] = manifest_samples[exchange_order[global_index]].sample_id
             row.update(score_transcript(reference, hypothesis))
             rows.append(row)
+            if hasattr(progress, "set_postfix"):
+                progress.set_postfix(samples=len(rows))
     word_errors = sum(int(row["word_errors"]) for row in rows)
     word_total = sum(len(row["reference"].split()) for row in rows)
     char_errors = sum(int(row["char_errors"]) for row in rows)
