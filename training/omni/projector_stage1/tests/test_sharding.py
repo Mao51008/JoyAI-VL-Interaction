@@ -138,6 +138,26 @@ class ShardingTest(unittest.TestCase):
         self.assertIn("speaker_summary", merged)
         self.assertIn("duration_summary", merged)
 
+    def test_old_wer_rows_recover_reference_chars_from_reference_text(self):
+        parts = [self._metadata(i, "wer") for i in range(4)]
+        for part in parts:
+            for row in part["rows"]:
+                row["reference"] = "AA BB"
+                row.pop("reference_chars")
+        merged = merge_shard_results(parts)
+        self.assertEqual(merged["reference_chars"], 8 * 4)
+        self.assertEqual(merged["duration_summary"]["10-15s"]["reference_chars"], 8 * 4)
+        self.assertEqual(merged["speaker_summary"]["0"]["reference_chars"], 4 * 4)
+        self.assertAlmostEqual(merged["cer"], merged["char_errors"] / (8 * 4))
+
+    def test_old_wer_rows_without_reference_text_fail_clearly(self):
+        parts = [self._metadata(i, "wer") for i in range(4)]
+        for part in parts:
+            for row in part["rows"]:
+                row.pop("reference_chars")
+        with self.assertRaisesRegex(ValueError, "reference text and reference_chars"):
+            merge_shard_results(parts)
+
     def test_merge_rejects_missing_duplicate_and_inconsistent_shards(self):
         parts = [self._metadata(i) for i in range(4)]
         with self.assertRaises(ValueError): merge_shard_results(parts[:3])

@@ -72,6 +72,7 @@ def score_transcript(reference: str, hypothesis: str) -> dict[str, int | float |
         "char_deletions": char_deletions,
         "char_substitutions": char_substitutions,
         "reference_words": len(reference_words),
+        "reference_chars": len(reference_chars),
         "hypothesis_words": len(hypothesis_words),
         "exact_match": reference == hypothesis,
     }

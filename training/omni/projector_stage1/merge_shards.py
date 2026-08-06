@@ -127,6 +127,16 @@ def _group_summary(rows: list[dict], key) -> dict:
 
 
 def _merge_wer(first: dict, rows: list[dict]) -> dict:
+    normalized_rows = []
+    for row in rows:
+        if "reference_chars" in row:
+            normalized_rows.append(row)
+            continue
+        reference = row.get("reference")
+        if not isinstance(reference, str):
+            raise ValueError("WER row missing reference text and reference_chars")
+        normalized_rows.append({**row, "reference_chars": len(reference.replace(" ", ""))})
+    rows = normalized_rows
     result = _base_result(first, rows)
     word_errors = sum(int(row["word_errors"]) for row in rows)
     reference_words = sum(int(row["reference_words"]) for row in rows)
