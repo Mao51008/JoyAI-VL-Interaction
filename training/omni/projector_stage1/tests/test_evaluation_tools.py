@@ -12,7 +12,7 @@ from training.omni.projector_stage1.ablation import (
     validate_exchange,
 )
 from training.omni.projector_stage1.compare_wer import compare_results
-from training.omni.projector_stage1.evaluate_wer import has_eos, score_transcript
+from training.omni.projector_stage1.evaluate_wer import canonical_ablation, has_eos, score_transcript
 from training.omni.projector_stage1.plot_metrics import (
     best_validation_summary,
     load_metrics,
@@ -20,6 +20,9 @@ from training.omni.projector_stage1.plot_metrics import (
 
 
 class EvaluationToolsTest(unittest.TestCase):
+    def test_canonical_ablation_accepts_waveform_zero_cli_value(self) -> None:
+        self.assertEqual(canonical_ablation("waveform-zero"), "waveform-zero")
+
     def test_transcript_metrics_include_word_counts_and_exact_match(self) -> None:
         score = score_transcript("HELLO WORLD", "HELLO THERE")
         self.assertEqual(score["reference_words"], 2)
