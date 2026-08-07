@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,42 @@ def _load_manifest(path: Path) -> list[dict[str, Any]]:
                 f"manifest row {index} lacks cache fields: {sorted(missing)}"
             )
     return rows
+
+
+def _load_rows(
+    manifests: list[Path], limit: int | None
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    rows: list[dict[str, Any]] = []
+    fingerprints: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    for manifest in manifests:
+        resolved = manifest.resolve()
+        for row in _load_manifest(resolved):
+            sample_id = str(row["sample_id"])
+            if sample_id in seen_ids:
+                raise ValueError(f"duplicate sample_id across manifests: {sample_id}")
+            seen_ids.add(sample_id)
+            rows.append(dict(row, _manifest_root=str(resolved.parent)))
+        fingerprints.append({"path": str(resolved), "sha256": _sha256_file(resolved)})
+    if limit is not None:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        rows = rows[:limit]
+    return rows, fingerprints
+
+
+def _validate_shard_args(num_shards: int, shard_index: int) -> None:
+    if num_shards <= 0:
+        raise ValueError("num_shards must be positive")
+    if not 0 <= shard_index < num_shards:
+        raise ValueError("shard_index must be in [0, num_shards)")
+
+
+def _select_shard_rows(
+    rows: list[dict[str, Any]], num_shards: int, shard_index: int
+) -> list[dict[str, Any]]:
+    _validate_shard_args(num_shards, shard_index)
+    return rows[shard_index::num_shards]
 
 
 def _audio_model_config_hash(audio_model: Path) -> str:
@@ -107,6 +144,8 @@ def cache_features(
     shard_size: int,
     limit: int | None,
     model_revision: str,
+    num_shards: int = 1,
+    shard_index: int = 0,
 ) -> dict[str, Any]:
     """Extract frozen ASR features once; refuse to reuse an output directory."""
     if output_dir.exists():
@@ -115,25 +154,9 @@ def cache_features(
         )
     if shard_size <= 0:
         raise ValueError("shard_size must be positive")
-    rows: list[dict[str, Any]] = []
-    manifest_fingerprints: list[dict[str, str]] = []
-    seen_ids: set[str] = set()
-    for manifest in manifests:
-        resolved = manifest.resolve()
-        manifest_rows = _load_manifest(resolved)
-        for row in manifest_rows:
-            sample_id = str(row["sample_id"])
-            if sample_id in seen_ids:
-                raise ValueError(f"duplicate sample_id across manifests: {sample_id}")
-            seen_ids.add(sample_id)
-            rows.append(dict(row, _manifest_root=str(resolved.parent)))
-        manifest_fingerprints.append(
-            {"path": str(resolved), "sha256": _sha256_file(resolved)}
-        )
-    if limit is not None:
-        if limit <= 0:
-            raise ValueError("limit must be positive")
-        rows = rows[:limit]
+    all_rows, manifest_fingerprints = _load_rows(manifests, limit)
+    rows = _select_shard_rows(all_rows, num_shards, shard_index)
+    cache_part_index = shard_index
 
     import torch
     from qwen_asr import Qwen3ASRModel
@@ -154,15 +177,15 @@ def cache_features(
     config_hash = _audio_model_config_hash(audio_model)
     records: list[dict[str, Any]] = []
     shard_samples: list[dict[str, Any]] = []
-    shard_index = 0
+    file_shard_index = 0
 
     def flush() -> None:
-        nonlocal shard_index, shard_samples
+        nonlocal file_shard_index, shard_samples
         if not shard_samples:
             return
-        name = f"shard-{shard_index:05d}.pt"
+        name = f"shard-{file_shard_index:05d}.pt"
         torch.save({"samples": shard_samples}, output_dir / name)
-        shard_index += 1
+        file_shard_index += 1
         shard_samples = []
 
     for row in rows:
@@ -190,7 +213,7 @@ def cache_features(
             raise ValueError(
                 f"invalid cached feature shape {tuple(features.shape)} for {row['sample_id']}"
             )
-        name = f"shard-{shard_index:05d}.pt"
+        name = f"shard-{file_shard_index:05d}.pt"
         shard_samples.append({"sample_id": row["sample_id"], "features": features})
         records.append(
             {
@@ -214,8 +237,11 @@ def cache_features(
         "audio_model_config_sha256": config_hash,
         "target_sample_rate": target_sample_rate,
         "manifests": manifest_fingerprints,
+        "total_samples": len(all_rows),
         "samples": len(records),
-        "shards": shard_index,
+        "shards": file_shard_index,
+        "num_shards": num_shards,
+        "shard_index": cache_part_index,
     }
     (output_dir / "index.json").write_text(
         json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -227,25 +253,121 @@ def cache_features(
     return metadata
 
 
+def merge_feature_cache_parts(
+    *,
+    manifests: list[Path],
+    part_dirs: list[Path],
+    output_dir: Path,
+    limit: int | None,
+) -> dict[str, Any]:
+    """Merge deterministic cache parts without copying their feature shard files."""
+    if output_dir.exists():
+        raise FileExistsError(f"refusing to reuse feature cache directory: {output_dir}")
+    if not part_dirs:
+        raise ValueError("at least one cache part is required")
+    expected_rows, manifest_fingerprints = _load_rows(manifests, limit)
+    expected = {str(row["sample_id"]): row for row in expected_rows}
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    reference: dict[str, Any] | None = None
+    for part_dir in part_dirs:
+        metadata_path, index_path = part_dir / "metadata.json", part_dir / "index.json"
+        if not metadata_path.is_file() or not index_path.is_file():
+            raise FileNotFoundError(f"cache part is incomplete: {part_dir}")
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("schema_version") != CACHE_SCHEMA_VERSION:
+            raise ValueError(f"unsupported cache schema in {part_dir}")
+        identity = {
+            key: metadata.get(key)
+            for key in (
+                "audio_model",
+                "audio_model_revision",
+                "audio_model_config_sha256",
+                "target_sample_rate",
+            )
+        }
+        if reference is None:
+            reference = identity
+        elif identity != reference:
+            raise ValueError("cache parts use different audio model metadata")
+        for record in json.loads(index_path.read_text(encoding="utf-8")):
+            sample_id = str(record["sample_id"])
+            if sample_id in seen:
+                raise ValueError(f"duplicate sample_id across cache parts: {sample_id}")
+            source = expected.get(sample_id)
+            if source is None:
+                raise ValueError(f"cache part contains unknown sample_id: {sample_id}")
+            if (
+                record.get("clip_sha256") != source["clip_sha256"]
+                or record.get("source_audio_sha256") != source["source_audio_sha256"]
+            ):
+                raise ValueError(f"cache part fingerprint mismatch: {sample_id}")
+            seen.add(sample_id)
+            merged.append(
+                {
+                    **record,
+                    "shard": os.path.relpath(part_dir / record["shard"], output_dir),
+                }
+            )
+    missing = [sample_id for sample_id in expected if sample_id not in seen]
+    if missing:
+        raise ValueError(f"cache parts are incomplete: missing={missing[:5]}")
+    position = {str(row["sample_id"]): index for index, row in enumerate(expected_rows)}
+    merged.sort(key=lambda row: position[str(row["sample_id"])])
+    output_dir.mkdir(parents=True)
+    metadata = {
+        "schema_version": CACHE_SCHEMA_VERSION,
+        **(reference or {}),
+        "manifests": manifest_fingerprints,
+        "total_samples": len(expected_rows),
+        "samples": len(merged),
+        "parts": [str(directory.resolve()) for directory in part_dirs],
+        "shards": len({record["shard"] for record in merged}),
+    }
+    (output_dir / "index.json").write_text(
+        json.dumps(merged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    (output_dir / "metadata.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return metadata
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, action="append", required=True)
-    parser.add_argument("--audio-model", type=Path, required=True)
+    parser.add_argument("--audio-model", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--shard-size", type=int, default=256)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--model-revision", default="local")
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--merge-part", type=Path, action="append")
     args = parser.parse_args()
-    result = cache_features(
-        manifests=args.manifest,
-        audio_model=args.audio_model,
-        output_dir=args.output_dir,
-        device=args.device,
-        shard_size=args.shard_size,
-        limit=args.limit,
-        model_revision=args.model_revision,
-    )
+    if args.merge_part:
+        result = merge_feature_cache_parts(
+            manifests=args.manifest,
+            part_dirs=args.merge_part,
+            output_dir=args.output_dir,
+            limit=args.limit,
+        )
+    else:
+        if args.audio_model is None:
+            parser.error("--audio-model is required unless --merge-part is used")
+        result = cache_features(
+            manifests=args.manifest,
+            audio_model=args.audio_model,
+            output_dir=args.output_dir,
+            device=args.device,
+            shard_size=args.shard_size,
+            limit=args.limit,
+            model_revision=args.model_revision,
+            num_shards=args.num_shards,
+            shard_index=args.shard_index,
+        )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
 
 
