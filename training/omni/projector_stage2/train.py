@@ -672,6 +672,7 @@ def train_model(
     import torch
 
     validate_config(config)
+    config.output_dir.mkdir(parents=True)
     trainables = freeze_asr_and_select_trainables(
         model, config.asr_encoder_prefix, config.projector_prefix
     )
