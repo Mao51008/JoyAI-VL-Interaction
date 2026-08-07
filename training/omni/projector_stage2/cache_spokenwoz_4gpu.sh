@@ -8,6 +8,11 @@ AUDIO_MODEL="${AUDIO_MODEL:-/data/maoyy/models/Qwen3-ASR-1.7B}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/data/maoyy/datasets/projector_stage2/spokenwoz_feature_cache_4gpu_20260807}"
 WORKERS=4
 
+format_duration() {
+  local seconds="$1"
+  printf '%02d:%02d:%02d' "$((seconds / 3600))" "$(((seconds % 3600) / 60))" "$((seconds % 60))"
+}
+
 test ! -e "$OUTPUT_ROOT"
 mkdir -p "$OUTPUT_ROOT/parts" "$OUTPUT_ROOT/logs"
 cd "$REPO_ROOT"
@@ -40,8 +45,15 @@ while :; do
     fi
   done
   if [ "$total" -gt 0 ]; then
-    printf '\rfeature cache: %d/%d (%.1f%%)' "$completed" "$total" \
-      "$(awk -v completed="$completed" -v total="$total" 'BEGIN { print 100 * completed / total }')"
+    if [ "$completed" -gt 0 ]; then
+      eta_seconds=$((SECONDS * (total - completed) / completed))
+      printf '\rfeature cache: %d/%d (%.1f%%), elapsed %s, ETA %s' \
+        "$completed" "$total" \
+        "$(awk -v completed="$completed" -v total="$total" 'BEGIN { print 100 * completed / total }')" \
+        "$(format_duration "$SECONDS")" "$(format_duration "$eta_seconds")"
+    else
+      printf '\rfeature cache: 0/%d (loading models...)' "$total"
+    fi
   fi
   [ "$active" -eq 0 ] && break
   sleep 5
