@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import math
+import struct
 import tarfile
 import wave
 from io import BytesIO
@@ -35,60 +36,95 @@ def _load_dev_ids(val_list: Path) -> set[str]:
     return ids
 
 
+def _parse_wav(source: bytes) -> tuple[int, int, int, int, bytes, int]:
+    """Read PCM or IEEE float RIFF/WAVE without relying on wave's format support."""
+    if len(source) < 12 or source[:4] != b"RIFF" or source[8:12] != b"WAVE":
+        raise ValueError("source is not a RIFF/WAVE file")
+    fmt: bytes | None = None
+    data: bytes | None = None
+    offset = 12
+    while offset + 8 <= len(source):
+        chunk_id = source[offset : offset + 4]
+        chunk_size = struct.unpack_from("<I", source, offset + 4)[0]
+        start = offset + 8
+        end = start + chunk_size
+        if end > len(source):
+            raise ValueError("WAV chunk exceeds file bounds")
+        if chunk_id == b"fmt ":
+            fmt = source[start:end]
+        elif chunk_id == b"data":
+            data = source[start:end]
+        offset = end + (chunk_size & 1)
+    if fmt is None or data is None or len(fmt) < 16:
+        raise ValueError("WAV is missing fmt or data chunk")
+    audio_format, channels, sample_rate, _, block_align, bits = struct.unpack_from("<HHIIHH", fmt)
+    if audio_format not in {1, 3}:
+        raise ValueError(f"unsupported WAV format: {audio_format}")
+    if channels < 1 or sample_rate < 1 or bits < 8 or bits % 8:
+        raise ValueError("invalid WAV format parameters")
+    sample_width = bits // 8
+    if block_align != channels * sample_width or len(data) % block_align:
+        raise ValueError("invalid WAV block alignment")
+    return audio_format, channels, sample_width, sample_rate, data, len(data) // block_align
+
+
+def _write_wav(audio_format: int, channels: int, sample_width: int, sample_rate: int, data: bytes) -> bytes:
+    if audio_format == 1:
+        output = BytesIO()
+        with wave.open(output, "wb") as writer:
+            writer.setnchannels(channels)
+            writer.setsampwidth(sample_width)
+            writer.setframerate(sample_rate)
+            writer.writeframes(data)
+        return output.getvalue()
+    if audio_format != 3:
+        raise ValueError(f"unsupported WAV format: {audio_format}")
+    fmt = struct.pack("<HHIIHH", audio_format, channels, sample_rate, sample_rate * channels * sample_width,
+                      channels * sample_width, sample_width * 8)
+    riff_size = 4 + 8 + len(fmt) + 8 + len(data)
+    return b"RIFF" + struct.pack("<I", riff_size) + b"WAVE" + b"fmt " + struct.pack("<I", len(fmt)) + fmt + b"data" + struct.pack("<I", len(data)) + data
+
+
 def _clip_wav(source: bytes, words: list[dict[str, Any]], dialogue_id: str, turn_id: int) -> tuple[bytes, int, int]:
     if not words:
         raise ValueError(f"{dialogue_id} turn {turn_id}: words is empty")
-    with wave.open(BytesIO(source), "rb") as reader:
-        channels = reader.getnchannels()
-        sample_width = reader.getsampwidth()
-        sample_rate = reader.getframerate()
-        frame_count = reader.getnframes()
-        if channels < 1 or sample_width < 1 or sample_rate < 1:
-            raise ValueError(f"{dialogue_id} turn {turn_id}: invalid WAV format")
-        channel_ids: set[int] = set()
-        starts: list[int] = []
-        ends: list[int] = []
-        for word in words:
-            try:
-                begin_ms = float(word["BeginTime"])
-                end_ms = float(word["EndTime"])
-                channel = int(word["ChannelId"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise ValueError(f"{dialogue_id} turn {turn_id}: invalid word timing/channel") from exc
-            if not math.isfinite(begin_ms) or not math.isfinite(end_ms):
-                raise ValueError(f"{dialogue_id} turn {turn_id}: non-finite word timing")
-            if channel < 0 or channel >= channels:
-                raise ValueError(f"{dialogue_id} turn {turn_id}: channel {channel} is out of range")
-            if begin_ms < 0 or end_ms <= begin_ms:
-                raise ValueError(f"{dialogue_id} turn {turn_id}: invalid word interval")
-            if end_ms > frame_count * 1000 / sample_rate:
-                raise ValueError(f"{dialogue_id} turn {turn_id}: word interval exceeds WAV duration")
-            channel_ids.add(channel)
-            starts.append(max(0, math.floor(begin_ms * sample_rate / 1000)))
-            ends.append(min(frame_count, math.ceil(end_ms * sample_rate / 1000)))
-        if len(channel_ids) != 1:
-            raise ValueError(f"{dialogue_id} turn {turn_id}: words cross audio channels")
-        start_frame, end_frame = min(starts), max(ends)
-        if not 0 <= start_frame < end_frame <= frame_count:
-            raise ValueError(f"{dialogue_id} turn {turn_id}: clip is out of bounds")
-        reader.rewind()
-        frames = reader.readframes(frame_count)
-        selected_channel = next(iter(channel_ids))
-        block_width = channels * sample_width
-        clip = b"".join(
-            frame[selected_channel * sample_width : (selected_channel + 1) * sample_width]
-            for frame in (
-                frames[offset : offset + block_width]
-                for offset in range(start_frame * block_width, end_frame * block_width, block_width)
-            )
+    audio_format, channels, sample_width, sample_rate, frames, frame_count = _parse_wav(source)
+    channel_ids: set[int] = set()
+    starts: list[int] = []
+    ends: list[int] = []
+    for word in words:
+        try:
+            begin_ms = float(word["BeginTime"])
+            end_ms = float(word["EndTime"])
+            channel = int(word["ChannelId"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{dialogue_id} turn {turn_id}: invalid word timing/channel") from exc
+        if not math.isfinite(begin_ms) or not math.isfinite(end_ms):
+            raise ValueError(f"{dialogue_id} turn {turn_id}: non-finite word timing")
+        if channel < 0 or channel >= channels:
+            raise ValueError(f"{dialogue_id} turn {turn_id}: channel {channel} is out of range")
+        if begin_ms < 0 or end_ms <= begin_ms:
+            raise ValueError(f"{dialogue_id} turn {turn_id}: invalid word interval")
+        if end_ms > frame_count * 1000 / sample_rate:
+            raise ValueError(f"{dialogue_id} turn {turn_id}: word interval exceeds WAV duration")
+        channel_ids.add(channel)
+        starts.append(max(0, math.floor(begin_ms * sample_rate / 1000)))
+        ends.append(min(frame_count, math.ceil(end_ms * sample_rate / 1000)))
+    if len(channel_ids) != 1:
+        raise ValueError(f"{dialogue_id} turn {turn_id}: words cross audio channels")
+    start_frame, end_frame = min(starts), max(ends)
+    if not 0 <= start_frame < end_frame <= frame_count:
+        raise ValueError(f"{dialogue_id} turn {turn_id}: clip is out of bounds")
+    selected_channel = next(iter(channel_ids))
+    block_width = channels * sample_width
+    clip = b"".join(
+        frame[selected_channel * sample_width : (selected_channel + 1) * sample_width]
+        for frame in (
+            frames[offset : offset + block_width]
+            for offset in range(start_frame * block_width, end_frame * block_width, block_width)
         )
-    output = BytesIO()
-    with wave.open(output, "wb") as writer:
-        writer.setnchannels(1)
-        writer.setsampwidth(sample_width)
-        writer.setframerate(sample_rate)
-        writer.writeframes(clip)
-    return output.getvalue(), selected_channel, round((end_frame - start_frame) * 1000 / sample_rate, 6)
+    )
+    return _write_wav(audio_format, 1, sample_width, sample_rate, clip), selected_channel, round((end_frame - start_frame) * 1000 / sample_rate, 6)
 
 
 def _audit(rows: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:

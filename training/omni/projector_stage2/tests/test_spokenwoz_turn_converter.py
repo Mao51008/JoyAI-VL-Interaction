@@ -9,6 +9,9 @@ from pathlib import Path
 import pytest
 
 from training.omni.projector_stage2.spokenwoz_turn_converter import (
+    _clip_wav,
+    _parse_wav,
+    _write_wav,
     convert_spokenwoz_turns,
     preflight_spokenwoz_turns,
 )
@@ -112,6 +115,20 @@ def test_converts_channel_slice_history_hashes_and_split(tmp_path: Path):
         assert reader.readframes(reader.getnframes()) == struct.pack("<hhhh", 1002, 1003, 1004, 1005)
     assert first["clip_sha256"] == hashlib.sha256(clip).hexdigest()
     assert provenance["leakage_audit"]["leakage"] is False
+
+
+def test_ieee_float_wav_is_sliced_as_single_channel():
+    frames = b"".join(struct.pack("<ff", index + 0.25, 100 + index + 0.5) for index in range(6))
+    source = _write_wav(3, 2, 4, 1000, frames)
+    clip, channel, duration = _clip_wav(
+        source,
+        [{"BeginTime": 1, "EndTime": 3, "ChannelId": 1}],
+        "MULFLOAT",
+        0,
+    )
+    audio_format, channels, width, rate, data, count = _parse_wav(clip)
+    assert (audio_format, channels, width, rate, count, channel, duration) == (3, 1, 4, 1000, 2, 1, 2.0)
+    assert struct.unpack("<ff", data) == (101.5, 102.5)
 
 
 def test_preflight_is_read_only_and_乱序_archive_is_supported(tmp_path: Path):
