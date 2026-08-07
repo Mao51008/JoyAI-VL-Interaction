@@ -187,6 +187,7 @@ def test_audio_features_change_inputs_and_loss():
             ).square()
 
     model = build_stage2_model(torch.nn.Linear(2, 2), TinyLLM(), 2, 2, ["proj"], 1, 2.0)
+    model.to(dtype=torch.bfloat16)
     tokenizer = ChatTokenizer()
     rows = [_row()]
     cache = Cache()

@@ -612,8 +612,9 @@ def build_stage2_model(
             labels = batch.labels.to(input_ids.device)
             embeddings = self.core.language_model.get_input_embeddings()(input_ids)
             attention_mask = batch.attention_mask.to(input_ids.device)
+            projector_dtype = next(self.core.audio_projector.parameters()).dtype
             return self.core(
-                audio_features=batch.audio_features.to(input_ids.device),
+                audio_features=batch.audio_features.to(input_ids.device, dtype=projector_dtype),
                 audio_attention_mask=batch.audio_attention_mask.to(input_ids.device),
                 text_embeddings=embeddings,
                 audio_placeholder_mask=batch.audio_placeholder_mask.to(
