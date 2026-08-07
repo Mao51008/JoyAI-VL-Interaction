@@ -576,7 +576,9 @@ def build_stage2_model(
     inject_lora(llm, lora_targets, lora_rank, lora_alpha)
     projector = AudioProjector(
         AudioProjectorConfig(
-            input_size=projector_in_features, output_size=projector_out_features
+            input_size=projector_in_features,
+            output_size=projector_out_features,
+            hidden_size=projector_out_features,
         )
     )
     projector_initialization = None
