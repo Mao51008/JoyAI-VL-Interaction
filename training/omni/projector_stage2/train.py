@@ -14,7 +14,7 @@ import math
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .cache_features import validate_feature_cache
 
@@ -78,6 +78,50 @@ class Stage2ConversationBatch:
     audio_features: Any = None
     audio_attention_mask: Any = None
     audio_placeholder_mask: Any = None
+
+
+class CachedConversationBatchSource:
+    """Reiterable, bounded-memory batches backed by on-disk frozen ASR features."""
+
+    def __init__(
+        self,
+        rows: Sequence[dict[str, Any]],
+        tokenizer: Any,
+        feature_dir: Path,
+        audio_placeholder_id: int,
+        batch_size: int,
+        max_cached_shards: int,
+        cache_factory: Callable[[Path, int], Any] | None = None,
+    ) -> None:
+        if batch_size <= 0 or max_cached_shards <= 0:
+            raise ValueError("batch_size and max_cached_shards must be positive")
+        self.rows = rows
+        self.tokenizer = tokenizer
+        self.feature_dir = feature_dir
+        self.audio_placeholder_id = audio_placeholder_id
+        self.batch_size = batch_size
+        self.max_cached_shards = max_cached_shards
+        self.cache_factory = cache_factory
+
+    def __len__(self) -> int:
+        return (len(self.rows) + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self) -> Iterable[Stage2ConversationBatch]:
+        if self.cache_factory is None:
+            from training.omni.projector_stage1.feature_cache import FeatureCache
+
+            feature_cache = FeatureCache(
+                self.feature_dir, max_loaded_shards=self.max_cached_shards
+            )
+        else:
+            feature_cache = self.cache_factory(self.feature_dir, self.max_cached_shards)
+        for index in range(0, len(self.rows), self.batch_size):
+            yield collate_cached_audio_conversations(
+                self.rows[index : index + self.batch_size],
+                self.tokenizer,
+                feature_cache,
+                self.audio_placeholder_id,
+            )
 
 
 def _system_prompt(sample_id: str) -> str:
@@ -748,9 +792,9 @@ def train_model(
     )
     optimizer = torch.optim.AdamW(trainables, lr=config.learning_rate)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
-    train_batches = list(train_batches)
-    dev_batches = list(dev_batches)
-    if not train_batches or not dev_batches:
+    if not hasattr(train_batches, "__len__") or not hasattr(dev_batches, "__len__"):
+        raise TypeError("train and dev batches must be re-iterable sized sources")
+    if len(train_batches) == 0 or len(dev_batches) == 0:
         raise ValueError("train and dev batches must be non-empty")
     records: list[dict[str, Any]] = []
     best_validation = float("inf")
@@ -789,7 +833,7 @@ def train_model(
             model.eval()
             with torch.no_grad():
                 dev_losses = [
-                    float(_loss_value(model(batch)).detach()) for batch in dev_batches
+                    float(_loss_value(model(batch)).detach()) for batch in iter(dev_batches)
                 ]
             validation_loss = sum(dev_losses) / len(dev_losses)
             record["validation_loss"] = validation_loss
@@ -876,6 +920,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--lora-target", action="append", default=[])
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--max-cached-feature-shards", type=int, default=8)
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--device", default="cuda:0")
     return parser
@@ -900,6 +945,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args.run:
         result = run_preflight(config)
     else:
+        if args.max_cached_feature_shards <= 0:
+            raise ValueError("--max-cached-feature-shards must be positive")
         required = {
             "--llm-model": args.llm_model,
             "--projector-in-features": args.projector_in_features,
@@ -924,14 +971,11 @@ def main(argv: list[str] | None = None) -> int:
             tokenizer, "unk_token_id", None
         ):
             raise ValueError("LLM tokenizer has no <|vision_pad|> audio placeholder")
-        from training.omni.projector_stage1.feature_cache import FeatureCache
-
         train_rows = load_manifest(args.train_manifest)
         dev_rows = load_manifest(args.dev_manifest)
         cache_metadata = validate_feature_cache(
             args.feature_dir, [*train_rows, *dev_rows]
         )
-        feature_cache = FeatureCache(args.feature_dir)
         model = build_model_from_pretrained(
             args.llm_model,
             args.projector_in_features,
@@ -945,24 +989,14 @@ def main(argv: list[str] | None = None) -> int:
             args.dtype,
         )
         model.feature_cache_metadata = cache_metadata
-        train_batches = [
-            collate_cached_audio_conversations(
-                train_rows[index : index + args.batch_size],
-                tokenizer,
-                feature_cache,
-                int(audio_placeholder_id),
-            )
-            for index in range(0, len(train_rows), args.batch_size)
-        ]
-        dev_batches = [
-            collate_cached_audio_conversations(
-                dev_rows[index : index + args.batch_size],
-                tokenizer,
-                feature_cache,
-                int(audio_placeholder_id),
-            )
-            for index in range(0, len(dev_rows), args.batch_size)
-        ]
+        train_batches = CachedConversationBatchSource(
+            train_rows, tokenizer, args.feature_dir, int(audio_placeholder_id),
+            args.batch_size, args.max_cached_feature_shards,
+        )
+        dev_batches = CachedConversationBatchSource(
+            dev_rows, tokenizer, args.feature_dir, int(audio_placeholder_id),
+            args.batch_size, args.max_cached_feature_shards,
+        )
         result = train_model(model, train_batches, dev_batches, config)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0

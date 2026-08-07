@@ -10,6 +10,7 @@ except ImportError:
 
 from training.omni.projector_stage2.cache_features import validate_feature_cache
 from training.omni.projector_stage2.train import (
+    CachedConversationBatchSource,
     Stage2Config,
     _build_supervised_sequence,
     build_parser,
@@ -147,6 +148,34 @@ def test_collator_preserves_ids_masks_and_attention():
     assert batch.audio_placeholder_mask.sum().item() == 1
     assert batch.labels[0, -2:].tolist() == [10, 5]
     assert batch.attention_mask.all()
+
+
+@pytest.mark.skipif(torch is None, reason="PyTorch is not installed")
+def test_cached_batch_source_defers_feature_reads_until_iteration():
+    created = []
+
+    class Cache:
+        def get(self, sample_id):
+            return {"features": torch.ones(2, 2)}
+
+    def cache_factory(directory, max_loaded_shards):
+        created.append((directory, max_loaded_shards))
+        return Cache()
+
+    source = CachedConversationBatchSource(
+        [_row("s1"), _row("s2")],
+        ChatTokenizer(),
+        Path("cache"),
+        7,
+        batch_size=1,
+        max_cached_shards=3,
+        cache_factory=cache_factory,
+    )
+    assert len(source) == 2
+    assert created == []
+    first = next(iter(source))
+    assert first.sample_ids == ["s1"]
+    assert created == [(Path("cache"), 3)]
 
 
 @pytest.mark.skipif(torch is None, reason="PyTorch is not installed")
