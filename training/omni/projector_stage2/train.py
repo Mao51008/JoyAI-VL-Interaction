@@ -659,7 +659,7 @@ def build_model_from_pretrained(
         stage1_projector_checkpoint,
         stage1_projector_sha256,
     )
-    return model.to(device)
+    return model.to(device=device, dtype=torch_dtype)
 
 
 def _loss_value(output: Any) -> Any:
