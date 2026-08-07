@@ -914,7 +914,9 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("--run requires " + ", ".join(missing))
         import transformers
 
-        tokenizer = transformers.AutoTokenizer.from_pretrained(args.llm_model)
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            args.llm_model, fix_mistral_regex=True
+        )
         if not hasattr(tokenizer, "convert_tokens_to_ids"):
             raise ValueError("LLM tokenizer must expose convert_tokens_to_ids")
         audio_placeholder_id = tokenizer.convert_tokens_to_ids("<|vision_pad|>")
