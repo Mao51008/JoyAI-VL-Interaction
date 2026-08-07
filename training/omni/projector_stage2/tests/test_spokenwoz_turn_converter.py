@@ -10,6 +10,7 @@ import pytest
 
 from training.omni.projector_stage2.spokenwoz_turn_converter import (
     convert_spokenwoz_turns,
+    preflight_spokenwoz_turns,
 )
 
 
@@ -68,7 +69,11 @@ def _split_dialogue() -> dict:
     }
 
 
-def _fixture(tmp_path: Path, dialogues: dict[str, dict] | None = None) -> tuple[Path, Path, Path]:
+def _fixture(
+    tmp_path: Path,
+    dialogues: dict[str, dict] | None = None,
+    archive_order: list[str] | None = None,
+) -> tuple[Path, Path, Path]:
     dialogues = dialogues or {"MUL0001": _dialogue("MUL0001"), "SNG0002": _dialogue("SNG0002")}
     data_json = tmp_path / "data.json"
     val_list = tmp_path / "valListFile.json"
@@ -76,7 +81,7 @@ def _fixture(tmp_path: Path, dialogues: dict[str, dict] | None = None) -> tuple[
     data_json.write_text(json.dumps(dialogues), encoding="utf-8")
     val_list.write_text("SNG0002\n", encoding="utf-8")
     with tarfile.open(archive_path, "w:gz") as archive:
-        for index, dialogue_id in enumerate(dialogues):
+        for index, dialogue_id in enumerate(archive_order or list(dialogues)):
             source = tmp_path / f"{dialogue_id}.wav"
             source.write_bytes(_wav_bytes(index * 10))
             archive.add(source, arcname=f"audio_5700_train_dev/{dialogue_id}.wav")
@@ -109,6 +114,21 @@ def test_converts_channel_slice_history_hashes_and_split(tmp_path: Path):
     assert provenance["leakage_audit"]["leakage"] is False
 
 
+def test_preflight_is_read_only_and_乱序_archive_is_supported(tmp_path: Path):
+    dialogues = {"MUL0001": _dialogue("MUL0001"), "SNG0002": _dialogue("SNG0002")}
+    data_json, val_list, archive = _fixture(
+        tmp_path, dialogues, archive_order=["SNG0002", "MUL0001"]
+    )
+    output = tmp_path / "out"
+    preflight = preflight_spokenwoz_turns(data_json, val_list, archive)
+    assert preflight["audio_members"] == 2
+    assert preflight["splits"]["train"]["dialogues"] == 1
+    assert not output.exists()
+    convert_spokenwoz_turns(data_json, val_list, archive, output)
+    rows = [json.loads(line) for line in (output / "train.jsonl").read_text().splitlines()]
+    assert {row["dialogue_id"] for row in rows} == {"MUL0001"}
+
+
 def test_realistic_4200_500_dialogue_split(tmp_path: Path):
     dialogues = {f"MUL{i:04d}": _split_dialogue() for i in range(4200)}
     dialogues.update({f"SNG{i:04d}": _split_dialogue() for i in range(500)})
@@ -138,5 +158,7 @@ def test_rejects_invalid_turns(tmp_path: Path, change, message):
     change(data["MUL0001"]["log"])
     data_json, val_list, archive = _fixture(tmp_path, data)
     val_list.write_text("MUL0001\n", encoding="utf-8")
+    output = tmp_path / "out"
     with pytest.raises(ValueError, match=message):
-        convert_spokenwoz_turns(data_json, val_list, archive, tmp_path / "out")
+        convert_spokenwoz_turns(data_json, val_list, archive, output)
+    assert not output.exists()

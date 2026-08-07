@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import math
@@ -32,19 +33,6 @@ def _load_dev_ids(val_list: Path) -> set[str]:
     if not ids:
         raise ValueError(f"empty validation split: {val_list}")
     return ids
-
-
-def _audio_members(archive: Path) -> dict[str, tuple[str, tarfile.TarInfo]]:
-    index: dict[str, tuple[str, tarfile.TarInfo]] = {}
-    with tarfile.open(archive, "r:gz") as handle:
-        for member in handle:
-            if not member.isfile() or not member.name.lower().endswith(".wav"):
-                continue
-            stem = Path(member.name).stem
-            if stem in index:
-                raise ValueError(f"duplicate audio stem in archive: {stem}")
-            index[stem] = (member.name, member)
-    return index
 
 
 def _clip_wav(source: bytes, words: list[dict[str, Any]], dialogue_id: str, turn_id: int) -> tuple[bytes, int, int]:
@@ -118,6 +106,168 @@ def _audit(rows: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     return result
 
 
+def _row_for_turn(
+    source: bytes,
+    member_name: str,
+    source_hash: str,
+    dialogue_id: str,
+    split: str,
+    turns: list[dict[str, Any]],
+    turn_id: int,
+    history: list[dict[str, str]],
+    output_root: Path | None,
+    data_json: Path,
+    val_list: Path,
+    audio_archive: Path,
+    dataset: str,
+    version: str,
+) -> dict[str, Any]:
+    turn = turns[turn_id]
+    if turn_id + 1 >= len(turns):
+        raise ValueError(f"{dialogue_id} turn {turn_id}: user turn has no adjacent assistant")
+    response_turn = turns[turn_id + 1]
+    response_tag = _text(response_turn.get("tag", response_turn.get("speaker"))).lower()
+    if response_tag not in {"system", "assistant"}:
+        raise ValueError(f"{dialogue_id} turn {turn_id}: assistant is not adjacent")
+    response = _text(response_turn.get("text"))
+    if not response:
+        raise ValueError(f"{dialogue_id} turn {turn_id}: assistant response is empty")
+    clip, channel, duration_ms = _clip_wav(source, turn.get("words", []), dialogue_id, turn_id)
+    clip_name = f"{dialogue_id}_turn{turn_id:04d}.wav"
+    clip_path = Path("audio") / split / clip_name
+    if output_root is not None:
+        destination = output_root / clip_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(clip)
+    clip_hash = _sha256(clip)
+    return {
+        "sample_id": f"{split}:{dialogue_id}:{turn_id}",
+        "dialogue_id": dialogue_id,
+        "turn_id": str(turn_id),
+        "split": split,
+        "channel_id": channel,
+        "audio_path": clip_path.as_posix(),
+        "clip_sha256": clip_hash,
+        "clip_duration_ms": duration_ms,
+        "source_audio_sha256": source_hash,
+        "user_text": _text(turn.get("text")),
+        "assistant_response": response,
+        "dialogue_history": list(history),
+        "provenance": {
+            "dataset": dataset,
+            "version": version,
+            "split": split,
+            "data_json": str(data_json),
+            "val_list": str(val_list),
+            "audio_archive": str(audio_archive),
+            "audio_member": member_name,
+        },
+    }
+
+
+def _scan_archive(
+    data_json: Path,
+    val_list: Path,
+    audio_archive: Path,
+    output_root: Path | None,
+    *,
+    dataset: str,
+    version: str,
+) -> dict[str, Any]:
+    dialogues = _load_dialogues(data_json)
+    dev_ids = _load_dev_ids(val_list)
+    unknown_dev = dev_ids - dialogues.keys()
+    if unknown_dev:
+        raise ValueError(f"validation split contains unknown dialogue IDs: {sorted(unknown_dev)[:5]}")
+    rows: dict[str, list[dict[str, Any]]] = {"train": [], "dev": []}
+    seen: set[str] = set()
+    with tarfile.open(audio_archive, "r:gz") as archive:
+        for member in archive:
+            if not member.isfile() or not member.name.lower().endswith(".wav"):
+                continue
+            dialogue_id = Path(member.name).stem
+            if dialogue_id in seen:
+                raise ValueError(f"duplicate audio stem in archive: {dialogue_id}")
+            seen.add(dialogue_id)
+            if dialogue_id not in dialogues:
+                continue
+            source = archive.extractfile(member)
+            if source is None:
+                raise ValueError(f"cannot read archive member: {member.name}")
+            source_bytes = source.read()
+            source_hash = _sha256(source_bytes)
+            dialogue = dialogues[dialogue_id]
+            turns = dialogue.get("log") if isinstance(dialogue, dict) else None
+            if not isinstance(turns, list):
+                raise TypeError(f"dialogue {dialogue_id} has no list log")
+            split = "dev" if dialogue_id in dev_ids else "train"
+            history: list[dict[str, str]] = []
+            for turn_id, turn in enumerate(turns):
+                if not isinstance(turn, dict):
+                    raise TypeError(f"dialogue {dialogue_id} turn {turn_id} is not an object")
+                tag = _text(turn.get("tag", turn.get("speaker"))).lower()
+                if tag in {"user", "human"}:
+                    rows[split].append(
+                        _row_for_turn(
+                            source_bytes,
+                            member.name,
+                            source_hash,
+                            dialogue_id,
+                            split,
+                            turns,
+                            turn_id,
+                            history,
+                            output_root,
+                            data_json,
+                            val_list,
+                            audio_archive,
+                            dataset,
+                            version,
+                        )
+                    )
+                current_text = _text(turn.get("text"))
+                if tag in {"user", "human"}:
+                    history.append({"role": "user", "text": current_text})
+                elif tag in {"system", "assistant"}:
+                    history.append({"role": "assistant", "text": current_text})
+                else:
+                    raise ValueError(f"{dialogue_id} turn {turn_id}: unsupported speaker tag {tag!r}")
+    missing_audio = sorted(set(dialogues) - seen)
+    extra_audio = sorted(seen - set(dialogues))
+    if missing_audio or extra_audio:
+        raise ValueError(f"audio/dialogue ID mismatch: missing={missing_audio[:5]}, extra={extra_audio[:5]}")
+    audit = _audit(rows)
+    for split_rows in rows.values():
+        split_rows.sort(key=lambda row: (row["dialogue_id"], int(row["turn_id"])))
+    return {"rows": rows, "audit": audit, "audio_members": len(seen)}
+
+
+def preflight_spokenwoz_turns(
+    data_json: Path,
+    val_list: Path,
+    audio_archive: Path,
+    *,
+    dataset: str = "SpokenWOZ",
+    version: str = "official-main",
+) -> dict[str, Any]:
+    """Validate every archive WAV and user turn without creating output files."""
+    result = _scan_archive(
+        data_json.resolve(), val_list.resolve(), audio_archive.resolve(), None,
+        dataset=dataset, version=version,
+    )
+    return {
+        "audio_members": result["audio_members"],
+        "leakage_audit": result["audit"],
+        "splits": {
+            split: {
+                "samples": len(rows),
+                "dialogues": len({row["dialogue_id"] for row in rows}),
+            }
+            for split, rows in result["rows"].items()
+        },
+    }
+
+
 def convert_spokenwoz_turns(
     data_json: Path,
     val_list: Path,
@@ -134,88 +284,16 @@ def convert_spokenwoz_turns(
     output_root = output_root.resolve()
     if output_root.exists():
         raise FileExistsError(f"refusing to reuse output directory: {output_root}")
-    dialogues = _load_dialogues(data_json)
-    dev_ids = _load_dev_ids(val_list)
-    unknown_dev = dev_ids - dialogues.keys()
-    if unknown_dev:
-        raise ValueError(f"validation split contains unknown dialogue IDs: {sorted(unknown_dev)[:5]}")
-    members = _audio_members(audio_archive)
-    if set(dialogues) != set(members):
-        missing_audio = sorted(set(dialogues) - set(members))
-        extra_audio = sorted(set(members) - set(dialogues))
-        raise ValueError(f"audio/dialogue ID mismatch: missing={missing_audio[:5]}, extra={extra_audio[:5]}")
-
-    rows: dict[str, list[dict[str, Any]]] = {"train": [], "dev": []}
+    preflight = preflight_spokenwoz_turns(
+        data_json, val_list, audio_archive, dataset=dataset, version=version
+    )
     output_root.mkdir(parents=True)
-    archive = tarfile.open(audio_archive, "r:gz")  # noqa: SIM115
-    for dialogue_id in sorted(dialogues):
-        dialogue = dialogues[dialogue_id]
-        turns = dialogue.get("log") if isinstance(dialogue, dict) else None
-        if not isinstance(turns, list):
-            raise TypeError(f"dialogue {dialogue_id} has no list log")
-        split = "dev" if dialogue_id in dev_ids else "train"
-        member_name, member = members[dialogue_id]
-        source = archive.extractfile(member)
-        if source is None:
-            raise ValueError(f"cannot read archive member: {member_name}")
-        source_bytes = source.read()
-        source_hash = _sha256(source_bytes)
-        history: list[dict[str, str]] = []
-        for turn_id, turn in enumerate(turns):
-            if not isinstance(turn, dict):
-                raise TypeError(f"dialogue {dialogue_id} turn {turn_id} is not an object")
-            tag = _text(turn.get("tag", turn.get("speaker"))).lower()
-            current_text = _text(turn.get("text"))
-            if tag in {"user", "human"}:
-                if turn_id + 1 >= len(turns):
-                    raise ValueError(f"{dialogue_id} turn {turn_id}: user turn has no adjacent assistant")
-                response_turn = turns[turn_id + 1]
-                response_tag = _text(response_turn.get("tag", response_turn.get("speaker"))).lower()
-                if response_tag not in {"system", "assistant"}:
-                    raise ValueError(f"{dialogue_id} turn {turn_id}: assistant is not adjacent")
-                response = _text(response_turn.get("text"))
-                if not response:
-                    raise ValueError(f"{dialogue_id} turn {turn_id}: assistant response is empty")
-                clip, channel, duration_ms = _clip_wav(source_bytes, turn.get("words", []), dialogue_id, turn_id)
-                clip_name = f"{dialogue_id}_turn{turn_id:04d}.wav"
-                clip_path = output_root / "audio" / split / clip_name
-                clip_path.parent.mkdir(parents=True, exist_ok=True)
-                clip_path.write_bytes(clip)
-                clip_hash = _sha256(clip)
-                row = {
-                    "sample_id": f"{split}:{dialogue_id}:{turn_id}",
-                    "dialogue_id": dialogue_id,
-                    "turn_id": str(turn_id),
-                    "split": split,
-                    "channel_id": channel,
-                    "audio_path": clip_path.relative_to(output_root).as_posix(),
-                    "clip_sha256": clip_hash,
-                    "clip_duration_ms": duration_ms,
-                    "source_audio_sha256": source_hash,
-                    "user_text": current_text,
-                    "assistant_response": response,
-                    "dialogue_history": list(history),
-                    "provenance": {
-                        "dataset": dataset,
-                        "version": version,
-                        "split": split,
-                        "data_json": str(data_json),
-                        "val_list": str(val_list),
-                        "audio_archive": str(audio_archive),
-                        "audio_member": member_name,
-                    },
-                }
-                rows[split].append(row)
-            if tag in {"user", "human"}:
-                history.append({"role": "user", "text": current_text})
-            elif tag in {"system", "assistant"}:
-                history.append({"role": "assistant", "text": current_text})
-            else:
-                raise ValueError(f"{dialogue_id} turn {turn_id}: unsupported speaker tag {tag!r}")
-
-    archive.close()
-
-    audit = _audit(rows)
+    result = _scan_archive(
+        data_json, val_list, audio_archive, output_root,
+        dataset=dataset, version=version,
+    )
+    rows = result["rows"]
+    audit = result["audit"]
     manifest_hashes: dict[str, str] = {}
     for split, split_rows in rows.items():
         split_rows.sort(key=lambda row: (row["dialogue_id"], int(row["turn_id"])))
@@ -229,6 +307,7 @@ def convert_spokenwoz_turns(
         "data_json": str(data_json),
         "val_list": str(val_list),
         "audio_archive": str(audio_archive),
+        "preflight": preflight,
         "splits": {
             split: {
                 "samples": len(split_rows),
@@ -247,3 +326,31 @@ def convert_spokenwoz_turns(
         json.dumps(audit, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     return provenance
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Convert official SpokenWOZ user turns to WAV clips.")
+    parser.add_argument("--data-json", type=Path, required=True)
+    parser.add_argument("--val-list", type=Path, required=True)
+    parser.add_argument("--audio-archive", type=Path, required=True)
+    parser.add_argument("--output-root", type=Path)
+    parser.add_argument("--preflight", action="store_true", help="validate without writing output")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.preflight:
+        result = preflight_spokenwoz_turns(args.data_json, args.val_list, args.audio_archive)
+    else:
+        if args.output_root is None:
+            raise ValueError("--output-root is required unless --preflight is used")
+        result = convert_spokenwoz_turns(
+            args.data_json, args.val_list, args.audio_archive, args.output_root
+        )
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
