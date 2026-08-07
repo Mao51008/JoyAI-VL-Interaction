@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .cache_features import validate_feature_cache
+
 CANONICAL_SYSTEM_PROMPT = (
     "You are a helpful dialogue assistant. Use the conversation history and the current "
     "user's speech to provide an appropriate response."
@@ -42,6 +44,9 @@ FORMAL_MANIFEST_FIELDS = {
     "dialogue_history",
     "provenance",
 }
+FROZEN_STAGE1_PROJECTOR_SHA256 = (
+    "4e1573a3091d7ed438af16cee130d28e11b9701f5c22eb830e179e2ef315a22c"
+)
 
 
 @dataclass(frozen=True)
@@ -333,6 +338,42 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def load_stage1_projector_initialization(
+    projector: Any,
+    checkpoint: Path,
+    expected_sha256: str = FROZEN_STAGE1_PROJECTOR_SHA256,
+) -> dict[str, Any]:
+    """Load the frozen stage-one projector and prove the exact checkpoint was used."""
+    if not checkpoint.is_file():
+        raise FileNotFoundError(
+            f"stage-one projector checkpoint does not exist: {checkpoint}"
+        )
+    actual_sha256 = _sha256(checkpoint)
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            f"stage-one projector SHA256 mismatch: expected={expected_sha256}, actual={actual_sha256}"
+        )
+    import torch
+
+    from training.omni.projector_stage1.checkpoint_loading import (
+        load_trusted_checkpoint,
+    )
+
+    state = load_trusted_checkpoint(checkpoint, torch)
+    projector_config = state.get("config", {}).get("projector")
+    if projector_config != projector.export_config():
+        raise ValueError(
+            "stage-one projector config does not match stage-two projector"
+        )
+    projector.load_state_dict(state["projector"], strict=True)
+    return {
+        "checkpoint": str(checkpoint.resolve()),
+        "sha256": actual_sha256,
+        "format": state.get("format"),
+        "config": projector_config,
+    }
+
+
 def load_manifest(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         raise FileNotFoundError(f"manifest does not exist: {path}")
@@ -518,6 +559,8 @@ def build_stage2_model(
     lora_targets: Sequence[str],
     lora_rank: int,
     lora_alpha: float,
+    stage1_projector_checkpoint: Path | None = None,
+    stage1_projector_sha256: str = FROZEN_STAGE1_PROJECTOR_SHA256,
 ) -> Any:
     """Compose ASR encoder, projector and LLM, injecting LoRA into named LLM Linear leaves."""
     from torch import nn
@@ -536,6 +579,11 @@ def build_stage2_model(
             input_size=projector_in_features, output_size=projector_out_features
         )
     )
+    projector_initialization = None
+    if stage1_projector_checkpoint is not None:
+        projector_initialization = load_stage1_projector_initialization(
+            projector, stage1_projector_checkpoint, stage1_projector_sha256
+        )
     core = CachedProjectorStage1Model(llm, projector)
 
     class Stage2Model(nn.Module):
@@ -543,6 +591,7 @@ def build_stage2_model(
             super().__init__()
             self.audio_encoder = asr_encoder
             self.core = core
+            self.projector_initialization = projector_initialization
 
         def forward(self, batch: Any) -> Any:
             required = (
@@ -578,31 +627,36 @@ def build_stage2_model(
 
 
 def build_model_from_pretrained(
-    asr_model: str,
     llm_model: str,
     projector_in_features: int,
     projector_out_features: int,
     lora_targets: Sequence[str],
     lora_rank: int,
     lora_alpha: float,
+    stage1_projector_checkpoint: Path,
+    stage1_projector_sha256: str,
+    device: str,
     dtype: str = "bfloat16",
 ) -> Any:
-    """Load real models only when an explicitly authorized ``--run`` calls this function."""
+    """Load only the LLM: frozen ASR features are supplied by the validated cache."""
     import torch
-    from transformers import AutoModel, AutoModelForCausalLM
+    from torch import nn
+    from transformers import AutoModelForImageTextToText
 
     torch_dtype = getattr(torch, dtype)
-    asr_encoder = AutoModel.from_pretrained(asr_model, torch_dtype=torch_dtype)
-    llm = AutoModelForCausalLM.from_pretrained(llm_model, torch_dtype=torch_dtype)
-    return build_stage2_model(
-        asr_encoder,
+    llm = AutoModelForImageTextToText.from_pretrained(llm_model, dtype=torch_dtype)
+    model = build_stage2_model(
+        nn.Identity(),
         llm,
         projector_in_features,
         projector_out_features,
         lora_targets,
         lora_rank,
         lora_alpha,
+        stage1_projector_checkpoint,
+        stage1_projector_sha256,
     )
+    return model.to(device)
 
 
 def _loss_value(output: Any) -> Any:
@@ -649,14 +703,27 @@ def _save_checkpoint(
 ) -> None:
     import torch
 
+    trainable_names = {
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    }
+    state_dict = model.state_dict()
+    trainable_state = {
+        name: state_dict[name].detach().cpu() for name in trainable_names
+    }
+    if not trainable_state:
+        raise RuntimeError("refusing to save a checkpoint without trainable weights")
     torch.save(
         {
-            "format": "projector-stage2-v1",
+            "format": "projector-stage2-v2",
             "step": step,
-            "model": model.state_dict(),
+            "trainable_state": trainable_state,
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "best_validation_loss": best_loss,
+            "projector_initialization": getattr(
+                model, "projector_initialization", None
+            ),
+            "feature_cache": getattr(model, "feature_cache_metadata", None),
         },
         path,
     )
@@ -688,7 +755,7 @@ def train_model(
     start_step = 0
     if config.resume_from is not None:
         state = torch.load(config.resume_from, map_location="cpu", weights_only=True)
-        model.load_state_dict(state["model"])
+        model.load_state_dict(state["trainable_state"], strict=False)
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
         start_step = int(state["step"])
@@ -800,9 +867,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-model")
     parser.add_argument("--projector-in-features", type=int)
     parser.add_argument("--projector-out-features", type=int)
+    parser.add_argument("--init-projector-checkpoint", type=Path)
+    parser.add_argument(
+        "--init-projector-sha256", default=FROZEN_STAGE1_PROJECTOR_SHA256
+    )
     parser.add_argument("--lora-target", action="append", default=[])
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--dtype", default="bfloat16")
+    parser.add_argument("--device", default="cuda:0")
     return parser
 
 
@@ -826,11 +898,11 @@ def main(argv: list[str] | None = None) -> int:
         result = run_preflight(config)
     else:
         required = {
-            "--asr-model": args.asr_model,
             "--llm-model": args.llm_model,
             "--projector-in-features": args.projector_in_features,
             "--projector-out-features": args.projector_out_features,
             "--feature-dir": args.feature_dir,
+            "--init-projector-checkpoint": args.init_projector_checkpoint,
         }
         missing = [name for name, value in required.items() if value in (None, "")]
         if not args.lora_target:
@@ -849,19 +921,25 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("LLM tokenizer has no <|vision_pad|> audio placeholder")
         from training.omni.projector_stage1.feature_cache import FeatureCache
 
+        train_rows = load_manifest(args.train_manifest)
+        dev_rows = load_manifest(args.dev_manifest)
+        cache_metadata = validate_feature_cache(
+            args.feature_dir, [*train_rows, *dev_rows]
+        )
         feature_cache = FeatureCache(args.feature_dir)
         model = build_model_from_pretrained(
-            args.asr_model,
             args.llm_model,
             args.projector_in_features,
             args.projector_out_features,
             args.lora_target,
             args.lora_rank,
             args.lora_alpha,
+            args.init_projector_checkpoint,
+            args.init_projector_sha256,
+            args.device,
             args.dtype,
         )
-        train_rows = load_manifest(args.train_manifest)
-        dev_rows = load_manifest(args.dev_manifest)
+        model.feature_cache_metadata = cache_metadata
         train_batches = [
             collate_cached_audio_conversations(
                 train_rows[index : index + args.batch_size],

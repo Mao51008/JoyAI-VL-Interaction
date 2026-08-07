@@ -8,6 +8,7 @@ try:
 except ImportError:
     torch = None
 
+from training.omni.projector_stage2.cache_features import validate_feature_cache
 from training.omni.projector_stage2.train import (
     Stage2Config,
     _build_supervised_sequence,
@@ -16,6 +17,7 @@ from training.omni.projector_stage2.train import (
     collate_cached_audio_conversations,
     collate_conversations,
     freeze_asr_and_select_trainables,
+    load_stage1_projector_initialization,
     run_preflight,
     train_model,
 )
@@ -210,6 +212,31 @@ def test_sequence_rejects_legacy_text_only_rows():
         )
 
 
+def test_feature_cache_validation_rejects_manifest_fingerprint_mismatch(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "metadata.json").write_text(
+        json.dumps({"schema_version": 1}), encoding="utf-8"
+    )
+    (cache / "index.json").write_text(
+        json.dumps(
+            [
+                {
+                    "sample_id": "s1",
+                    "clip_sha256": "clip-s1",
+                    "source_audio_sha256": "source-d1",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assert validate_feature_cache(cache, [_row()])["schema_version"] == 1
+    mismatched = _row()
+    mismatched["clip_sha256"] = "different"
+    with pytest.raises(ValueError, match="mismatched"):
+        validate_feature_cache(cache, [mismatched])
+
+
 def test_preflight_rejects_leakage_and_invalid_parameters(tmp_path):
     config = _config(tmp_path)
     dev = config.dev_manifest
@@ -252,4 +279,42 @@ def test_mock_training_freezes_asr_and_writes_metrics_checkpoints_curve(tmp_path
     assert all(
         (tmp_path / "out" / name).is_file()
         for name in ("best.pt", "last.pt", "metrics.jsonl", "loss_curve.svg")
+    )
+    state = torch.load(
+        tmp_path / "out" / "last.pt", map_location="cpu", weights_only=True
+    )
+    assert "model" not in state
+    assert set(state["trainable_state"]) == {
+        "audio_projector.weight",
+        "audio_projector.bias",
+        "lora_weight",
+    }
+
+
+@pytest.mark.skipif(torch is None, reason="PyTorch is not installed")
+def test_stage_one_projector_checkpoint_initializes_matching_projector(tmp_path):
+    from training.omni.projector_stage1.projector import (
+        AudioProjector,
+        AudioProjectorConfig,
+    )
+
+    source = AudioProjector(AudioProjectorConfig(input_size=2, output_size=3))
+    checkpoint = tmp_path / "stage1.pt"
+    torch.save(
+        {
+            "format": "projector-stage1-v4",
+            "config": {"projector": source.export_config()},
+            "projector": source.state_dict(),
+        },
+        checkpoint,
+    )
+    target = AudioProjector(AudioProjectorConfig(input_size=2, output_size=3))
+    import hashlib
+
+    expected = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    provenance = load_stage1_projector_initialization(target, checkpoint, expected)
+    assert provenance["sha256"] == expected
+    assert all(
+        torch.equal(source.state_dict()[name], target.state_dict()[name])
+        for name in source.state_dict()
     )
