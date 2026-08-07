@@ -79,25 +79,23 @@ def validate_feature_cache(
 
 
 def _load_mono_audio(path: Path, target_sample_rate: int) -> Any:
-    import torch
-
     try:
         import soundfile as sf
-        import torchaudio.functional as audio_functional
+        import soxr
     except ImportError as exc:
         raise RuntimeError(
-            "soundfile and torchaudio are required for feature caching"
+            "soundfile and soxr are required for feature caching"
         ) from exc
     waveform, source_rate = sf.read(path, dtype="float32", always_2d=True)
-    waveform = torch.from_numpy(waveform.mean(axis=1))
-    if not waveform.numel():
+    waveform = waveform.mean(axis=1)
+    if not waveform.size:
         raise ValueError(f"audio clip is empty: {path}")
     source_rate = int(source_rate)
     if source_rate <= 0:
         raise ValueError(f"invalid sample rate {source_rate}: {path}")
     if source_rate != target_sample_rate:
-        waveform = audio_functional.resample(waveform, source_rate, target_sample_rate)
-    return waveform.numpy()
+        waveform = soxr.resample(waveform, source_rate, target_sample_rate)
+    return waveform
 
 
 def cache_features(
