@@ -88,6 +88,7 @@ agent-workspace/
 *.crt
 *.sqlite
 *.db
+youtube-cookies.txt
 
 # Generated test outputs are not uploaded from this combined workspace
 test-results/
