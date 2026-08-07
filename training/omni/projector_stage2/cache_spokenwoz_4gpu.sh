@@ -17,9 +17,36 @@ for shard_index in 0 1 2 3; do
   CUDA_VISIBLE_DEVICES="$shard_index" "$PYTHON_BIN" -m training.omni.projector_stage2.cache_features \
     --manifest "$DATA_ROOT/train.jsonl" --manifest "$DATA_ROOT/dev.jsonl" \
     --audio-model "$AUDIO_MODEL" --output-dir "$OUTPUT_ROOT/parts/worker-$shard_index" \
-    --device cuda:0 --num-shards "$WORKERS" --shard-index "$shard_index" >"$OUTPUT_ROOT/logs/worker-$shard_index.log" 2>&1 &
+    --device cuda:0 --num-shards "$WORKERS" --shard-index "$shard_index" \
+    --progress-file "$OUTPUT_ROOT/parts/worker-$shard_index/progress.json" \
+    >"$OUTPUT_ROOT/logs/worker-$shard_index.log" 2>&1 &
   pids+=("$!")
 done
+
+while :; do
+  completed=0
+  total=0
+  active=0
+  for shard_index in 0 1 2 3; do
+    progress_file="$OUTPUT_ROOT/parts/worker-$shard_index/progress.json"
+    if [ -f "$progress_file" ]; then
+      worker_completed="$(grep -o '"completed": [0-9]*' "$progress_file" | awk '{print $2}' || true)"
+      worker_total="$(grep -o '"total": [0-9]*' "$progress_file" | awk '{print $2}' || true)"
+      completed=$((completed + ${worker_completed:-0}))
+      total=$((total + ${worker_total:-0}))
+    fi
+    if kill -0 "${pids[$shard_index]}" 2>/dev/null; then
+      active=1
+    fi
+  done
+  if [ "$total" -gt 0 ]; then
+    printf '\rfeature cache: %d/%d (%.1f%%)' "$completed" "$total" \
+      "$(awk -v completed="$completed" -v total="$total" 'BEGIN { print 100 * completed / total }')"
+  fi
+  [ "$active" -eq 0 ] && break
+  sleep 5
+done
+printf '\n'
 
 for pid in "${pids[@]}"; do
   wait "$pid"

@@ -146,6 +146,8 @@ def cache_features(
     model_revision: str,
     num_shards: int = 1,
     shard_index: int = 0,
+    progress_file: Path | None = None,
+    progress_every: int = 100,
 ) -> dict[str, Any]:
     """Extract frozen ASR features once; refuse to reuse an output directory."""
     if output_dir.exists():
@@ -154,6 +156,8 @@ def cache_features(
         )
     if shard_size <= 0:
         raise ValueError("shard_size must be positive")
+    if progress_every <= 0:
+        raise ValueError("progress_every must be positive")
     all_rows, manifest_fingerprints = _load_rows(manifests, limit)
     rows = _select_shard_rows(all_rows, num_shards, shard_index)
     cache_part_index = shard_index
@@ -163,6 +167,25 @@ def cache_features(
     from transformers import AutoProcessor
 
     output_dir.mkdir(parents=True)
+
+    def write_progress(completed: int, status: str) -> None:
+        if progress_file is None:
+            return
+        progress_file.write_text(
+            json.dumps(
+                {
+                    "completed": completed,
+                    "total": len(rows),
+                    "shard_index": cache_part_index,
+                    "status": status,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    write_progress(0, "loading")
     wrapper = Qwen3ASRModel.from_pretrained(
         str(audio_model),
         dtype=torch.bfloat16,
@@ -188,7 +211,7 @@ def cache_features(
         file_shard_index += 1
         shard_samples = []
 
-    for row in rows:
+    for completed, row in enumerate(rows, start=1):
         clip_path = Path(row["_manifest_root"]) / row["audio_path"]
         if not clip_path.is_file():
             raise FileNotFoundError(f"manifest audio clip does not exist: {clip_path}")
@@ -229,7 +252,10 @@ def cache_features(
         )
         if len(shard_samples) == shard_size:
             flush()
+        if completed % progress_every == 0 or completed == len(rows):
+            write_progress(completed, "running")
     flush()
+    write_progress(len(rows), "complete")
     metadata = {
         "schema_version": CACHE_SCHEMA_VERSION,
         "audio_model": str(audio_model.resolve()),
@@ -346,6 +372,8 @@ def main() -> None:
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--merge-part", type=Path, action="append")
+    parser.add_argument("--progress-file", type=Path)
+    parser.add_argument("--progress-every", type=int, default=100)
     args = parser.parse_args()
     if args.merge_part:
         result = merge_feature_cache_parts(
@@ -367,6 +395,8 @@ def main() -> None:
             model_revision=args.model_revision,
             num_shards=args.num_shards,
             shard_index=args.shard_index,
+            progress_file=args.progress_file,
+            progress_every=args.progress_every,
         )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
 
