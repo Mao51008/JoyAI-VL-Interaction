@@ -11,6 +11,8 @@ import argparse
 import hashlib
 import json
 import math
+import os
+from itertools import islice
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,6 +66,7 @@ class Stage2Config:
     early_stopping_patience: int = 0
     no_progress: bool = False
     resume_from: Path | None = None
+    max_validation_batches: int | None = None
 
 
 @dataclass
@@ -498,6 +501,8 @@ def validate_config(config: Stage2Config) -> None:
         )
     if config.early_stopping_patience < 0:
         raise ValueError("early stopping patience cannot be negative")
+    if config.max_validation_batches is not None and config.max_validation_batches <= 0:
+        raise ValueError("max_validation_batches must be positive")
     if config.output_dir.exists() and config.resume_from is None:
         raise FileExistsError(
             f"refusing to reuse output directory: {config.output_dir}"
@@ -750,10 +755,13 @@ def _save_checkpoint(
 ) -> None:
     import torch
 
+    checkpoint_model = getattr(model, "module", model)
     trainable_names = {
-        name for name, parameter in model.named_parameters() if parameter.requires_grad
+        name
+        for name, parameter in checkpoint_model.named_parameters()
+        if parameter.requires_grad
     }
-    state_dict = model.state_dict()
+    state_dict = checkpoint_model.state_dict()
     trainable_state = {
         name: state_dict[name].detach().cpu() for name in trainable_names
     }
@@ -768,9 +776,9 @@ def _save_checkpoint(
             "scheduler": scheduler.state_dict(),
             "best_validation_loss": best_loss,
             "projector_initialization": getattr(
-                model, "projector_initialization", None
+                checkpoint_model, "projector_initialization", None
             ),
-            "feature_cache": getattr(model, "feature_cache_metadata", None),
+            "feature_cache": getattr(checkpoint_model, "feature_cache_metadata", None),
         },
         path,
     )
@@ -785,10 +793,21 @@ def train_model(
     """Train an injected model for CPU tests or a future authorized runtime."""
     import torch
 
-    validate_config(config)
-    config.output_dir.mkdir(parents=True)
+    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+    rank = torch.distributed.get_rank() if distributed else 0
+    world_size = torch.distributed.get_world_size() if distributed else 1
+
+    if rank == 0:
+        validate_config(config)
+    if distributed:
+        torch.distributed.barrier()
+    if rank == 0:
+        config.output_dir.mkdir(parents=True)
+    if distributed:
+        torch.distributed.barrier()
+    base_model = getattr(model, "module", model)
     trainables = freeze_asr_and_select_trainables(
-        model, config.asr_encoder_prefix, config.projector_prefix
+        base_model, config.asr_encoder_prefix, config.projector_prefix
     )
     optimizer = torch.optim.AdamW(trainables, lr=config.learning_rate)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
@@ -802,14 +821,14 @@ def train_model(
     start_step = 0
     if config.resume_from is not None:
         state = torch.load(config.resume_from, map_location="cpu", weights_only=True)
-        model.load_state_dict(state["trainable_state"], strict=False)
+        base_model.load_state_dict(state["trainable_state"], strict=False)
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
         start_step = int(state["step"])
         best_validation = float(state.get("best_validation_loss", best_validation))
     train_iterator = iter(train_batches)
     progress = None
-    if not config.no_progress:
+    if rank == 0 and not config.no_progress:
         try:
             from tqdm import tqdm
 
@@ -828,29 +847,36 @@ def train_model(
         loss.backward()
         optimizer.step()
         scheduler.step()
-        record = {"step": step, "loss": float(loss.detach())}
+        loss_value = loss.detach()
+        if distributed:
+            torch.distributed.all_reduce(loss_value)
+            loss_value /= world_size
+        record = {"step": step, "loss": float(loss_value)}
         if step % config.validation_every == 0 or step == config.steps:
             model.eval()
             with torch.no_grad():
                 dev_losses = [
-                    float(_loss_value(model(batch)).detach()) for batch in iter(dev_batches)
+                    _loss_value(model(batch)).detach()
+                    for batch in islice(iter(dev_batches), config.max_validation_batches)
                 ]
-            validation_loss = sum(dev_losses) / len(dev_losses)
+            validation_total = torch.stack(dev_losses).sum()
+            validation_count = torch.tensor(float(len(dev_losses)), device=validation_total.device)
+            if distributed:
+                torch.distributed.all_reduce(validation_total)
+                torch.distributed.all_reduce(validation_count)
+            validation_loss = float(validation_total / validation_count)
             record["validation_loss"] = validation_loss
             if validation_loss < best_validation:
                 best_validation = validation_loss
                 bad_checks = 0
-                _save_checkpoint(
-                    config.output_dir / "best.pt",
-                    model,
-                    optimizer,
-                    scheduler,
-                    step,
-                    best_validation,
-                )
+                if rank == 0:
+                    _save_checkpoint(
+                        config.output_dir / "best.pt", model, optimizer, scheduler, step, best_validation
+                    )
             else:
                 bad_checks += 1
-        records.append(record)
+        if rank == 0:
+            records.append(record)
         if progress is not None:
             progress.update(1)
             progress.set_postfix(loss=f"{record['loss']:.4f}")
@@ -861,23 +887,18 @@ def train_model(
             break
     if progress is not None:
         progress.close()
-    _save_checkpoint(
-        config.output_dir / "last.pt",
-        model,
-        optimizer,
-        scheduler,
-        records[-1]["step"],
-        best_validation,
-    )
-    (config.output_dir / "metrics.jsonl").write_text(
-        "".join(json.dumps(row, sort_keys=True) + "\n" for row in records),
-        encoding="utf-8",
-    )
-    _write_loss_curve(records, config.output_dir / "loss_curve.svg")
+    if rank == 0:
+        _save_checkpoint(
+            config.output_dir / "last.pt", model, optimizer, scheduler, records[-1]["step"], best_validation
+        )
+        (config.output_dir / "metrics.jsonl").write_text(
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in records), encoding="utf-8"
+        )
+        _write_loss_curve(records, config.output_dir / "loss_curve.svg")
     return {
         "steps": records[-1]["step"],
         "best_validation_loss": best_validation,
-        "records": records,
+        "records": records if rank == 0 else [],
     }
 
 
@@ -898,6 +919,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=3e-5)
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--validation-every", type=int, default=100)
+    parser.add_argument("--max-validation-batches", type=int)
     parser.add_argument("--early-stopping-patience", type=int, default=0)
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument(
@@ -923,11 +945,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-cached-feature-shards", type=int, default=8)
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--distributed", action="store_true")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    distributed = args.distributed
+    rank = 0
+    world_size = 1
+    if distributed:
+        import torch
+
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        torch.distributed.init_process_group("nccl")
+        args.device = f"cuda:{local_rank}"
     config = Stage2Config(
         train_manifest=args.train_manifest,
         dev_manifest=args.dev_manifest,
@@ -941,6 +976,7 @@ def main(argv: list[str] | None = None) -> int:
         validation_every=args.validation_every,
         early_stopping_patience=args.early_stopping_patience,
         no_progress=args.no_progress,
+        max_validation_batches=args.max_validation_batches,
     )
     if not args.run:
         result = run_preflight(config)
@@ -989,6 +1025,13 @@ def main(argv: list[str] | None = None) -> int:
             args.dtype,
         )
         model.feature_cache_metadata = cache_metadata
+        freeze_asr_and_select_trainables(model, args.asr_encoder_prefix, args.projector_prefix)
+        if distributed:
+            from torch.nn.parallel import DistributedDataParallel
+
+            model = DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
+        train_rows = train_rows[rank::world_size]
+        dev_rows = dev_rows[rank::world_size]
         train_batches = CachedConversationBatchSource(
             train_rows, tokenizer, args.feature_dir, int(audio_placeholder_id),
             args.batch_size, args.max_cached_feature_shards,
@@ -998,7 +1041,12 @@ def main(argv: list[str] | None = None) -> int:
             args.batch_size, args.max_cached_feature_shards,
         )
         result = train_model(model, train_batches, dev_batches, config)
-    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    if rank == 0:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    if distributed:
+        import torch
+
+        torch.distributed.destroy_process_group()
     return 0
 
 
