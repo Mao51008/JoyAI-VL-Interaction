@@ -689,6 +689,7 @@ def build_model_from_pretrained(
     stage1_projector_sha256: str,
     device: str,
     dtype: str = "bfloat16",
+    gradient_checkpointing: bool = False,
 ) -> Any:
     """Load only the LLM: frozen ASR features are supplied by the validated cache."""
     import torch
@@ -697,6 +698,12 @@ def build_model_from_pretrained(
 
     torch_dtype = getattr(torch, dtype)
     llm = AutoModelForImageTextToText.from_pretrained(llm_model, dtype=torch_dtype)
+    if gradient_checkpointing:
+        if not hasattr(llm, "gradient_checkpointing_enable"):
+            raise TypeError("LLM does not support gradient checkpointing")
+        llm.gradient_checkpointing_enable()
+        if hasattr(llm, "config"):
+            llm.config.use_cache = False
     model = build_stage2_model(
         nn.Identity(),
         llm,
@@ -946,6 +953,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--distributed", action="store_true")
+    parser.add_argument("--gradient-checkpointing", action="store_true")
     return parser
 
 
@@ -1023,6 +1031,7 @@ def main(argv: list[str] | None = None) -> int:
             args.init_projector_sha256,
             args.device,
             args.dtype,
+            args.gradient_checkpointing,
         )
         model.feature_cache_metadata = cache_metadata
         freeze_asr_and_select_trainables(model, args.asr_encoder_prefix, args.projector_prefix)
