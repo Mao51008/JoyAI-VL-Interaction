@@ -67,6 +67,8 @@ class Stage2Config:
     no_progress: bool = False
     resume_from: Path | None = None
     max_validation_batches: int | None = None
+    warmup_steps: int = 1000
+    min_learning_rate_ratio: float = 0.1
 
 
 @dataclass
@@ -501,6 +503,10 @@ def validate_config(config: Stage2Config) -> None:
         )
     if config.early_stopping_patience < 0:
         raise ValueError("early stopping patience cannot be negative")
+    if config.warmup_steps < 0:
+        raise ValueError("warmup_steps cannot be negative")
+    if not 0 < config.min_learning_rate_ratio <= 1:
+        raise ValueError("min_learning_rate_ratio must be in (0, 1]")
     if config.max_validation_batches is not None and config.max_validation_batches <= 0:
         raise ValueError("max_validation_batches must be positive")
     if config.output_dir.exists() and config.resume_from is None:
@@ -531,6 +537,8 @@ def run_preflight(config: Stage2Config) -> dict[str, Any]:
             "learning_rate": config.learning_rate,
             "steps": config.steps,
             "validation_every": config.validation_every,
+            "warmup_steps": config.warmup_steps,
+            "min_learning_rate_ratio": config.min_learning_rate_ratio,
             "early_stopping_patience": config.early_stopping_patience,
         },
         "manifests": manifest_info,
@@ -817,7 +825,14 @@ def train_model(
         base_model, config.asr_encoder_prefix, config.projector_prefix
     )
     optimizer = torch.optim.AdamW(trainables, lr=config.learning_rate)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    def learning_rate_scale(step: int) -> float:
+        if config.warmup_steps and step < config.warmup_steps:
+            return (step + 1) / config.warmup_steps
+        decay_steps = max(1, config.steps - config.warmup_steps)
+        progress = min(1.0, max(0.0, (step - config.warmup_steps) / decay_steps))
+        return 1.0 - (1.0 - config.min_learning_rate_ratio) * progress
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, learning_rate_scale)
     if not hasattr(train_batches, "__len__") or not hasattr(dev_batches, "__len__"):
         raise TypeError("train and dev batches must be re-iterable sized sources")
     if len(train_batches) == 0 or len(dev_batches) == 0:
@@ -849,6 +864,7 @@ def train_model(
             train_iterator = iter(train_batches)
             batch = next(train_iterator)
         model.train()
+        learning_rate = optimizer.param_groups[0]["lr"]
         optimizer.zero_grad()
         loss = _loss_value(model(batch))
         loss.backward()
@@ -858,7 +874,7 @@ def train_model(
         if distributed:
             torch.distributed.all_reduce(loss_value)
             loss_value /= world_size
-        record = {"step": step, "loss": float(loss_value)}
+        record = {"step": step, "loss": float(loss_value), "learning_rate": learning_rate}
         if step % config.validation_every == 0 or step == config.steps:
             model.eval()
             with torch.no_grad():
@@ -927,6 +943,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--validation-every", type=int, default=100)
     parser.add_argument("--max-validation-batches", type=int)
+    parser.add_argument("--warmup-steps", type=int, default=1000)
+    parser.add_argument("--min-learning-rate-ratio", type=float, default=0.1)
     parser.add_argument("--early-stopping-patience", type=int, default=0)
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument(
@@ -985,6 +1003,8 @@ def main(argv: list[str] | None = None) -> int:
         early_stopping_patience=args.early_stopping_patience,
         no_progress=args.no_progress,
         max_validation_batches=args.max_validation_batches,
+        warmup_steps=args.warmup_steps,
+        min_learning_rate_ratio=args.min_learning_rate_ratio,
     )
     if not args.run:
         result = run_preflight(config)
