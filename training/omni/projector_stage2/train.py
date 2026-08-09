@@ -903,7 +903,7 @@ def train_model(
         )
         _write_loss_curve(records, config.output_dir / "loss_curve.svg")
     return {
-        "steps": records[-1]["step"],
+        "steps": records[-1]["step"] if rank == 0 else config.steps,
         "best_validation_loss": best_validation,
         "records": records if rank == 0 else [],
     }
