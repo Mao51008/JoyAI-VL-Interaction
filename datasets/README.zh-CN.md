@@ -85,3 +85,41 @@ python ./convert_data.py \
   }
 ]
 ```
+
+### 5. Omni Stage3：下载计划与多来源转换
+
+`download_omni_stage3_media.py` 只接受已完成母媒体映射的 JSONL 清单。默认仅输出
+下载计划；只有显式加 `--execute` 才会访问网络。每条清单必须包含 `source`、
+`video_name`、`download_url`、`relative_path`、`size_bytes`，并建议提供 `sha256`。
+下载器按 source 配额和总容量上限拒绝超额条目。
+
+`mapped_media.jsonl` 的一行示例：
+
+```json
+{"source":"holoassist","video_name":"R007.mp4","download_url":"https://approved.example/R007.mp4","relative_path":"holoassist/R007.mp4","size_bytes":123456789,"sha256":"可选的64位sha256"}
+```
+
+`source_quotas.json` 是字节单位的 source 到容量上限映射；只为已经通过来源映射和许可核验的 source 配置额度：
+
+```json
+{"holoassist":155692564480,"ActivityNet":59055800320,"YouCook2":32212254720}
+```
+
+```bash
+python datasets/download_omni_stage3_media.py mapped_media.jsonl \
+  --quota-config source_quotas.json \
+  --output-root /data/maoyy/datasets/omni_stage3/raw \
+  --receipt /data/maoyy/datasets/omni_stage3/manifests/download_plan.jsonl
+```
+
+常规媒体验收完成后，`convert_omni_stage3_sources.py` 会按 source 分别调用已有的
+Omni 转换器。混合 audit JSONL 的每一行应含 `source`，从而避免同名视频跨来源错误连接。
+未显式写入的时间步依照 Omni 协议自动监督为 `silence`。
+
+`source_provenance.json` 采用 `source -> provenance JSON 文件路径` 的映射；每个 provenance 文件仍须完整满足 `omni-training-v1` 的许可证字段约束。
+
+```bash
+python datasets/convert_omni_stage3_sources.py annotations.json media_audit.jsonl \
+  --provenance-registry source_provenance.json \
+  --output-dir /data/maoyy/datasets/omni_stage3/converted
+```

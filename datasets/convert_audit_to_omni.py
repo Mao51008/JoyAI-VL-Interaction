@@ -6,9 +6,14 @@ import argparse
 import hashlib
 import json
 import math
+import sys
 from collections import Counter
 from pathlib import Path, PurePosixPath
 from typing import Any
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from training.omni.schema import OmniSample
 
@@ -23,13 +28,16 @@ def canonical_video_key(value: str) -> str:
     )
 
 
-def load_audit_rows(path: Path) -> dict[str, dict[str, Any]]:
+def load_audit_rows(path: Path, *, source: str) -> dict[str, dict[str, Any]]:
     rows = {}
     with path.open(encoding="utf-8") as handle:
         for line in handle:
             if not line.strip():
                 continue
             row = json.loads(line)
+            audited_source = str(row.get("source", "")).strip()
+            if audited_source and audited_source != source:
+                continue
             key = canonical_video_key(str(row["video_name"]))
             if key in rows:
                 raise ValueError(f"duplicate audited video_name: {row['video_name']}")
@@ -60,7 +68,7 @@ def convert(
     source: str,
 ) -> dict[str, Any]:
     records = json.loads(annotations_path.read_text(encoding="utf-8"))
-    audit_rows = load_audit_rows(audit_path)
+    audit_rows = load_audit_rows(audit_path, source=source)
     provenance = load_provenance(provenance_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     converted = []
