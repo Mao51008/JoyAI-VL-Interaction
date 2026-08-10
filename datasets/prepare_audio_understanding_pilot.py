@@ -134,6 +134,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clotho-dev-csv", type=Path, default=DATA_ROOT / "clotho_aqa/raw/clotho_aqa_val.csv")
     parser.add_argument("--clotho-test-csv", type=Path, default=DATA_ROOT / "clotho_aqa/raw/clotho_aqa_test.csv")
     parser.add_argument("--output-dir", type=Path, default=DATA_ROOT / "manifests")
+    parser.add_argument("--voice-sample-count", type=int, default=20_000)
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--run", action="store_true", help="Write manifests; omitted means count and validate only.")
     return parser
@@ -149,14 +150,34 @@ def main(argv: list[str] | None = None) -> int:
         from tqdm import tqdm
     except ImportError:
         tqdm = lambda rows, **_: rows
-    voice_rows = list(tqdm(iter_voiceassistant(args.voiceassistant_jsonl), desc="VoiceAssistant", unit="sample", disable=args.no_progress))
+    voice_candidates = list(
+        tqdm(
+            iter_voiceassistant(args.voiceassistant_jsonl),
+            desc="VoiceAssistant",
+            unit="sample",
+            disable=args.no_progress,
+        )
+    )
+    if not 0 < args.voice_sample_count <= len(voice_candidates):
+        raise ValueError(
+            f"--voice-sample-count must be in [1, {len(voice_candidates)}]"
+        )
+    voice_rows = sorted(
+        voice_candidates,
+        key=lambda row: hashlib.sha256(str(row["sample_id"]).encode("utf-8")).hexdigest(),
+    )[: args.voice_sample_count]
     clotho_rows: list[dict[str, Any]] = []
     clotho_rejected = 0
     for split, path in (("train", args.clotho_train_csv), ("dev", args.clotho_dev_csv), ("test", args.clotho_test_csv)):
         rows, rejected = load_clotho_consensus(path, split)
         clotho_rows.extend(rows)
         clotho_rejected += rejected
-    summary = {"voiceassistant_single_turn": len(voice_rows), "clotho_consensus": len(clotho_rows), "clotho_rejected_no_consensus": clotho_rejected}
+    summary = {
+        "voiceassistant_eligible": len(voice_candidates),
+        "voiceassistant_selected": len(voice_rows),
+        "clotho_consensus": len(clotho_rows),
+        "clotho_rejected_no_consensus": clotho_rejected,
+    }
     if args.run:
         output_dir.mkdir(parents=True, exist_ok=True)
         summary["written"] = {
