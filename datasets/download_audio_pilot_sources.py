@@ -16,8 +16,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-VOICEASSISTANT_REPOSITORY = "https://huggingface.co/datasets/shenyunhang/VoiceAssistant-400K"
-VOICEASSISTANT_MANIFEST_URL = f"{VOICEASSISTANT_REPOSITORY}/resolve/main/data.jsonl?download=true"
+VOICEASSISTANT_DATASET = "datasets/shenyunhang/VoiceAssistant-400K"
+DEFAULT_HUGGINGFACE_ENDPOINT = "https://huggingface.co"
 CLOTHO_AQA_RECORD = "https://zenodo.org/records/6473207/files"
 CLOTHO_AQA_FILES = {
     "train": "clotho_aqa_train.csv",
@@ -69,30 +69,35 @@ def _download(
     check_remote: bool,
     transport: str,
     proxy: str | None,
+    resume: bool,
 ) -> dict[str, Any]:
-    if destination.exists():
-        raise FileExistsError(f"refusing to overwrite existing file: {destination}")
     size = _content_length(url, transport, proxy) if run or check_remote else None
+    existing_bytes = destination.stat().st_size if destination.exists() else 0
+    if destination.exists() and not (run and resume and transport == "curl"):
+        raise FileExistsError(f"refusing to overwrite existing file: {destination}")
+    if size is not None and existing_bytes > size:
+        raise ValueError(f"existing file exceeds remote size: {destination}")
     if size is not None and size > max_bytes:
         raise ValueError(f"refusing {url}: {size} bytes exceeds limit {max_bytes}")
-    result = {"url": url, "destination": str(destination), "bytes": size, "downloaded": False}
+    result = {
+        "url": url,
+        "destination": str(destination),
+        "bytes": size,
+        "existing_bytes": existing_bytes,
+        "downloaded": False,
+    }
     if not run:
+        return result
+    if size is not None and existing_bytes == size:
+        result["sha256"] = _sha256(destination)
         return result
     destination.parent.mkdir(parents=True, exist_ok=True)
     if transport == "curl":
-        subprocess.run(
-            [
-                *_curl_args(proxy),
-                "--fail",
-                "--location",
-                "--retry",
-                "3",
-                "--output",
-                str(destination),
-                url,
-            ],
-            check=True,
-        )
+        command = [*_curl_args(proxy), "--fail", "--location", "--retry", "3"]
+        if resume and destination.exists():
+            command.extend(["--continue-at", "-"])
+        command.extend(["--output", str(destination), url])
+        subprocess.run(command, check=True)
     else:
         with urllib.request.urlopen(url, timeout=60) as response, destination.open("xb") as handle:
             shutil.copyfileobj(response, handle)
@@ -118,17 +123,23 @@ def plan_downloads(
     check_remote: bool = False,
     transport: str = "urllib",
     proxy: str | None = None,
+    resume: bool = False,
+    huggingface_endpoint: str = DEFAULT_HUGGINGFACE_ENDPOINT,
 ) -> list[dict[str, Any]]:
     root = _require_data_root(output_root)
+    voiceassistant_url = (
+        f"{huggingface_endpoint.rstrip('/')}/{VOICEASSISTANT_DATASET}/resolve/main/data.jsonl?download=true"
+    )
     plans = [
         _download(
-            VOICEASSISTANT_MANIFEST_URL,
+            voiceassistant_url,
             root / "voiceassistant_400k" / "raw" / "data.jsonl",
             512 * 1024**2,
             run,
             check_remote,
             transport,
             proxy,
+            resume,
         )
     ]
     for name, filename in CLOTHO_AQA_FILES.items():
@@ -141,6 +152,7 @@ def plan_downloads(
                 check_remote,
                 transport,
                 proxy,
+                resume,
             )
         )
     if include_clotho_audio:
@@ -153,6 +165,7 @@ def plan_downloads(
                 check_remote,
                 transport,
                 proxy,
+                resume,
             )
         )
     return plans
@@ -166,6 +179,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("/data/maoyy/datasets/audio_understanding_pilot"),
     )
     parser.add_argument("--proxy", help="Explicit HTTP proxy address passed to curl transport.")
+    parser.add_argument(
+        "--huggingface-endpoint",
+        default=DEFAULT_HUGGINGFACE_ENDPOINT,
+        help="Hugging Face endpoint, e.g. https://hf-mirror.com for the regional mirror.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume an existing partial file; supported only with --run --transport curl.",
+    )
     parser.add_argument(
         "--transport",
         choices=("urllib", "curl"),
@@ -195,6 +218,8 @@ def main(argv: list[str] | None = None) -> int:
         args.check_remote,
         args.transport,
         args.proxy,
+        args.resume,
+        args.huggingface_endpoint,
     )
     print(json.dumps({"run": args.run, "downloads": plans}, ensure_ascii=False, indent=2))
     return 0
