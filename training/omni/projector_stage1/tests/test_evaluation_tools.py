@@ -13,7 +13,11 @@ from training.omni.projector_stage1.ablation import (
 )
 from training.omni.projector_stage1.compare_wer import compare_results
 from training.omni.projector_stage1.evaluate_wer import canonical_ablation, has_eos, score_transcript
-from training.omni.projector_stage1.evaluate_transcription import summarize_rows
+from training.omni.projector_stage1.evaluate_transcription import (
+    merge_role_results,
+    sharded_indices,
+    summarize_rows,
+)
 from training.omni.projector_stage1.plot_metrics import (
     best_validation_summary,
     load_metrics,
@@ -21,6 +25,23 @@ from training.omni.projector_stage1.plot_metrics import (
 
 
 class EvaluationToolsTest(unittest.TestCase):
+    def test_role_results_merge_by_sample_id_and_shards_are_disjoint(self) -> None:
+        projector = [{"mode": "projector-vlm", "rows": [
+            {"sample_id": "b", "duration_ms": 1, "reference": "B", "projector_vlm_word_errors": 0,
+             "projector_vlm_reference_words": 1, "projector_vlm_char_errors": 0,
+             "projector_vlm_reference_chars": 1, "projector_vlm_latency_ms": 2.0},
+        ]}]
+        qwen = [{"mode": "qwen-asr", "rows": [
+            {"sample_id": "b", "duration_ms": 1, "reference": "B", "qwen_asr_word_errors": 1,
+             "qwen_asr_reference_words": 1, "qwen_asr_char_errors": 1,
+             "qwen_asr_reference_chars": 1, "qwen_asr_latency_ms": 1.0},
+        ]}]
+        result = merge_role_results(projector, qwen)
+        self.assertEqual(result["summary"]["projector_vlm_wer"], 0.0)
+        self.assertEqual(result["summary"]["qwen_asr_wer"], 1.0)
+        self.assertEqual(sharded_indices(5, 2, 0), [0, 2, 4])
+        self.assertEqual(sharded_indices(5, 2, 1), [1, 3])
+
     def test_paired_transcription_summary_uses_corpus_rates_and_latency_mean(self) -> None:
         rows = [
             {"projector_vlm_word_errors": 1, "projector_vlm_reference_words": 2,

@@ -16,6 +16,42 @@ from .evaluate_wer import _normalize, has_eos, score_transcript
 from .progress import progress_iter
 
 
+def sharded_indices(total: int, num_shards: int, shard_index: int) -> list[int]:
+    """Return deterministic, disjoint global indices for one worker."""
+    if total <= 0:
+        raise ValueError("total must be positive")
+    if num_shards <= 0 or not 0 <= shard_index < num_shards:
+        raise ValueError("invalid shard selection")
+    return list(range(shard_index, total, num_shards))
+
+
+def merge_role_results(projector_results: list[dict], qwen_results: list[dict]) -> dict:
+    """Join complete projector and Qwen-ASR shard sets by sample id."""
+    def collect(results: list[dict], mode: str) -> dict[str, dict]:
+        if not results or any(result.get("mode") != mode for result in results):
+            raise ValueError(f"expected non-empty {mode} results")
+        rows = [row for result in results for row in result.get("rows", [])]
+        indexed = {row.get("sample_id"): row for row in rows}
+        if None in indexed or len(indexed) != len(rows):
+            raise ValueError(f"{mode} shards contain duplicate or missing sample ids")
+        return indexed
+
+    projector_rows = collect(projector_results, "projector-vlm")
+    qwen_rows = collect(qwen_results, "qwen-asr")
+    if set(projector_rows) != set(qwen_rows):
+        raise ValueError("projector and Qwen-ASR shards cover different sample ids")
+    rows = []
+    for sample_id in sorted(projector_rows):
+        projector_row = projector_rows[sample_id]
+        qwen_row = qwen_rows[sample_id]
+        if projector_row["reference"] != qwen_row["reference"]:
+            raise ValueError(f"reference mismatch for {sample_id}")
+        rows.append({**projector_row, **{key: value for key, value in qwen_row.items()
+                                        if key not in {"sample_id", "duration_ms", "reference"}}})
+    return {"format": "projector-stage1-paired-transcription-v2", "summary": summarize_rows(rows),
+            "rows": rows}
+
+
 def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, int | float]:
     """Aggregate paired transcript rows using corpus-level WER/CER."""
     if not rows:
@@ -121,6 +157,9 @@ def main() -> None:
     parser.add_argument("--joyai-model", required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--qwen-language", default=None)
+    parser.add_argument("--mode", choices=("paired", "projector-vlm", "qwen-asr"), default="paired")
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--output", type=Path, required=True)
@@ -130,43 +169,43 @@ def main() -> None:
         raise ValueError("--max-samples must be positive")
     if args.max_new_tokens <= 0:
         raise ValueError("--max-new-tokens must be positive")
+    if args.num_shards <= 0 or not 0 <= args.shard_index < args.num_shards:
+        raise ValueError("--shard-index must be in [0, --num-shards)")
 
     import torch
     from qwen_asr import Qwen3ASRModel
     from transformers import AutoModelForImageTextToText, AutoProcessor, AutoTokenizer
 
-    checkpoint = load_trusted_checkpoint(args.checkpoint, torch)
-    audio_wrapper = Qwen3ASRModel.from_pretrained(
-        args.audio_model,
-        dtype=torch.bfloat16,
-        device_map=args.device,
-        max_inference_batch_size=1,
-        max_new_tokens=args.max_new_tokens,
-    )
-    audio_model = audio_wrapper.model.eval()
-    audio_processor = AutoProcessor.from_pretrained(
-        args.audio_model, fix_mistral_regex=True
-    )
-    tokenizer = AutoTokenizer.from_pretrained(args.joyai_model, fix_mistral_regex=True)
-    layout = JoyAIStage1TokenLayout.from_tokenizer(tokenizer)
-    llm = (
-        AutoModelForImageTextToText.from_pretrained(
-            args.joyai_model, dtype=torch.bfloat16
+    audio_wrapper = None
+    audio_model = audio_processor = tokenizer = layout = llm = projector = None
+    if args.mode in {"paired", "projector-vlm"}:
+        checkpoint = load_trusted_checkpoint(args.checkpoint, torch)
+        audio_wrapper = Qwen3ASRModel.from_pretrained(
+            args.audio_model, dtype=torch.bfloat16, device_map=args.device,
+            max_inference_batch_size=1, max_new_tokens=args.max_new_tokens,
         )
-        .to(args.device)
-        .eval()
-    )
-    from .projector import AudioProjector, AudioProjectorConfig
-
-    projector = (
-        AudioProjector(AudioProjectorConfig(**checkpoint["config"]["projector"]))
-        .to(args.device, dtype=torch.bfloat16)
-        .eval()
-    )
-    projector.load_state_dict(checkpoint["projector"])
+        audio_model = audio_wrapper.model.eval()
+        audio_processor = AutoProcessor.from_pretrained(args.audio_model, fix_mistral_regex=True)
+        tokenizer = AutoTokenizer.from_pretrained(args.joyai_model, fix_mistral_regex=True)
+        layout = JoyAIStage1TokenLayout.from_tokenizer(tokenizer)
+        llm = AutoModelForImageTextToText.from_pretrained(
+            args.joyai_model, dtype=torch.bfloat16
+        ).to(args.device).eval()
+        from .projector import AudioProjector, AudioProjectorConfig
+        projector = AudioProjector(AudioProjectorConfig(**checkpoint["config"]["projector"])).to(
+            args.device, dtype=torch.bfloat16
+        ).eval()
+        projector.load_state_dict(checkpoint["projector"])
+    if args.mode in {"paired", "qwen-asr"}:
+        audio_wrapper = audio_wrapper or Qwen3ASRModel.from_pretrained(
+            args.audio_model, dtype=torch.bfloat16, device_map=args.device,
+            max_inference_batch_size=1, max_new_tokens=args.max_new_tokens,
+        )
 
     rows = []
-    samples = load_samples(args.manifest)[: args.max_samples]
+    manifest_samples = load_samples(args.manifest)[: args.max_samples]
+    indices = sharded_indices(len(manifest_samples), args.num_shards, args.shard_index)
+    samples = [manifest_samples[index] for index in indices]
     with torch.inference_mode():
         progress = progress_iter(
             samples,
@@ -181,67 +220,51 @@ def main() -> None:
                     f"{sample.sample_id}: expected exactly one audio segment"
                 )
             audio_path = sample.audio[0].path
-            waveform, rate = _load_mono_audio(audio_path)
-            if rate != 16_000:
-                raise ValueError(
-                    f"{sample.sample_id}: expected 16 kHz audio, got {rate}"
-                )
-            started = time.perf_counter()
-            projector_text, generated_tokens, generated_eos = _projector_transcribe(
-                waveform=waveform,
-                audio_model=audio_model,
-                audio_processor=audio_processor,
-                projector=projector,
-                llm=llm,
-                tokenizer=tokenizer,
-                layout=layout,
-                device=args.device,
-                max_new_tokens=args.max_new_tokens,
-            )
-            projector_latency_ms = (time.perf_counter() - started) * 1000
-            started = time.perf_counter()
-            qwen_result = audio_wrapper.transcribe(
-                audio=audio_path, language=args.qwen_language
-            )[0]
-            qwen_text = _normalize(qwen_result.text)
-            qwen_latency_ms = (time.perf_counter() - started) * 1000
             reference = _normalize(target_text(sample))
             row: dict[str, Any] = {
                 "sample_id": sample.sample_id,
                 "duration_ms": sample.duration_ms,
                 "reference": reference,
-                "projector_vlm_hypothesis": projector_text,
-                "projector_vlm_latency_ms": projector_latency_ms,
-                "projector_vlm_generated_tokens": generated_tokens,
-                "projector_vlm_generated_eos": generated_eos,
-                "qwen_asr_hypothesis": qwen_text,
-                "qwen_asr_latency_ms": qwen_latency_ms,
-                "qwen_asr_language": str(qwen_result.language),
             }
-            row.update(
-                {
-                    "projector_vlm_" + key: value
-                    for key, value in score_transcript(
-                        reference, projector_text
-                    ).items()
-                }
-            )
-            row.update(
-                {
-                    "qwen_asr_" + key: value
-                    for key, value in score_transcript(reference, qwen_text).items()
-                }
-            )
+            if args.mode in {"paired", "projector-vlm"}:
+                waveform, rate = _load_mono_audio(audio_path)
+                if rate != 16_000:
+                    raise ValueError(f"{sample.sample_id}: expected 16 kHz audio, got {rate}")
+                started = time.perf_counter()
+                projector_text, generated_tokens, generated_eos = _projector_transcribe(
+                    waveform=waveform, audio_model=audio_model, audio_processor=audio_processor,
+                    projector=projector, llm=llm, tokenizer=tokenizer, layout=layout,
+                    device=args.device, max_new_tokens=args.max_new_tokens,
+                )
+                row.update({"projector_vlm_hypothesis": projector_text,
+                            "projector_vlm_latency_ms": (time.perf_counter() - started) * 1000,
+                            "projector_vlm_generated_tokens": generated_tokens,
+                            "projector_vlm_generated_eos": generated_eos})
+                row.update({"projector_vlm_" + key: value
+                            for key, value in score_transcript(reference, projector_text).items()})
+            if args.mode in {"paired", "qwen-asr"}:
+                started = time.perf_counter()
+                qwen_result = audio_wrapper.transcribe(audio=audio_path, language=args.qwen_language)[0]
+                qwen_text = _normalize(qwen_result.text)
+                row.update({"qwen_asr_hypothesis": qwen_text,
+                            "qwen_asr_latency_ms": (time.perf_counter() - started) * 1000,
+                            "qwen_asr_language": str(qwen_result.language)})
+                row.update({"qwen_asr_" + key: value
+                            for key, value in score_transcript(reference, qwen_text).items()})
             rows.append(row)
     result = {
-        "format": "projector-stage1-paired-transcription-v1",
+        "format": "projector-stage1-paired-transcription-v2",
+        "mode": args.mode,
         "manifest": str(args.manifest),
         "checkpoint": str(args.checkpoint),
         "audio_model": args.audio_model,
         "joyai_model": args.joyai_model,
         "qwen_language": args.qwen_language,
         "max_new_tokens": args.max_new_tokens,
-        "summary": summarize_rows(rows),
+        "num_shards": args.num_shards,
+        "shard_index": args.shard_index,
+        "global_indices": indices,
+        "summary": summarize_rows(rows) if args.mode == "paired" else {"samples": len(rows)},
         "rows": rows,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
