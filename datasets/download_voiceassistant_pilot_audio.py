@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -80,6 +81,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
     parser.add_argument("--proxy", help="Optional explicit HTTP proxy passed to curl.")
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--shard-count", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--run", action="store_true", help="Download audio; omitted means validate only.")
     return parser
@@ -87,12 +90,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.workers <= 0:
-        raise ValueError("--workers must be positive")
+    if args.workers <= 0 or args.shard_count <= 0 or not 0 <= args.shard_index < args.shard_count:
+        raise ValueError("workers and shard-count must be positive; shard-index must be in range")
     output_dir = _require_data_root(args.output_dir)
     rows = load_manifest(args.manifest)
+    selected_rows = [
+        row
+        for row in rows
+        if int(hashlib.sha256(str(row["sample_id"]).encode("utf-8")).hexdigest()[:8], 16)
+        % args.shard_count
+        == args.shard_index
+    ]
+    if not selected_rows:
+        raise ValueError("selected shard is empty")
     if not args.run:
-        print(json.dumps({"run": False, "samples": len(rows)}, ensure_ascii=False))
+        print(json.dumps({"run": False, "samples": len(selected_rows)}, ensure_ascii=False))
         return 0
     try:
         from tqdm import tqdm
@@ -103,7 +115,7 @@ def main(argv: list[str] | None = None) -> int:
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {
             executor.submit(_download_one, row, output_dir, args.endpoint, args.proxy): row
-            for row in rows
+            for row in selected_rows
         }
         iterator = as_completed(futures)
         if tqdm is not None:
@@ -115,7 +127,7 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as error:
                 outcomes["failed"] += 1
                 failures.append(f"{row['sample_id']}: {error}")
-    print(json.dumps({"samples": len(rows), **outcomes}, ensure_ascii=False, sort_keys=True))
+    print(json.dumps({"samples": len(selected_rows), **outcomes}, ensure_ascii=False, sort_keys=True))
     if failures:
         raise RuntimeError("VoiceAssistant audio failures: " + "\n".join(failures[:10]))
     return 0
