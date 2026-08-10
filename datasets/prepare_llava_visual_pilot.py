@@ -30,14 +30,37 @@ def _curl(proxy: str | None, *args: str) -> list[str]:
     return ["curl", *( ["--proxy", proxy] if proxy else [] ), *args]
 
 
-def _download(url: str, destination: Path, proxy: str | None) -> None:
-    if destination.exists():
-        return
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        _curl(proxy, "--fail", "--location", "--retry", "3", "--output", str(destination), url),
+def _remote_size(url: str, proxy: str | None) -> int:
+    response = subprocess.run(
+        _curl(proxy, "--fail", "--location", "--silent", "--show-error", "--head", url),
         check=True,
+        capture_output=True,
+        text=True,
     )
+    lengths = [
+        line.split(":", 1)[1].strip()
+        for line in response.stdout.splitlines()
+        if line.lower().startswith("content-length:")
+    ]
+    if not lengths:
+        raise ValueError(f"remote response has no Content-Length: {url}")
+    return int(lengths[-1])
+
+
+def _download(url: str, destination: Path, proxy: str | None, resume: bool = False) -> None:
+    command = _curl(proxy, "--fail", "--location", "--retry", "3")
+    if destination.exists():
+        if not resume:
+            return
+        remote_size = _remote_size(url, proxy)
+        local_size = destination.stat().st_size
+        if local_size == remote_size:
+            return
+        if local_size > remote_size:
+            raise ValueError(f"existing image exceeds remote size: {destination}")
+        command.extend(["--continue-at", "-"])
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run([*command, "--output", str(destination), url], check=True)
 
 
 def _normalise_prompt(value: str) -> str:
@@ -183,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
                 tqdm = lambda items, **_: items
             for row in tqdm(selected, desc="COCO images", unit="image", disable=args.no_progress):
                 destination = image_dir / row["relative_image_path"]
-                _download(row["source_image_url"], destination, args.proxy)
+                _download(row["source_image_url"], destination, args.proxy, resume=True)
             summary["images"] = len(selected)
     else:
         summary = {"train": len(train_rows), "dev": len(dev_rows), "images": len(selected)}
