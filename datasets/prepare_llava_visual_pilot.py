@@ -71,7 +71,7 @@ def select_single_turn_rows(rows: list[dict[str, Any]], count: int) -> list[dict
         conversations = row.get("conversations")
         if not isinstance(conversations, list) or len(conversations) < 2:
             continue
-        human, assistant = conversations
+        human, assistant = conversations[:2]
         if not isinstance(human, dict) or not isinstance(assistant, dict):
             continue
         if human.get("from") != "human" or assistant.get("from") != "gpt":
