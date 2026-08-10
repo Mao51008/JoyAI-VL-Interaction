@@ -141,6 +141,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lora-alpha", type=float, default=16.0)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", default="bfloat16")
+    parser.add_argument("--no-progress", action="store_true")
     args = parser.parse_args(argv)
     if args.output.exists():
         raise FileExistsError(f"refusing to overwrite output: {args.output}")
@@ -184,8 +185,17 @@ def main(argv: list[str] | None = None) -> int:
     source = CachedConversationBatchSource(
         rows, tokenizer, args.feature_dir, int(placeholder_id), batch_size=1, max_cached_shards=8
     )
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        tqdm = None
+    progress = (
+        tqdm(source, total=len(source), desc=args.task, unit="sample")
+        if tqdm is not None and not args.no_progress
+        else source
+    )
     with torch.inference_mode():
-        for batch in source:
+        for batch in progress:
             prompt = _prompt_batch(batch)
             raw_text, token_count, eos = _generate(model, prompt, tokenizer, args.max_new_tokens)
             hypothesis = _normalise(raw_text)
@@ -210,6 +220,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.task == "asr_transcription":
                 record.update(score_transcript(reference, hypothesis))
             records.append(record)
+            if hasattr(progress, "set_postfix"):
+                progress.set_postfix(samples=len(records), eos=int(eos))
     result = {
         "format": "projector-stage2-overfit-gate-v1",
         "checkpoint": str(args.checkpoint.resolve()),

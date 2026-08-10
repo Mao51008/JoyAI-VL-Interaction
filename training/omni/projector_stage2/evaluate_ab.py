@@ -8,18 +8,18 @@ import json
 import math
 import random
 import sys
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 from .cache_features import validate_feature_cache
 from .train import (
-    CachedConversationBatchSource,
     FROZEN_STAGE1_PROJECTOR_SHA256,
+    CachedConversationBatchSource,
     build_model_from_pretrained,
     load_manifest,
 )
-
 
 CONFIGURATIONS = (
     "stage1_no_lora",
@@ -201,13 +201,23 @@ def evaluate_configuration(
     batches: Iterable[Any],
     configuration: str,
     progress_every: int = 10,
+    no_progress: bool = False,
 ) -> list[dict[str, Any]]:
     import torch
 
     model.eval()
     records = []
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        tqdm = None
+    progress = (
+        tqdm(batches, total=len(batches), desc=configuration, unit="sample")
+        if tqdm is not None and not no_progress and hasattr(batches, "__len__")
+        else batches
+    )
     with torch.inference_mode():
-        for batch_index, batch in enumerate(batches, start=1):
+        for batch_index, batch in enumerate(progress, start=1):
             output = model(batch)
             loss = output["loss"] if isinstance(output, dict) else output.loss
             supervised_tokens = int(batch.labels[:, 1:].ne(-100).sum().item())
@@ -231,6 +241,8 @@ def evaluate_configuration(
                     file=sys.stderr,
                     flush=True,
                 )
+            if hasattr(progress, "set_postfix"):
+                progress.set_postfix(samples=len(records), nll=f"{float(loss):.3f}")
     return records
 
 
@@ -249,6 +261,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-cached-feature-shards", type=int, default=8)
     parser.add_argument("--progress-every", type=int, default=10)
+    parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--device", default="cuda:0")
     return parser
@@ -300,7 +313,7 @@ def main(argv: list[str] | None = None) -> int:
             args.max_cached_feature_shards,
         )
         all_records[configuration] = evaluate_configuration(
-            model, batches, configuration, args.progress_every
+            model, batches, configuration, args.progress_every, args.no_progress
         )
     summary = {
         "schema_version": 1,

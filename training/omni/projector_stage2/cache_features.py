@@ -148,6 +148,7 @@ def cache_features(
     shard_index: int = 0,
     progress_file: Path | None = None,
     progress_every: int = 100,
+    no_progress: bool = False,
 ) -> dict[str, Any]:
     """Extract frozen ASR features once; refuse to reuse an output directory."""
     if output_dir.exists():
@@ -211,7 +212,16 @@ def cache_features(
         file_shard_index += 1
         shard_samples = []
 
-    for completed, row in enumerate(rows, start=1):
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        tqdm = None
+    progress = (
+        tqdm(rows, total=len(rows), desc="cache audio features", unit="sample")
+        if tqdm is not None and not no_progress
+        else rows
+    )
+    for completed, row in enumerate(progress, start=1):
         clip_path = Path(row["_manifest_root"]) / row["audio_path"]
         if not clip_path.is_file():
             raise FileNotFoundError(f"manifest audio clip does not exist: {clip_path}")
@@ -254,6 +264,8 @@ def cache_features(
             flush()
         if completed % progress_every == 0 or completed == len(rows):
             write_progress(completed, "running")
+        if hasattr(progress, "set_postfix"):
+            progress.set_postfix(samples=completed, shards=shard_index + 1)
     flush()
     write_progress(len(rows), "complete")
     metadata = {
@@ -374,6 +386,7 @@ def main() -> None:
     parser.add_argument("--merge-part", type=Path, action="append")
     parser.add_argument("--progress-file", type=Path)
     parser.add_argument("--progress-every", type=int, default=100)
+    parser.add_argument("--no-progress", action="store_true")
     args = parser.parse_args()
     if args.merge_part:
         result = merge_feature_cache_parts(
@@ -397,6 +410,7 @@ def main() -> None:
             shard_index=args.shard_index,
             progress_file=args.progress_file,
             progress_every=args.progress_every,
+            no_progress=args.no_progress,
         )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
 
