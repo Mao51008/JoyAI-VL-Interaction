@@ -78,6 +78,14 @@ def _checkpoint_lora_layout(state: dict[str, Any]) -> tuple[list[str], int]:
     return lora_targets, ranks.pop()
 
 
+def select_task_rows(rows: Sequence[dict[str, Any]], task: str) -> list[dict[str, Any]]:
+    """Keep only samples supervised with the requested task prompt."""
+    selected = [dict(row) for row in rows if row.get("training_task") == task]
+    if not selected:
+        raise ValueError(f"manifest has no rows with training_task={task!r}")
+    return selected
+
+
 def _prompt_batch(batch: Stage2ConversationBatch) -> Stage2ConversationBatch:
     target_positions = batch.labels[0].ne(-100).nonzero(as_tuple=False)
     if not len(target_positions):
@@ -157,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
     if state.get("format") != "projector-stage2-v2":
         raise ValueError(f"unsupported checkpoint format: {state.get('format')!r}")
     lora_targets, lora_rank = _checkpoint_lora_layout(state)
-    rows = [dict(row, training_task=args.task) for row in load_manifest(args.manifest)]
+    rows = select_task_rows(load_manifest(args.manifest), args.task)
     if args.max_samples is not None:
         rows = rows[: args.max_samples]
     validate_feature_cache(args.feature_dir, rows)

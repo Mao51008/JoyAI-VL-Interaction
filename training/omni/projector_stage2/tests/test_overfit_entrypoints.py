@@ -1,6 +1,6 @@
 import pytest
 
-from training.omni.projector_stage2.evaluate_overfit import summarise_records
+from training.omni.projector_stage2.evaluate_overfit import select_task_rows, summarise_records
 from training.omni.projector_stage2.prepare_overfit_manifests import (
     assign_mixed_tasks,
     select_one_turn_per_dialogue,
@@ -35,6 +35,17 @@ def test_assign_mixed_tasks_is_fixed_and_has_requested_balance():
     assert sum(row["training_task"] == "dialogue_response" for row in first) == 16
     with pytest.raises(ValueError, match=r"\[0, 32\]"):
         assign_mixed_tasks(rows, asr_samples=33, seed=9)
+
+
+def test_select_task_rows_preserves_only_the_original_supervision_prompt():
+    rows = [
+        {"sample_id": "asr", "training_task": "asr_transcription"},
+        {"sample_id": "dialogue", "training_task": "dialogue_response"},
+    ]
+    assert [row["sample_id"] for row in select_task_rows(rows, "asr_transcription")] == ["asr"]
+    assert [row["sample_id"] for row in select_task_rows(rows, "dialogue_response")] == ["dialogue"]
+    with pytest.raises(ValueError, match="no rows"):
+        select_task_rows(rows, "missing")
 
 
 def test_asr_gate_summary_reports_error_rates_and_format_failures():
