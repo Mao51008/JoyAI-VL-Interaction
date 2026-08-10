@@ -15,7 +15,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-VOICEASSISTANT_REPOSITORY = "https://huggingface.co/datasets/gpt-omni/VoiceAssistant-400K"
+VOICEASSISTANT_REPOSITORY = "https://huggingface.co/datasets/shenyunhang/VoiceAssistant-400K"
 VOICEASSISTANT_MANIFEST_URL = f"{VOICEASSISTANT_REPOSITORY}/resolve/main/data.jsonl?download=true"
 CLOTHO_AQA_RECORD = "https://zenodo.org/records/6473207/files"
 CLOTHO_AQA_FILES = {
@@ -80,7 +80,7 @@ def plan_downloads(
         _download(
             VOICEASSISTANT_MANIFEST_URL,
             root / "voiceassistant_400k" / "raw" / "data.jsonl",
-            2 * 1024**3,
+            512 * 1024**2,
             run,
             check_remote,
         )
