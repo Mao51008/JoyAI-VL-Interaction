@@ -104,7 +104,7 @@ def select_single_turn_rows(rows: list[dict[str, Any]], count: int) -> list[dict
         )
     if len(selected) < count:
         raise ValueError(f"only {len(selected)} eligible LLaVA/COCO rows; requested {count}")
-    return [row for _, row in sorted(selected)[:count]]
+    return [row for _, row in sorted(selected, key=lambda item: item[0])[:count]]
 
 
 def _split(sample_id: str) -> str:
