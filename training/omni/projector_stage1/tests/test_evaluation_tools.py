@@ -13,6 +13,7 @@ from training.omni.projector_stage1.ablation import (
 )
 from training.omni.projector_stage1.compare_wer import compare_results
 from training.omni.projector_stage1.evaluate_wer import canonical_ablation, has_eos, score_transcript
+from training.omni.projector_stage1.evaluate_transcription import summarize_rows
 from training.omni.projector_stage1.plot_metrics import (
     best_validation_summary,
     load_metrics,
@@ -20,6 +21,26 @@ from training.omni.projector_stage1.plot_metrics import (
 
 
 class EvaluationToolsTest(unittest.TestCase):
+    def test_paired_transcription_summary_uses_corpus_rates_and_latency_mean(self) -> None:
+        rows = [
+            {"projector_vlm_word_errors": 1, "projector_vlm_reference_words": 2,
+             "projector_vlm_char_errors": 2, "projector_vlm_reference_chars": 10,
+             "projector_vlm_latency_ms": 10.0, "qwen_asr_word_errors": 0,
+             "qwen_asr_reference_words": 2, "qwen_asr_char_errors": 0,
+             "qwen_asr_reference_chars": 10, "qwen_asr_latency_ms": 20.0},
+            {"projector_vlm_word_errors": 1, "projector_vlm_reference_words": 8,
+             "projector_vlm_char_errors": 1, "projector_vlm_reference_chars": 20,
+             "projector_vlm_latency_ms": 30.0, "qwen_asr_word_errors": 2,
+             "qwen_asr_reference_words": 8, "qwen_asr_char_errors": 2,
+             "qwen_asr_reference_chars": 20, "qwen_asr_latency_ms": 40.0},
+        ]
+        summary = summarize_rows(rows)
+        self.assertEqual(summary["samples"], 2)
+        self.assertEqual(summary["projector_vlm_wer"], 0.2)
+        self.assertEqual(summary["qwen_asr_wer"], 0.2)
+        self.assertEqual(summary["projector_vlm_latency_ms_mean"], 20.0)
+        self.assertAlmostEqual(summary["projector_vlm_minus_qwen_asr_cer"], 1 / 30)
+
     def test_canonical_ablation_accepts_waveform_zero_cli_value(self) -> None:
         self.assertEqual(canonical_ablation("waveform-zero"), "waveform-zero")
 
