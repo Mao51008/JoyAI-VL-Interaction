@@ -56,8 +56,11 @@ def _coco_url(image: str) -> tuple[str, str] | None:
                 split = candidate
                 break
     if split is None:
-        return None
-    return f"https://images.cocodataset.org/{split}/{filename}", f"{split}/{filename}"
+        if len(path.stem) != 12 or not path.stem.isdigit():
+            return None
+        split = "train2014"
+        filename = f"COCO_{split}_{filename}"
+    return f"http://images.cocodataset.org/{split}/{filename}", f"{split}/{filename}"
 
 
 def select_single_turn_rows(rows: list[dict[str, Any]], count: int) -> list[dict[str, Any]]:
@@ -66,7 +69,7 @@ def select_single_turn_rows(rows: list[dict[str, Any]], count: int) -> list[dict
     selected: list[tuple[str, dict[str, Any]]] = []
     for row in rows:
         conversations = row.get("conversations")
-        if not isinstance(conversations, list) or len(conversations) != 2:
+        if not isinstance(conversations, list) or len(conversations) < 2:
             continue
         human, assistant = conversations
         if not isinstance(human, dict) or not isinstance(assistant, dict):
@@ -94,7 +97,7 @@ def select_single_turn_rows(rows: list[dict[str, Any]], count: int) -> list[dict
                     "provenance": {
                         "dataset": "liuhaotian/LLaVA-Instruct-150K",
                         "source_image": str(row["image"]),
-                        "selection": "single_turn_human_to_gpt",
+                        "selection": "first_human_to_gpt_turn",
                     },
                 },
             )
