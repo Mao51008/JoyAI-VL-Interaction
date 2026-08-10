@@ -43,10 +43,12 @@ def _content_length(url: str) -> int | None:
     return int(value) if value is not None else None
 
 
-def _download(url: str, destination: Path, max_bytes: int, run: bool) -> dict[str, Any]:
+def _download(
+    url: str, destination: Path, max_bytes: int, run: bool, check_remote: bool
+) -> dict[str, Any]:
     if destination.exists():
         raise FileExistsError(f"refusing to overwrite existing file: {destination}")
-    size = _content_length(url)
+    size = _content_length(url) if run or check_remote else None
     if size is not None and size > max_bytes:
         raise ValueError(f"refusing {url}: {size} bytes exceeds limit {max_bytes}")
     result = {"url": url, "destination": str(destination), "bytes": size, "downloaded": False}
@@ -70,7 +72,9 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def plan_downloads(output_root: Path, include_clotho_audio: bool, run: bool) -> list[dict[str, Any]]:
+def plan_downloads(
+    output_root: Path, include_clotho_audio: bool, run: bool, check_remote: bool = False
+) -> list[dict[str, Any]]:
     root = _require_data_root(output_root)
     plans = [
         _download(
@@ -78,6 +82,7 @@ def plan_downloads(output_root: Path, include_clotho_audio: bool, run: bool) -> 
             root / "voiceassistant_400k" / "raw" / "data.jsonl",
             2 * 1024**3,
             run,
+            check_remote,
         )
     ]
     for name, filename in CLOTHO_AQA_FILES.items():
@@ -87,6 +92,7 @@ def plan_downloads(output_root: Path, include_clotho_audio: bool, run: bool) -> 
                 root / "clotho_aqa" / "raw" / filename,
                 16 * 1024**2,
                 run,
+                check_remote,
             )
         )
     if include_clotho_audio:
@@ -96,6 +102,7 @@ def plan_downloads(output_root: Path, include_clotho_audio: bool, run: bool) -> 
                 root / "clotho_aqa" / "raw" / CLOTHO_AQA_AUDIO,
                 4 * 1024**3,
                 run,
+                check_remote,
             )
         )
     return plans
@@ -114,12 +121,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also download Zenodo's 3.1 GB audio archive after manifest review.",
     )
     parser.add_argument("--run", action="store_true", help="Perform downloads; omitted means dry-run.")
+    parser.add_argument(
+        "--check-remote",
+        action="store_true",
+        help="Read remote Content-Length values during dry-run; requires server proxy access.",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    plans = plan_downloads(args.output_root, args.download_clotho_aqa_audio, args.run)
+    plans = plan_downloads(
+        args.output_root, args.download_clotho_aqa_audio, args.run, args.check_remote
+    )
     print(json.dumps({"run": args.run, "downloads": plans}, ensure_ascii=False, indent=2))
     return 0
 
