@@ -37,10 +37,14 @@ def _require_data_root(path: Path) -> Path:
     return resolved
 
 
-def _content_length(url: str, transport: str) -> int | None:
+def _curl_args(proxy: str | None) -> list[str]:
+    return ["curl", "--proxy", proxy] if proxy else ["curl"]
+
+
+def _content_length(url: str, transport: str, proxy: str | None) -> int | None:
     if transport == "curl":
         result = subprocess.run(
-            ["curl", "--fail", "--location", "--silent", "--show-error", "--head", url],
+            [*_curl_args(proxy), "--fail", "--location", "--silent", "--show-error", "--head", url],
             check=True,
             capture_output=True,
             text=True,
@@ -58,11 +62,17 @@ def _content_length(url: str, transport: str) -> int | None:
 
 
 def _download(
-    url: str, destination: Path, max_bytes: int, run: bool, check_remote: bool, transport: str
+    url: str,
+    destination: Path,
+    max_bytes: int,
+    run: bool,
+    check_remote: bool,
+    transport: str,
+    proxy: str | None,
 ) -> dict[str, Any]:
     if destination.exists():
         raise FileExistsError(f"refusing to overwrite existing file: {destination}")
-    size = _content_length(url, transport) if run or check_remote else None
+    size = _content_length(url, transport, proxy) if run or check_remote else None
     if size is not None and size > max_bytes:
         raise ValueError(f"refusing {url}: {size} bytes exceeds limit {max_bytes}")
     result = {"url": url, "destination": str(destination), "bytes": size, "downloaded": False}
@@ -71,7 +81,16 @@ def _download(
     destination.parent.mkdir(parents=True, exist_ok=True)
     if transport == "curl":
         subprocess.run(
-            ["curl", "--fail", "--location", "--retry", "3", "--output", str(destination), url],
+            [
+                *_curl_args(proxy),
+                "--fail",
+                "--location",
+                "--retry",
+                "3",
+                "--output",
+                str(destination),
+                url,
+            ],
             check=True,
         )
     else:
@@ -98,6 +117,7 @@ def plan_downloads(
     run: bool,
     check_remote: bool = False,
     transport: str = "urllib",
+    proxy: str | None = None,
 ) -> list[dict[str, Any]]:
     root = _require_data_root(output_root)
     plans = [
@@ -108,6 +128,7 @@ def plan_downloads(
             run,
             check_remote,
             transport,
+            proxy,
         )
     ]
     for name, filename in CLOTHO_AQA_FILES.items():
@@ -119,6 +140,7 @@ def plan_downloads(
                 run,
                 check_remote,
                 transport,
+                proxy,
             )
         )
     if include_clotho_audio:
@@ -130,6 +152,7 @@ def plan_downloads(
                 run,
                 check_remote,
                 transport,
+                proxy,
             )
         )
     return plans
@@ -142,6 +165,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("/data/maoyy/datasets/audio_understanding_pilot"),
     )
+    parser.add_argument("--proxy", help="Explicit HTTP proxy address passed to curl transport.")
     parser.add_argument(
         "--transport",
         choices=("urllib", "curl"),
@@ -170,6 +194,7 @@ def main(argv: list[str] | None = None) -> int:
         args.run,
         args.check_remote,
         args.transport,
+        args.proxy,
     )
     print(json.dumps({"run": args.run, "downloads": plans}, ensure_ascii=False, indent=2))
     return 0
