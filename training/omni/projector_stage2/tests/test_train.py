@@ -1,5 +1,7 @@
 import json
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +15,7 @@ from training.omni.projector_stage2.train import (
     CachedConversationBatchSource,
     Stage2Config,
     _build_supervised_sequence,
+    _optimizer_parameter_groups,
     build_parser,
     build_stage2_model,
     collate_cached_audio_conversations,
@@ -114,7 +117,12 @@ def test_cli_help_and_preflight_writes_contract(tmp_path, capsys):
     result = run_preflight(_config(tmp_path))
     assert result["status"] == "preflight-only"
     assert result["prompt_contract"]["current_user_text_input"] is False
-    assert result["prompt_contract"]["supervision"] == "assistant_response-only"
+    assert (
+        result["prompt_contract"]["supervision"]
+        == "assistant_response-and-asr_transcription"
+    )
+    assert result["prompt_contract"]["asr_transcript_prompt_leakage"] is False
+    assert result["config"]["asr_replay_ratio"] == pytest.approx(0.3)
     assert (
         json.loads((tmp_path / "out" / "preflight.json").read_text())["manifests"][
             "train_samples"
@@ -138,6 +146,18 @@ def test_sequence_uses_official_chat_template_without_current_transcript():
     ]
     assert "SECRET CURRENT TRANSCRIPT" not in json.dumps(tokenizer.calls)
     assert prompt_messages[-1]["content"].count("<|vision_pad|>") == 1
+
+
+def test_asr_replay_supervises_transcript_without_leaking_it_into_prompt():
+    tokenizer = ChatTokenizer()
+    row = _row()
+    row["training_task"] = "asr_transcription"
+    sequence = _build_supervised_sequence(row, tokenizer, 7, 1, 4096)
+    assert sequence["labels"][-2:] == [9, 5]
+    prompt_messages = tokenizer.calls[0][0]
+    assert [message["role"] for message in prompt_messages] == ["system", "user"]
+    assert "SECRET CURRENT TRANSCRIPT" not in json.dumps(prompt_messages)
+    assert "Transcribe" in prompt_messages[0]["content"]
 
 
 @pytest.mark.skipif(torch is None, reason="PyTorch is not installed")
@@ -179,6 +199,59 @@ def test_cached_batch_source_defers_feature_reads_until_iteration():
 
 
 @pytest.mark.skipif(torch is None, reason="PyTorch is not installed")
+def test_cached_batch_source_shuffles_deterministically_by_epoch():
+    class Cache:
+        def get(self, sample_id):
+            return {"features": torch.ones(2, 2)}
+
+    rows = [_row(f"s{index}") for index in range(6)]
+
+    def source():
+        return CachedConversationBatchSource(
+            rows,
+            ChatTokenizer(),
+            Path("cache"),
+            7,
+            batch_size=2,
+            max_cached_shards=1,
+            shuffle=True,
+            seed=11,
+            cache_factory=lambda *_: Cache(),
+        )
+
+    first_source = source()
+    first_epoch = [sample for batch in first_source for sample in batch.sample_ids]
+    second_epoch = [sample for batch in first_source for sample in batch.sample_ids]
+    repeated_first_epoch = [sample for batch in source() for sample in batch.sample_ids]
+    assert first_epoch == repeated_first_epoch
+    assert first_epoch != second_epoch
+    assert sorted(first_epoch) == sorted(row["sample_id"] for row in rows)
+
+
+@pytest.mark.skipif(torch is None, reason="PyTorch is not installed")
+def test_cached_batch_source_applies_deterministic_asr_replay_ratio():
+    class Cache:
+        def get(self, sample_id):
+            return {"features": torch.ones(2, 2)}
+
+    source = CachedConversationBatchSource(
+        [_row(f"s{index}") for index in range(10)],
+        ChatTokenizer(),
+        Path("cache"),
+        7,
+        batch_size=2,
+        max_cached_shards=1,
+        shuffle=True,
+        seed=19,
+        asr_replay_ratio=0.3,
+        cache_factory=lambda *_: Cache(),
+    )
+    task_types = [task for batch in source for task in batch.task_types]
+    assert task_types.count("asr_transcription") == 3
+    assert task_types.count("dialogue_response") == 7
+
+
+@pytest.mark.skipif(torch is None, reason="PyTorch is not installed")
 def test_model_builder_injects_lora_and_freezes_asr():
     asr = torch.nn.Linear(2, 2)
     llm = torch.nn.Sequential(torch.nn.Linear(2, 2))
@@ -190,10 +263,17 @@ def test_model_builder_injects_lora_and_freezes_asr():
         for name, parameter in names.items()
         if name.startswith("audio_encoder.")
     )
+    groups = _optimizer_parameter_groups(
+        model, Stage2Config(Path("train"), Path("dev"), Path("out"))
+    )
+    assert [group["group_name"] for group in groups] == ["projector", "lora"]
+    assert [group["lr"] for group in groups] == [3e-6, 1e-5]
 
 
 @pytest.mark.skipif(torch is None, reason="PyTorch is not installed")
 def test_audio_features_change_inputs_and_loss():
+    torch.manual_seed(0)
+
     class Cache:
         def __init__(self):
             self.features = torch.tensor([[1.0, 0.0]])
@@ -212,7 +292,7 @@ def test_audio_features_change_inputs_and_loss():
 
         def forward(self, inputs_embeds, labels, **kwargs):
             return (
-                self.proj(inputs_embeds).mean() - labels.float().mean() / 10
+                self.proj(inputs_embeds).sum() - labels.float().mean() / 10
             ).square()
 
     model = build_stage2_model(torch.nn.Linear(2, 2), TinyLLM(), 2, 2, ["proj"], 1, 2.0)
@@ -222,7 +302,7 @@ def test_audio_features_change_inputs_and_loss():
     cache = Cache()
     first = collate_cached_audio_conversations(rows, tokenizer, cache, 7)
     loss_one = model(first)
-    cache.features = torch.tensor([[0.0, 1.0]])
+    cache.features = torch.tensor([[1.0, 1.0]])
     second = collate_cached_audio_conversations(rows, tokenizer, cache, 7)
     loss_two = model(second)
     assert first.audio_placeholder_mask.sum().item() == 1
@@ -319,6 +399,50 @@ def test_mock_training_freezes_asr_and_writes_metrics_checkpoints_curve(tmp_path
         "audio_projector.bias",
         "lora_weight",
     }
+    assert state["training_config"]["gradient_accumulation_steps"] == 8
+    assert [group["group_name"] for group in state["optimizer"]["param_groups"]] == [
+        "projector",
+        "lora",
+    ]
+    assert all(record["supervised_tokens"] == 8 for record in result["records"])
+    assert all("gradient_norm" in record for record in result["records"])
+    assert all(record["task_samples"] == {"unknown": 8} for record in result["records"])
+
+
+@pytest.mark.skipif(torch is None, reason="PyTorch is not installed")
+def test_training_and_validation_losses_are_weighted_by_supervised_tokens(tmp_path):
+    class MockModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.audio_encoder = torch.nn.Linear(1, 1)
+            self.audio_projector = torch.nn.Linear(1, 1)
+            self.lora_weight = torch.nn.Parameter(torch.tensor(0.1))
+
+        def forward(self, batch):
+            return self.audio_projector.weight.sum() * 0 + batch.loss
+
+    def batch(loss, supervised_tokens):
+        labels = torch.full((1, supervised_tokens + 1), -100, dtype=torch.long)
+        labels[:, 1:] = 1
+        return SimpleNamespace(loss=torch.tensor(float(loss)), labels=labels)
+
+    config = replace(
+        _config(tmp_path),
+        steps=1,
+        validation_every=1,
+        gradient_accumulation_steps=2,
+        warmup_steps=0,
+    )
+    result = train_model(
+        MockModel(),
+        [batch(1, 1), batch(3, 3)],
+        [batch(1, 1), batch(3, 3)],
+        config,
+    )
+    assert result["records"][0]["loss"] == pytest.approx(2.5)
+    assert result["records"][0]["supervised_tokens"] == 4
+    assert result["records"][0]["validation_loss"] == pytest.approx(2.5)
+    assert result["records"][0]["validation_supervised_tokens"] == 4
 
 
 @pytest.mark.skipif(torch is None, reason="PyTorch is not installed")

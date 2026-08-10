@@ -12,11 +12,14 @@ import hashlib
 import json
 import math
 import os
-from itertools import islice
-from collections.abc import Iterable, Sequence
+import random
+from collections import Counter
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .cache_features import validate_feature_cache
 
@@ -29,6 +32,7 @@ SYSTEM_PROMPT_VARIANTS = (
     "Listen to the current user audio and respond appropriately using the conversation history.",
     "Respond to the user's spoken request while considering the preceding dialogue.",
 )
+ASR_SYSTEM_PROMPT = "Transcribe the user's speech exactly. Return only the transcription."
 AUDIO_START_TOKEN = "<|vision_start|>"
 AUDIO_PLACEHOLDER_TOKEN = "<|vision_pad|>"
 AUDIO_END_TOKEN = "<|vision_end|>"
@@ -60,14 +64,21 @@ class Stage2Config:
     projector_prefix: str = "audio_projector"
     lora_rank: int = 8
     lora_alpha: float = 16.0
-    learning_rate: float = 3e-5
+    learning_rate: float | None = None
+    projector_learning_rate: float = 3e-6
+    lora_learning_rate: float = 1e-5
+    weight_decay: float = 0.01
+    gradient_accumulation_steps: int = 8
+    max_grad_norm: float = 1.0
+    shuffle_seed: int = 3407
+    asr_replay_ratio: float = 0.3
     steps: int = 1000
     validation_every: int = 100
     early_stopping_patience: int = 0
     no_progress: bool = False
     resume_from: Path | None = None
     max_validation_batches: int | None = None
-    warmup_steps: int = 1000
+    warmup_steps: int = 100
     min_learning_rate_ratio: float = 0.1
 
 
@@ -83,6 +94,7 @@ class Stage2ConversationBatch:
     audio_features: Any = None
     audio_attention_mask: Any = None
     audio_placeholder_mask: Any = None
+    task_types: list[str] | None = None
 
 
 class CachedConversationBatchSource:
@@ -96,22 +108,31 @@ class CachedConversationBatchSource:
         audio_placeholder_id: int,
         batch_size: int,
         max_cached_shards: int,
+        shuffle: bool = False,
+        seed: int = 3407,
+        asr_replay_ratio: float = 0.0,
         cache_factory: Callable[[Path, int], Any] | None = None,
     ) -> None:
         if batch_size <= 0 or max_cached_shards <= 0:
             raise ValueError("batch_size and max_cached_shards must be positive")
+        if not 0 <= asr_replay_ratio <= 1:
+            raise ValueError("asr_replay_ratio must be in [0, 1]")
         self.rows = rows
         self.tokenizer = tokenizer
         self.feature_dir = feature_dir
         self.audio_placeholder_id = audio_placeholder_id
         self.batch_size = batch_size
         self.max_cached_shards = max_cached_shards
+        self.shuffle = shuffle
+        self.seed = seed
+        self.asr_replay_ratio = asr_replay_ratio
         self.cache_factory = cache_factory
+        self._epoch = 0
 
     def __len__(self) -> int:
         return (len(self.rows) + self.batch_size - 1) // self.batch_size
 
-    def __iter__(self) -> Iterable[Stage2ConversationBatch]:
+    def __iter__(self) -> Iterator[Stage2ConversationBatch]:
         if self.cache_factory is None:
             from training.omni.projector_stage1.feature_cache import FeatureCache
 
@@ -120,9 +141,25 @@ class CachedConversationBatchSource:
             )
         else:
             feature_cache = self.cache_factory(self.feature_dir, self.max_cached_shards)
-        for index in range(0, len(self.rows), self.batch_size):
+        epoch = self._epoch
+        rows = [dict(row) for row in self.rows]
+        asr_count = round(len(rows) * self.asr_replay_ratio)
+        asr_indices = set(
+            random.Random(self.seed + epoch + 1_000_003).sample(
+                range(len(rows)), asr_count
+            )
+        )
+        for index, row in enumerate(rows):
+            row["training_task"] = (
+                "asr_transcription" if index in asr_indices else "dialogue_response"
+            )
+        if self.shuffle:
+            random.Random(self.seed + epoch).shuffle(rows)
+        if self.shuffle or self.asr_replay_ratio:
+            self._epoch += 1
+        for index in range(0, len(rows), self.batch_size):
             yield collate_cached_audio_conversations(
-                self.rows[index : index + self.batch_size],
+                rows[index : index + self.batch_size],
                 self.tokenizer,
                 feature_cache,
                 self.audio_placeholder_id,
@@ -207,10 +244,18 @@ def _build_supervised_sequence(
         )
     if audio_token_count <= 0:
         raise ValueError("audio token count must be positive")
-    response = str(row["assistant_response"]).strip()
+    training_task = str(row.get("training_task", "dialogue_response"))
+    if training_task not in {"dialogue_response", "asr_transcription"}:
+        raise ValueError(f"unsupported training_task: {training_task}")
+    response_field = "user_text" if training_task == "asr_transcription" else "assistant_response"
+    response = str(row[response_field]).strip()
     if not response:
-        raise ValueError("assistant_response cannot be empty")
-    history = _normalise_history(row["dialogue_history"])
+        raise ValueError(f"{response_field} cannot be empty")
+    history = (
+        []
+        if training_task == "asr_transcription"
+        else _normalise_history(row["dialogue_history"])
+    )
     audio_content = (
         AUDIO_START_TOKEN
         + AUDIO_PLACEHOLDER_TOKEN * audio_token_count
@@ -218,7 +263,14 @@ def _build_supervised_sequence(
     )
     while True:
         messages = [
-            {"role": "system", "content": _system_prompt(str(row["sample_id"]))},
+            {
+                "role": "system",
+                "content": (
+                    ASR_SYSTEM_PROMPT
+                    if training_task == "asr_transcription"
+                    else _system_prompt(str(row["sample_id"]))
+                ),
+            },
             *history,
             {"role": "user", "content": audio_content},
         ]
@@ -321,6 +373,7 @@ def collate_cached_audio_conversations(
         audio_features=audio_features,
         audio_attention_mask=audio_attention_mask,
         audio_placeholder_mask=placeholder_mask,
+        task_types=[str(row.get("training_task", "dialogue_response")) for row in rows],
     )
 
 
@@ -376,6 +429,7 @@ def collate_conversations(
         sample_ids=[str(row["sample_id"]) for row in rows],
         dialogue_ids=[str(row["dialogue_id"]) for row in rows],
         audio_placeholder_mask=placeholder_mask,
+        task_types=[str(row.get("training_task", "dialogue_response")) for row in rows],
     )
 
 
@@ -497,10 +551,27 @@ def validate_manifests(train_manifest: Path, dev_manifest: Path) -> dict[str, An
 def validate_config(config: Stage2Config) -> None:
     if config.lora_rank <= 0 or config.lora_alpha <= 0:
         raise ValueError("LoRA rank and alpha must be positive")
-    if config.learning_rate <= 0 or config.steps <= 0 or config.validation_every <= 0:
+    learning_rates = (
+        [config.learning_rate]
+        if config.learning_rate is not None
+        else [config.projector_learning_rate, config.lora_learning_rate]
+    )
+    if (
+        any(rate <= 0 for rate in learning_rates)
+        or config.steps <= 0
+        or config.validation_every <= 0
+    ):
         raise ValueError(
             "learning rate, steps and validation interval must be positive"
         )
+    if config.weight_decay < 0:
+        raise ValueError("weight_decay cannot be negative")
+    if config.gradient_accumulation_steps <= 0:
+        raise ValueError("gradient_accumulation_steps must be positive")
+    if config.max_grad_norm <= 0:
+        raise ValueError("max_grad_norm must be positive")
+    if not 0 <= config.asr_replay_ratio <= 1:
+        raise ValueError("asr_replay_ratio must be in [0, 1]")
     if config.early_stopping_patience < 0:
         raise ValueError("early stopping patience cannot be negative")
     if config.warmup_steps < 0:
@@ -529,12 +600,20 @@ def run_preflight(config: Stage2Config) -> dict[str, Any]:
             "canonical_system_prompt": CANONICAL_SYSTEM_PROMPT,
             "system_prompt_policy": "80% canonical, 20% deterministic equivalent variants",
             "current_user_text_input": False,
-            "supervision": "assistant_response-only",
+            "supervision": "assistant_response-and-asr_transcription",
+            "asr_transcript_prompt_leakage": False,
         },
         "config": {
             "train_manifest": str(config.train_manifest.resolve()),
             "dev_manifest": str(config.dev_manifest.resolve()),
             "learning_rate": config.learning_rate,
+            "projector_learning_rate": config.projector_learning_rate,
+            "lora_learning_rate": config.lora_learning_rate,
+            "weight_decay": config.weight_decay,
+            "gradient_accumulation_steps": config.gradient_accumulation_steps,
+            "max_grad_norm": config.max_grad_norm,
+            "shuffle_seed": config.shuffle_seed,
+            "asr_replay_ratio": config.asr_replay_ratio,
             "steps": config.steps,
             "validation_every": config.validation_every,
             "warmup_steps": config.warmup_steps,
@@ -732,6 +811,64 @@ def _loss_value(output: Any) -> Any:
     )
 
 
+def _supervised_token_count(batch: Any) -> int:
+    """Return the number of shifted, non-masked target tokens in a batch."""
+    labels = getattr(batch, "labels", None)
+    if labels is None:
+        return 1
+    shifted = labels[..., 1:] if labels.ndim >= 2 else labels[1:]
+    count = int(shifted.ne(-100).sum().item())
+    if count <= 0:
+        raise ValueError("training batch has no supervised target tokens")
+    return count
+
+
+def _optimizer_parameter_groups(
+    model: Any, config: Stage2Config
+) -> list[dict[str, Any]]:
+    projector_lr = config.learning_rate or config.projector_learning_rate
+    lora_lr = config.learning_rate or config.lora_learning_rate
+    projector_parameters = []
+    lora_parameters = []
+    unexpected = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if (
+            name.startswith(config.projector_prefix + ".")
+            or ("." + config.projector_prefix + ".") in name
+        ):
+            projector_parameters.append(parameter)
+        elif "lora" in name.lower():
+            lora_parameters.append(parameter)
+        else:
+            unexpected.append(name)
+    if unexpected:
+        raise ValueError(f"unexpected trainable parameters: {unexpected}")
+    groups = []
+    if projector_parameters:
+        groups.append(
+            {
+                "params": projector_parameters,
+                "lr": projector_lr,
+                "weight_decay": config.weight_decay,
+                "group_name": "projector",
+            }
+        )
+    if lora_parameters:
+        groups.append(
+            {
+                "params": lora_parameters,
+                "lr": lora_lr,
+                "weight_decay": config.weight_decay,
+                "group_name": "lora",
+            }
+        )
+    if not groups:
+        raise ValueError("no projector or LoRA parameters are trainable")
+    return groups
+
+
 def _write_loss_curve(records: list[dict[str, Any]], path: Path) -> None:
     width, height = 720, 360
     values = [
@@ -766,7 +903,13 @@ def _write_loss_curve(records: list[dict[str, Any]], path: Path) -> None:
 
 
 def _save_checkpoint(
-    path: Path, model: Any, optimizer: Any, scheduler: Any, step: int, best_loss: float
+    path: Path,
+    model: Any,
+    optimizer: Any,
+    scheduler: Any,
+    step: int,
+    best_loss: float,
+    config: Stage2Config,
 ) -> None:
     import torch
 
@@ -790,6 +933,18 @@ def _save_checkpoint(
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "best_validation_loss": best_loss,
+            "training_config": {
+                "projector_learning_rate": config.projector_learning_rate,
+                "lora_learning_rate": config.lora_learning_rate,
+                "legacy_learning_rate_override": config.learning_rate,
+                "weight_decay": config.weight_decay,
+                "gradient_accumulation_steps": config.gradient_accumulation_steps,
+                "max_grad_norm": config.max_grad_norm,
+                "shuffle_seed": config.shuffle_seed,
+                "asr_replay_ratio": config.asr_replay_ratio,
+                "warmup_steps": config.warmup_steps,
+                "min_learning_rate_ratio": config.min_learning_rate_ratio,
+            },
             "projector_initialization": getattr(
                 checkpoint_model, "projector_initialization", None
             ),
@@ -824,7 +979,9 @@ def train_model(
     trainables = freeze_asr_and_select_trainables(
         base_model, config.asr_encoder_prefix, config.projector_prefix
     )
-    optimizer = torch.optim.AdamW(trainables, lr=config.learning_rate)
+    parameter_groups = _optimizer_parameter_groups(base_model, config)
+    optimizer = torch.optim.AdamW(parameter_groups)
+
     def learning_rate_scale(step: int) -> float:
         if config.warmup_steps and step < config.warmup_steps:
             return (step + 1) / config.warmup_steps
@@ -844,7 +1001,13 @@ def train_model(
     if config.resume_from is not None:
         state = torch.load(config.resume_from, map_location="cpu", weights_only=True)
         base_model.load_state_dict(state["trainable_state"], strict=False)
-        optimizer.load_state_dict(state["optimizer"])
+        try:
+            optimizer.load_state_dict(state["optimizer"])
+        except ValueError as error:
+            raise ValueError(
+                "checkpoint optimizer groups are incompatible with the separated "
+                "projector/LoRA learning-rate groups; start a fresh stability run"
+            ) from error
         scheduler.load_state_dict(state["scheduler"])
         start_step = int(state["step"])
         best_validation = float(state.get("best_validation_loss", best_validation))
@@ -858,43 +1021,91 @@ def train_model(
         except ImportError:
             pass
     for step in range(start_step + 1, config.steps + 1):
-        try:
-            batch = next(train_iterator)
-        except StopIteration:
-            train_iterator = iter(train_batches)
-            batch = next(train_iterator)
+        microbatches = []
+        for _ in range(config.gradient_accumulation_steps):
+            try:
+                batch = next(train_iterator)
+            except StopIteration:
+                train_iterator = iter(train_batches)
+                batch = next(train_iterator)
+            microbatches.append(batch)
         model.train()
-        learning_rate = optimizer.param_groups[0]["lr"]
-        optimizer.zero_grad()
-        loss = _loss_value(model(batch))
-        loss.backward()
+        learning_rates = {
+            group["group_name"]: group["lr"] for group in optimizer.param_groups
+        }
+        optimizer.zero_grad(set_to_none=True)
+        local_token_counts = [_supervised_token_count(batch) for batch in microbatches]
+        global_token_count = torch.tensor(
+            float(sum(local_token_counts)), device=trainables[0].device
+        )
+        if distributed:
+            torch.distributed.all_reduce(global_token_count)
+        weighted_loss_sum = torch.zeros((), device=trainables[0].device)
+        for microbatch_index, (batch, token_count) in enumerate(
+            zip(microbatches, local_token_counts)
+        ):
+            sync_context = (
+                model.no_sync()
+                if distributed and microbatch_index + 1 < len(microbatches)
+                else nullcontext()
+            )
+            with sync_context:
+                loss = _loss_value(model(batch))
+                loss_scale = token_count * world_size / float(global_token_count)
+                (loss * loss_scale).backward()
+            weighted_loss_sum += loss.detach() * token_count
+        grad_norm = torch.nn.utils.clip_grad_norm_(trainables, config.max_grad_norm)
         optimizer.step()
         scheduler.step()
-        loss_value = loss.detach()
         if distributed:
-            torch.distributed.all_reduce(loss_value)
-            loss_value /= world_size
-        record = {"step": step, "loss": float(loss_value), "learning_rate": learning_rate}
+            torch.distributed.all_reduce(weighted_loss_sum)
+        loss_value = weighted_loss_sum / global_token_count
+        record = {
+            "step": step,
+            "loss": float(loss_value),
+            "learning_rate": learning_rates.get(
+                "projector", next(iter(learning_rates.values()))
+            ),
+            "learning_rates": learning_rates,
+            "supervised_tokens": int(global_token_count),
+            "gradient_norm": float(grad_norm),
+            "task_samples": dict(
+                Counter(
+                    task
+                    for batch in microbatches
+                    for task in (getattr(batch, "task_types", None) or ["unknown"])
+                )
+            ),
+        }
         if step % config.validation_every == 0 or step == config.steps:
             model.eval()
             with torch.no_grad():
-                dev_losses = [
-                    _loss_value(model(batch)).detach()
-                    for batch in islice(iter(dev_batches), config.max_validation_batches)
-                ]
-            validation_total = torch.stack(dev_losses).sum()
-            validation_count = torch.tensor(float(len(dev_losses)), device=validation_total.device)
+                validation_total = torch.zeros((), device=trainables[0].device)
+                validation_count = torch.zeros((), device=trainables[0].device)
+                for batch in islice(iter(dev_batches), config.max_validation_batches):
+                    token_count = _supervised_token_count(batch)
+                    validation_total += _loss_value(model(batch)).detach() * token_count
+                    validation_count += token_count
             if distributed:
                 torch.distributed.all_reduce(validation_total)
                 torch.distributed.all_reduce(validation_count)
+            if validation_count.item() <= 0:
+                raise ValueError("validation batches have no supervised target tokens")
             validation_loss = float(validation_total / validation_count)
             record["validation_loss"] = validation_loss
+            record["validation_supervised_tokens"] = int(validation_count)
             if validation_loss < best_validation:
                 best_validation = validation_loss
                 bad_checks = 0
                 if rank == 0:
                     _save_checkpoint(
-                        config.output_dir / "best.pt", model, optimizer, scheduler, step, best_validation
+                        config.output_dir / "best.pt",
+                        model,
+                        optimizer,
+                        scheduler,
+                        step,
+                        best_validation,
+                        config,
                     )
             else:
                 bad_checks += 1
@@ -912,7 +1123,13 @@ def train_model(
         progress.close()
     if rank == 0:
         _save_checkpoint(
-            config.output_dir / "last.pt", model, optimizer, scheduler, records[-1]["step"], best_validation
+            config.output_dir / "last.pt",
+            model,
+            optimizer,
+            scheduler,
+            records[-1]["step"],
+            best_validation,
+            config,
         )
         (config.output_dir / "metrics.jsonl").write_text(
             "".join(json.dumps(row, sort_keys=True) + "\n" for row in records), encoding="utf-8"
@@ -939,11 +1156,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--projector-prefix", default="audio_projector")
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-alpha", type=float, default=16.0)
-    parser.add_argument("--learning-rate", type=float, default=3e-5)
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        help="Legacy override that applies one learning rate to projector and LoRA",
+    )
+    parser.add_argument("--projector-learning-rate", type=float, default=3e-6)
+    parser.add_argument("--lora-learning-rate", type=float, default=1e-5)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--shuffle-seed", type=int, default=3407)
+    parser.add_argument("--asr-replay-ratio", type=float, default=0.3)
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--validation-every", type=int, default=100)
     parser.add_argument("--max-validation-batches", type=int)
-    parser.add_argument("--warmup-steps", type=int, default=1000)
+    parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--min-learning-rate-ratio", type=float, default=0.1)
     parser.add_argument("--early-stopping-patience", type=int, default=0)
     parser.add_argument("--no-progress", action="store_true")
@@ -998,6 +1226,13 @@ def main(argv: list[str] | None = None) -> int:
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         learning_rate=args.learning_rate,
+        projector_learning_rate=args.projector_learning_rate,
+        lora_learning_rate=args.lora_learning_rate,
+        weight_decay=args.weight_decay,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        max_grad_norm=args.max_grad_norm,
+        shuffle_seed=args.shuffle_seed,
+        asr_replay_ratio=args.asr_replay_ratio,
         steps=args.steps,
         validation_every=args.validation_every,
         early_stopping_patience=args.early_stopping_patience,
@@ -1064,6 +1299,9 @@ def main(argv: list[str] | None = None) -> int:
         train_batches = CachedConversationBatchSource(
             train_rows, tokenizer, args.feature_dir, int(audio_placeholder_id),
             args.batch_size, args.max_cached_feature_shards,
+            shuffle=True,
+            seed=args.shuffle_seed + rank,
+            asr_replay_ratio=args.asr_replay_ratio,
         )
         dev_batches = CachedConversationBatchSource(
             dev_rows, tokenizer, args.feature_dir, int(audio_placeholder_id),
