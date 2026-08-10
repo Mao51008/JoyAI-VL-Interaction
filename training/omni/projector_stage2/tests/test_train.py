@@ -400,6 +400,7 @@ def test_mock_training_freezes_asr_and_writes_metrics_checkpoints_curve(tmp_path
         "lora_weight",
     }
     assert state["training_config"]["gradient_accumulation_steps"] == 8
+    assert state["lora_targets"] == []
     assert [group["group_name"] for group in state["optimizer"]["param_groups"]] == [
         "projector",
         "lora",

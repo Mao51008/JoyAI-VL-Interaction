@@ -945,6 +945,13 @@ def _save_checkpoint(
                 "warmup_steps": config.warmup_steps,
                 "min_learning_rate_ratio": config.min_learning_rate_ratio,
             },
+            "lora_targets": sorted(
+                {
+                    name.removeprefix("core.language_model.").rsplit(".", 1)[0]
+                    for name in trainable_state
+                    if ".lora_" in name
+                }
+            ),
             "projector_initialization": getattr(
                 checkpoint_model, "projector_initialization", None
             ),
@@ -1254,8 +1261,6 @@ def main(argv: list[str] | None = None) -> int:
             "--init-projector-checkpoint": args.init_projector_checkpoint,
         }
         missing = [name for name, value in required.items() if value in (None, "")]
-        if not args.lora_target:
-            missing.append("--lora-target")
         if missing:
             raise ValueError("--run requires " + ", ".join(missing))
         import transformers
