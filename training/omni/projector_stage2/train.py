@@ -143,19 +143,23 @@ class CachedConversationBatchSource:
             feature_cache = self.cache_factory(self.feature_dir, self.max_cached_shards)
         epoch = self._epoch
         rows = [dict(row) for row in self.rows]
-        asr_count = round(len(rows) * self.asr_replay_ratio)
-        asr_indices = set(
-            random.Random(self.seed + epoch + 1_000_003).sample(
-                range(len(rows)), asr_count
+        explicit_tasks = ["training_task" in row for row in rows]
+        if any(explicit_tasks) and not all(explicit_tasks):
+            raise ValueError("manifest must either assign training_task for every row or none")
+        if not any(explicit_tasks):
+            asr_count = round(len(rows) * self.asr_replay_ratio)
+            asr_indices = set(
+                random.Random(self.seed + epoch + 1_000_003).sample(
+                    range(len(rows)), asr_count
+                )
             )
-        )
-        for index, row in enumerate(rows):
-            row["training_task"] = (
-                "asr_transcription" if index in asr_indices else "dialogue_response"
-            )
+            for index, row in enumerate(rows):
+                row["training_task"] = (
+                    "asr_transcription" if index in asr_indices else "dialogue_response"
+                )
         if self.shuffle:
             random.Random(self.seed + epoch).shuffle(rows)
-        if self.shuffle or self.asr_replay_ratio:
+        if self.shuffle or (self.asr_replay_ratio and not any(explicit_tasks)):
             self._epoch += 1
         for index in range(0, len(rows), self.batch_size):
             yield collate_cached_audio_conversations(

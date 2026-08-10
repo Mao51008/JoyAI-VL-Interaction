@@ -33,6 +33,24 @@ def select_one_turn_per_dialogue(
     return sorted(selected, key=lambda row: str(row["sample_id"]))
 
 
+def assign_mixed_tasks(
+    rows: Sequence[dict[str, Any]], asr_samples: int, seed: int
+) -> list[dict[str, Any]]:
+    """Annotate a fixed ASR/dialogue mixture without changing selected examples."""
+    if not 0 <= asr_samples <= len(rows):
+        raise ValueError(f"asr_samples must be in [0, {len(rows)}]")
+    asr_indices = set(random.Random(seed).sample(range(len(rows)), asr_samples))
+    return [
+        dict(
+            row,
+            training_task=(
+                "asr_transcription" if index in asr_indices else "dialogue_response"
+            ),
+        )
+        for index, row in enumerate(rows)
+    ]
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -54,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dev-manifest", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--train-samples", type=int, default=32)
+    parser.add_argument("--asr-train-samples", type=int, default=16)
     parser.add_argument("--dev-samples", type=int, default=256)
     parser.add_argument("--seed", type=int, default=20260816)
     args = parser.parse_args(argv)
@@ -62,6 +81,7 @@ def main(argv: list[str] | None = None) -> int:
     train_rows = select_one_turn_per_dialogue(
         load_manifest(args.train_manifest), args.train_samples, args.seed
     )
+    train_rows = assign_mixed_tasks(train_rows, args.asr_train_samples, args.seed + 2)
     dev_rows = select_one_turn_per_dialogue(
         load_manifest(args.dev_manifest), args.dev_samples, args.seed + 1
     )
@@ -82,6 +102,10 @@ def main(argv: list[str] | None = None) -> int:
             "source": str(args.train_manifest.resolve()),
             "samples": len(train_rows),
             "dialogues": len(train_dialogues),
+            "tasks": {
+                "asr_transcription": args.asr_train_samples,
+                "dialogue_response": len(train_rows) - args.asr_train_samples,
+            },
             "manifest": str(train_path.resolve()),
             "sha256": _sha256(train_path),
         },
@@ -92,7 +116,7 @@ def main(argv: list[str] | None = None) -> int:
             "manifest": str(dev_path.resolve()),
             "sha256": _sha256(dev_path),
         },
-        "selection": "one_random_turn_per_dialogue",
+        "selection": "one_random_turn_per_dialogue_with_fixed_task_assignment",
     }
     (args.output_dir / "selection.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",

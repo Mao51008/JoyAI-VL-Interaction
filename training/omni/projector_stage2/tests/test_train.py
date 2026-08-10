@@ -252,6 +252,34 @@ def test_cached_batch_source_applies_deterministic_asr_replay_ratio():
 
 
 @pytest.mark.skipif(torch is None, reason="PyTorch is not installed")
+def test_cached_batch_source_preserves_explicit_task_assignments():
+    class Cache:
+        def get(self, sample_id):
+            return {"features": torch.ones(2, 2)}
+
+    rows = [_row(f"s{index}") for index in range(10)]
+    for index, row in enumerate(rows):
+        row["training_task"] = (
+            "asr_transcription" if index < 4 else "dialogue_response"
+        )
+    source = CachedConversationBatchSource(
+        rows,
+        ChatTokenizer(),
+        Path("cache"),
+        7,
+        batch_size=2,
+        max_cached_shards=1,
+        shuffle=True,
+        seed=19,
+        asr_replay_ratio=0.9,
+        cache_factory=lambda *_: Cache(),
+    )
+    task_types = [task for batch in source for task in batch.task_types]
+    assert task_types.count("asr_transcription") == 4
+    assert task_types.count("dialogue_response") == 6
+
+
+@pytest.mark.skipif(torch is None, reason="PyTorch is not installed")
 def test_model_builder_injects_lora_and_freezes_asr():
     asr = torch.nn.Linear(2, 2)
     llm = torch.nn.Sequential(torch.nn.Linear(2, 2))

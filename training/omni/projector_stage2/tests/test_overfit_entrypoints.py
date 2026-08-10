@@ -2,6 +2,7 @@ import pytest
 
 from training.omni.projector_stage2.evaluate_overfit import summarise_records
 from training.omni.projector_stage2.prepare_overfit_manifests import (
+    assign_mixed_tasks,
     select_one_turn_per_dialogue,
 )
 
@@ -23,6 +24,17 @@ def test_select_one_turn_per_dialogue_is_deterministic_and_unique():
     assert len({row["dialogue_id"] for row in first}) == 3
     with pytest.raises(ValueError, match="only 3 dialogues"):
         select_one_turn_per_dialogue(rows, sample_count=4, seed=7)
+
+
+def test_assign_mixed_tasks_is_fixed_and_has_requested_balance():
+    rows = [_row(f"d{index}", f"s{index}") for index in range(32)]
+    first = assign_mixed_tasks(rows, asr_samples=16, seed=9)
+    second = assign_mixed_tasks(rows, asr_samples=16, seed=9)
+    assert first == second
+    assert sum(row["training_task"] == "asr_transcription" for row in first) == 16
+    assert sum(row["training_task"] == "dialogue_response" for row in first) == 16
+    with pytest.raises(ValueError, match=r"\[0, 32\]"):
+        assign_mixed_tasks(rows, asr_samples=33, seed=9)
 
 
 def test_asr_gate_summary_reports_error_rates_and_format_failures():
