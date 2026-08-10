@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import shutil
+import subprocess
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -36,7 +37,20 @@ def _require_data_root(path: Path) -> Path:
     return resolved
 
 
-def _content_length(url: str) -> int | None:
+def _content_length(url: str, transport: str) -> int | None:
+    if transport == "curl":
+        result = subprocess.run(
+            ["curl", "--fail", "--location", "--silent", "--show-error", "--head", url],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        values = [
+            line.split(":", 1)[1].strip()
+            for line in result.stdout.splitlines()
+            if line.lower().startswith("content-length:")
+        ]
+        return int(values[-1]) if values else None
     request = urllib.request.Request(url, method="HEAD")
     with urllib.request.urlopen(request, timeout=30) as response:
         value = response.headers.get("Content-Length")
@@ -44,19 +58,25 @@ def _content_length(url: str) -> int | None:
 
 
 def _download(
-    url: str, destination: Path, max_bytes: int, run: bool, check_remote: bool
+    url: str, destination: Path, max_bytes: int, run: bool, check_remote: bool, transport: str
 ) -> dict[str, Any]:
     if destination.exists():
         raise FileExistsError(f"refusing to overwrite existing file: {destination}")
-    size = _content_length(url) if run or check_remote else None
+    size = _content_length(url, transport) if run or check_remote else None
     if size is not None and size > max_bytes:
         raise ValueError(f"refusing {url}: {size} bytes exceeds limit {max_bytes}")
     result = {"url": url, "destination": str(destination), "bytes": size, "downloaded": False}
     if not run:
         return result
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(url, timeout=60) as response, destination.open("xb") as handle:
-        shutil.copyfileobj(response, handle)
+    if transport == "curl":
+        subprocess.run(
+            ["curl", "--fail", "--location", "--retry", "3", "--output", str(destination), url],
+            check=True,
+        )
+    else:
+        with urllib.request.urlopen(url, timeout=60) as response, destination.open("xb") as handle:
+            shutil.copyfileobj(response, handle)
     actual = destination.stat().st_size
     if actual > max_bytes:
         raise ValueError(f"download exceeded limit: {destination} is {actual} bytes")
@@ -73,7 +93,11 @@ def _sha256(path: Path) -> str:
 
 
 def plan_downloads(
-    output_root: Path, include_clotho_audio: bool, run: bool, check_remote: bool = False
+    output_root: Path,
+    include_clotho_audio: bool,
+    run: bool,
+    check_remote: bool = False,
+    transport: str = "urllib",
 ) -> list[dict[str, Any]]:
     root = _require_data_root(output_root)
     plans = [
@@ -83,6 +107,7 @@ def plan_downloads(
             512 * 1024**2,
             run,
             check_remote,
+            transport,
         )
     ]
     for name, filename in CLOTHO_AQA_FILES.items():
@@ -93,6 +118,7 @@ def plan_downloads(
                 16 * 1024**2,
                 run,
                 check_remote,
+                transport,
             )
         )
     if include_clotho_audio:
@@ -103,6 +129,7 @@ def plan_downloads(
                 4 * 1024**3,
                 run,
                 check_remote,
+                transport,
             )
         )
     return plans
@@ -114,6 +141,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-root",
         type=Path,
         default=Path("/data/maoyy/datasets/audio_understanding_pilot"),
+    )
+    parser.add_argument(
+        "--transport",
+        choices=("urllib", "curl"),
+        default="urllib",
+        help="Use curl for proxy-compatible server transfers when Python urllib fails.",
     )
     parser.add_argument(
         "--download-clotho-aqa-audio",
@@ -132,7 +165,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     plans = plan_downloads(
-        args.output_root, args.download_clotho_aqa_audio, args.run, args.check_remote
+        args.output_root,
+        args.download_clotho_aqa_audio,
+        args.run,
+        args.check_remote,
+        args.transport,
     )
     print(json.dumps({"run": args.run, "downloads": plans}, ensure_ascii=False, indent=2))
     return 0
