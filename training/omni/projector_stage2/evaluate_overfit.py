@@ -97,7 +97,7 @@ def _prompt_batch(batch: Stage2ConversationBatch) -> Stage2ConversationBatch:
 
 
 def _generate(model: Any, batch: Stage2ConversationBatch, tokenizer: Any, max_new_tokens: int) -> tuple[str, int, bool]:
-    from .model import replace_audio_placeholders
+    from ..projector_stage1.model import replace_audio_placeholders
 
     core_model = getattr(model, "module", model)
     language_model = core_model.core.language_model
