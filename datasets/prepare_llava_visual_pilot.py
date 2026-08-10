@@ -108,8 +108,10 @@ def _split(sample_id: str) -> str:
     return "dev" if int(hashlib.sha256(sample_id.encode()).hexdigest()[:8], 16) % 10 == 0 else "train"
 
 
-def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> int:
+def _write_jsonl(path: Path, rows: list[dict[str, Any]], resume: bool) -> int:
     if path.exists():
+        if resume:
+            return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line)
         raise FileExistsError(f"refusing to overwrite existing manifest: {path}")
     with path.open("x", encoding="utf-8") as handle:
         for row in rows:
@@ -126,6 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--proxy", help="Explicit HTTP proxy forwarded to curl.")
     parser.add_argument("--download-annotation", action="store_true")
     parser.add_argument("--download-images", action="store_true")
+    parser.add_argument("--resume", action="store_true", help="Keep existing manifests and images on a retry.")
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--run", action="store_true", help="Write manifests and requested images.")
     return parser
@@ -163,8 +166,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.run:
         output_dir.mkdir(parents=True, exist_ok=True)
         summary = {
-            "train": _write_jsonl(output_dir / "llava_coco_source_train.jsonl", train_rows),
-            "dev": _write_jsonl(output_dir / "llava_coco_source_dev.jsonl", dev_rows),
+            "train": _write_jsonl(
+                output_dir / "llava_coco_source_train.jsonl", train_rows, args.resume
+            ),
+            "dev": _write_jsonl(
+                output_dir / "llava_coco_source_dev.jsonl", dev_rows, args.resume
+            ),
         }
         if args.download_images:
             try:
