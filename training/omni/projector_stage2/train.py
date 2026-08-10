@@ -50,6 +50,14 @@ FORMAL_MANIFEST_FIELDS = {
     "dialogue_history",
     "provenance",
 }
+VISION_DISTILLATION_FIELDS = {
+    "sample_id",
+    "split",
+    "image_path",
+    "prompt",
+    "teacher_response",
+    "provenance",
+}
 FROZEN_STAGE1_PROJECTOR_SHA256 = (
     "4e1573a3091d7ed438af16cee130d28e11b9701f5c22eb830e179e2ef315a22c"
 )
@@ -60,6 +68,8 @@ class Stage2Config:
     train_manifest: Path
     dev_manifest: Path
     output_dir: Path
+    vision_train_manifest: Path | None = None
+    vision_dev_manifest: Path | None = None
     asr_encoder_prefix: str = "audio_encoder"
     projector_prefix: str = "audio_projector"
     lora_rank: int = 8
@@ -95,6 +105,8 @@ class Stage2ConversationBatch:
     audio_attention_mask: Any = None
     audio_placeholder_mask: Any = None
     task_types: list[str] | None = None
+    modality: str = "audio"
+    vision_inputs: dict[str, Any] | None = None
 
 
 class CachedConversationBatchSource:
@@ -168,6 +180,140 @@ class CachedConversationBatchSource:
                 feature_cache,
                 self.audio_placeholder_id,
             )
+
+
+def load_vision_distillation_manifest(path: Path) -> list[dict[str, Any]]:
+    """Load fixed teacher-response image examples without accepting unlabeled images."""
+    if not path.is_file():
+        raise FileNotFoundError(f"vision distillation manifest does not exist: {path}")
+    rows = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if not rows:
+        raise ValueError(f"vision distillation manifest is empty: {path}")
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise TypeError(f"vision distillation row {index} is not an object: {path}")
+        missing = VISION_DISTILLATION_FIELDS - row.keys()
+        if missing:
+            raise ValueError(
+                f"vision distillation row {index} lacks fields {sorted(missing)}: {path}"
+            )
+        if not str(row["prompt"]).strip() or not str(row["teacher_response"]).strip():
+            raise ValueError(f"vision distillation row {index} has an empty prompt or teacher_response")
+        image_path = Path(str(row["image_path"]))
+        if not image_path.is_absolute():
+            image_path = path.parent / image_path
+        if not image_path.is_file():
+            raise FileNotFoundError(f"vision distillation image does not exist: {image_path}")
+        row["_image_path"] = str(image_path.resolve())
+    return rows
+
+
+def collate_vision_distillation(
+    row: dict[str, Any], processor: Any
+) -> Stage2ConversationBatch:
+    """Build one image-conditioned teacher-response batch using the official processor."""
+    import torch
+
+    image_content = {"type": "image", "image": row["_image_path"]}
+    prompt_messages = [
+        {"role": "user", "content": [image_content, {"type": "text", "text": row["prompt"]}]}
+    ]
+    full_messages = [
+        *prompt_messages,
+        {"role": "assistant", "content": row["teacher_response"]},
+    ]
+    prompt = processor.apply_chat_template(
+        prompt_messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+    )
+    full = processor.apply_chat_template(
+        full_messages,
+        tokenize=True,
+        add_generation_prompt=False,
+        return_dict=True,
+        return_tensors="pt",
+    )
+    prompt_ids = prompt["input_ids"]
+    input_ids = full["input_ids"]
+    if input_ids.shape[0] != 1 or prompt_ids.shape[0] != 1:
+        raise ValueError("vision distillation processor must return exactly one sequence")
+    prompt_length = int(prompt_ids.shape[1])
+    if input_ids.shape[1] <= prompt_length or not torch.equal(
+        input_ids[:, :prompt_length], prompt_ids
+    ):
+        raise ValueError("vision distillation chat template did not preserve the generation prefix")
+    labels = input_ids.clone()
+    labels[:, :prompt_length] = -100
+    vision_inputs = {
+        key: value
+        for key, value in dict(full).items()
+        if key not in {"labels"}
+    }
+    return Stage2ConversationBatch(
+        input_ids=input_ids,
+        labels=labels,
+        attention_mask=full["attention_mask"],
+        sample_ids=[str(row["sample_id"])],
+        dialogue_ids=[str(row["sample_id"])],
+        task_types=["vision_distillation"],
+        modality="vision_distillation",
+        vision_inputs=vision_inputs,
+    )
+
+
+class VisionDistillationBatchSource:
+    """Reiterable single-image batches for offline teacher-response distillation."""
+
+    def __init__(
+        self, rows: Sequence[dict[str, Any]], processor: Any, shuffle: bool = False, seed: int = 3407
+    ) -> None:
+        self.rows = [dict(row) for row in rows]
+        self.processor = processor
+        self.shuffle = shuffle
+        self.seed = seed
+        self._epoch = 0
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __iter__(self) -> Iterator[Stage2ConversationBatch]:
+        rows = [dict(row) for row in self.rows]
+        if self.shuffle:
+            random.Random(self.seed + self._epoch).shuffle(rows)
+            self._epoch += 1
+        for row in rows:
+            yield collate_vision_distillation(row, self.processor)
+
+
+class MixedStage2BatchSource:
+    """Interleave complete audio and vision batches without mixing modalities in one batch."""
+
+    def __init__(self, sources: Sequence[Iterable[Stage2ConversationBatch]], shuffle: bool = False, seed: int = 3407) -> None:
+        if not sources or any(not hasattr(source, "__len__") or len(source) == 0 for source in sources):
+            raise ValueError("mixed batch sources must all be non-empty and sized")
+        self.sources = list(sources)
+        self.shuffle = shuffle
+        self.seed = seed
+        self._epoch = 0
+
+    def __len__(self) -> int:
+        return sum(len(source) for source in self.sources)
+
+    def __iter__(self) -> Iterator[Stage2ConversationBatch]:
+        schedule = [index for index, source in enumerate(self.sources) for _ in range(len(source))]
+        if self.shuffle:
+            random.Random(self.seed + self._epoch).shuffle(schedule)
+            self._epoch += 1
+        iterators = [iter(source) for source in self.sources]
+        for index in schedule:
+            yield next(iterators[index])
 
 
 def _system_prompt(sample_id: str) -> str:
@@ -552,6 +698,26 @@ def validate_manifests(train_manifest: Path, dev_manifest: Path) -> dict[str, An
     }
 
 
+def validate_vision_distillation_manifests(
+    train_manifest: Path, dev_manifest: Path
+) -> dict[str, Any]:
+    train_rows = load_vision_distillation_manifest(train_manifest)
+    dev_rows = load_vision_distillation_manifest(dev_manifest)
+    if any(row["split"] != "train" for row in train_rows):
+        raise ValueError("vision train manifest contains a non-train row")
+    if any(row["split"] != "dev" for row in dev_rows):
+        raise ValueError("vision dev manifest contains a non-dev row")
+    overlap = {row["sample_id"] for row in train_rows} & {row["sample_id"] for row in dev_rows}
+    if overlap:
+        raise ValueError(f"vision train/dev leakage detected: {sorted(overlap)[:10]}")
+    return {
+        "train_samples": len(train_rows),
+        "dev_samples": len(dev_rows),
+        "train_manifest_sha256": _sha256(train_manifest),
+        "dev_manifest_sha256": _sha256(dev_manifest),
+    }
+
+
 def validate_config(config: Stage2Config) -> None:
     if config.lora_rank <= 0 or config.lora_alpha <= 0:
         raise ValueError("LoRA rank and alpha must be positive")
@@ -572,6 +738,8 @@ def validate_config(config: Stage2Config) -> None:
         raise ValueError("weight_decay cannot be negative")
     if config.gradient_accumulation_steps <= 0:
         raise ValueError("gradient_accumulation_steps must be positive")
+    if (config.vision_train_manifest is None) != (config.vision_dev_manifest is None):
+        raise ValueError("vision train and dev manifests must be provided together")
     if config.max_grad_norm <= 0:
         raise ValueError("max_grad_norm must be positive")
     if not 0 <= config.asr_replay_ratio <= 1:
@@ -593,6 +761,10 @@ def validate_config(config: Stage2Config) -> None:
 def run_preflight(config: Stage2Config) -> dict[str, Any]:
     validate_config(config)
     manifest_info = validate_manifests(config.train_manifest, config.dev_manifest)
+    if config.vision_train_manifest is not None:
+        manifest_info["vision_distillation"] = validate_vision_distillation_manifests(
+            config.vision_train_manifest, config.vision_dev_manifest
+        )
     config.output_dir.mkdir(parents=True)
     result = {
         "schema_version": 1,
@@ -736,6 +908,16 @@ def build_stage2_model(
             self.projector_initialization = projector_initialization
 
         def forward(self, batch: Any) -> Any:
+            if getattr(batch, "modality", "audio") == "vision_distillation":
+                if not batch.vision_inputs:
+                    raise TypeError("vision distillation batch must include processor inputs")
+                device = next(self.parameters()).device
+                inputs = {
+                    name: value.to(device) if hasattr(value, "to") else value
+                    for name, value in batch.vision_inputs.items()
+                }
+                inputs["labels"] = batch.labels.to(device)
+                return self.core.language_model(**inputs)
             required = (
                 "input_ids",
                 "labels",
@@ -1160,6 +1342,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-manifest", type=Path, required=True)
     parser.add_argument("--dev-manifest", type=Path, required=True)
     parser.add_argument(
+        "--vision-train-manifest",
+        type=Path,
+        help="Offline teacher-response image manifest mixed with audio training batches",
+    )
+    parser.add_argument(
+        "--vision-dev-manifest",
+        type=Path,
+        help="Offline teacher-response image manifest used for validation",
+    )
+    parser.add_argument(
         "--feature-dir", type=Path, help="Frozen ASR feature cache used by --run"
     )
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -1232,6 +1424,8 @@ def main(argv: list[str] | None = None) -> int:
         train_manifest=args.train_manifest,
         dev_manifest=args.dev_manifest,
         output_dir=args.output_dir,
+        vision_train_manifest=args.vision_train_manifest,
+        vision_dev_manifest=args.vision_dev_manifest,
         asr_encoder_prefix=args.asr_encoder_prefix,
         projector_prefix=args.projector_prefix,
         lora_rank=args.lora_rank,
@@ -1281,6 +1475,15 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("LLM tokenizer has no <|vision_pad|> audio placeholder")
         train_rows = load_manifest(args.train_manifest)
         dev_rows = load_manifest(args.dev_manifest)
+        vision_train_rows: list[dict[str, Any]] = []
+        vision_dev_rows: list[dict[str, Any]] = []
+        processor = None
+        if args.vision_train_manifest is not None or args.vision_dev_manifest is not None:
+            if args.vision_train_manifest is None or args.vision_dev_manifest is None:
+                raise ValueError("--vision-train-manifest and --vision-dev-manifest must be provided together")
+            vision_train_rows = load_vision_distillation_manifest(args.vision_train_manifest)
+            vision_dev_rows = load_vision_distillation_manifest(args.vision_dev_manifest)
+            processor = transformers.AutoProcessor.from_pretrained(args.llm_model)
         cache_metadata = validate_feature_cache(
             args.feature_dir, [*train_rows, *dev_rows]
         )
@@ -1305,17 +1508,35 @@ def main(argv: list[str] | None = None) -> int:
             model = DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
         train_rows = train_rows[rank::world_size]
         dev_rows = dev_rows[rank::world_size]
-        train_batches = CachedConversationBatchSource(
+        train_batches: Any = CachedConversationBatchSource(
             train_rows, tokenizer, args.feature_dir, int(audio_placeholder_id),
             args.batch_size, args.max_cached_feature_shards,
             shuffle=True,
             seed=args.shuffle_seed + rank,
             asr_replay_ratio=args.asr_replay_ratio,
         )
-        dev_batches = CachedConversationBatchSource(
+        dev_batches: Any = CachedConversationBatchSource(
             dev_rows, tokenizer, args.feature_dir, int(audio_placeholder_id),
             args.batch_size, args.max_cached_feature_shards,
         )
+        if processor is not None:
+            vision_train_rows = vision_train_rows[rank::world_size]
+            vision_dev_rows = vision_dev_rows[rank::world_size]
+            if not vision_train_rows or not vision_dev_rows:
+                raise ValueError("every distributed rank must receive vision distillation samples")
+            train_batches = MixedStage2BatchSource(
+                [
+                    train_batches,
+                    VisionDistillationBatchSource(
+                        vision_train_rows, processor, shuffle=True, seed=args.shuffle_seed + rank
+                    ),
+                ],
+                shuffle=True,
+                seed=args.shuffle_seed + rank,
+            )
+            dev_batches = MixedStage2BatchSource(
+                [dev_batches, VisionDistillationBatchSource(vision_dev_rows, processor)],
+            )
         result = train_model(model, train_batches, dev_batches, config)
     if rank == 0:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))

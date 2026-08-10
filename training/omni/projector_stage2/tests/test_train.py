@@ -18,10 +18,13 @@ from training.omni.projector_stage2.train import (
     _optimizer_parameter_groups,
     build_parser,
     build_stage2_model,
+    collate_vision_distillation,
     collate_cached_audio_conversations,
     collate_conversations,
     freeze_asr_and_select_trainables,
+    load_vision_distillation_manifest,
     load_stage1_projector_initialization,
+    MixedStage2BatchSource,
     run_preflight,
     train_model,
 )
@@ -110,6 +113,19 @@ class ChatTokenizer:
         return ids
 
 
+class VisionProcessor:
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, return_dict, return_tensors):
+        assert tokenize and return_dict and return_tensors == "pt"
+        has_response = any(message["role"] == "assistant" for message in messages)
+        ids = [1, 2, 3, 4] if has_response else [1, 2, 3]
+        return {
+            "input_ids": torch.tensor([ids]),
+            "attention_mask": torch.ones((1, len(ids)), dtype=torch.long),
+            "pixel_values": torch.ones((1, 3)),
+            "image_grid_thw": torch.tensor([[1, 1, 1]]),
+        }
+
+
 def test_cli_help_and_preflight_writes_contract(tmp_path, capsys):
     with pytest.raises(SystemExit) as error:
         build_parser().parse_args(["--help"])
@@ -158,6 +174,33 @@ def test_asr_replay_supervises_transcript_without_leaking_it_into_prompt():
     assert [message["role"] for message in prompt_messages] == ["system", "user"]
     assert "SECRET CURRENT TRANSCRIPT" not in json.dumps(prompt_messages)
     assert "Transcribe" in prompt_messages[0]["content"]
+
+
+@pytest.mark.skipif(torch is None, reason="PyTorch is not installed")
+def test_vision_distillation_uses_only_fixed_teacher_response(tmp_path):
+    image = tmp_path / "image.jpg"
+    image.write_bytes(b"fixture")
+    row = {
+        "sample_id": "vision-1",
+        "split": "train",
+        "image_path": image.name,
+        "prompt": "What is in the image?",
+        "teacher_response": "A fixture image.",
+        "provenance": {"teacher_model": "JoyAI-VL"},
+    }
+    manifest = tmp_path / "vision.jsonl"
+    manifest.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    loaded = load_vision_distillation_manifest(manifest)
+    batch = collate_vision_distillation(loaded[0], VisionProcessor())
+    assert batch.modality == "vision_distillation"
+    assert batch.task_types == ["vision_distillation"]
+    assert batch.labels.tolist() == [[-100, -100, -100, 4]]
+    assert batch.vision_inputs["pixel_values"].shape == (1, 3)
+
+
+def test_mixed_source_preserves_all_batches():
+    source = MixedStage2BatchSource([["audio-1", "audio-2"], ["vision-1"]], shuffle=False)
+    assert list(source) == ["audio-1", "audio-2", "vision-1"]
 
 
 @pytest.mark.skipif(torch is None, reason="PyTorch is not installed")
@@ -337,6 +380,40 @@ def test_audio_features_change_inputs_and_loss():
     assert first.labels[0, :-2].eq(-100).all()
     assert not torch.equal(first.audio_features, second.audio_features)
     assert not torch.equal(loss_one, loss_two)
+
+
+@pytest.mark.skipif(torch is None, reason="PyTorch is not installed")
+def test_model_routes_vision_distillation_through_language_model(tmp_path):
+    class TinyVisionLLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = torch.nn.Embedding(16, 2)
+            self.proj = torch.nn.Linear(2, 2)
+
+        def get_input_embeddings(self):
+            return self.embedding
+
+        def forward(self, input_ids=None, pixel_values=None, labels=None, **kwargs):
+            assert input_ids is not None
+            assert pixel_values is not None
+            assert labels is not None
+            return (self.proj(self.embedding(input_ids)).sum() + pixel_values.sum()).square()
+
+    image = tmp_path / "image.jpg"
+    image.write_bytes(b"fixture")
+    batch = collate_vision_distillation(
+        {
+            "sample_id": "vision-1",
+            "_image_path": str(image),
+            "prompt": "Describe this.",
+            "teacher_response": "A fixture.",
+        },
+        VisionProcessor(),
+    )
+    model = build_stage2_model(
+        torch.nn.Linear(2, 2), TinyVisionLLM(), 2, 2, ["proj"], 1, 2.0
+    )
+    assert model(batch).isfinite()
 
 
 def test_sequence_rejects_legacy_text_only_rows():
