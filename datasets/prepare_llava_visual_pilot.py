@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import subprocess
@@ -157,6 +158,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--proxy", help="Explicit HTTP proxy forwarded to curl.")
     parser.add_argument("--download-annotation", action="store_true")
     parser.add_argument("--download-images", action="store_true")
+    parser.add_argument("--download-workers", type=int, default=8)
     parser.add_argument("--resume", action="store_true", help="Keep existing manifests and images on a retry.")
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--run", action="store_true", help="Write manifests and requested images.")
@@ -203,13 +205,27 @@ def main(argv: list[str] | None = None) -> int:
             ),
         }
         if args.download_images:
+            if args.download_workers <= 0:
+                raise ValueError("--download-workers must be positive")
             try:
                 from tqdm import tqdm
             except ImportError:
                 tqdm = lambda items, **_: items
-            for row in tqdm(selected, desc="COCO images", unit="image", disable=args.no_progress):
+
+            def download_row(row: dict[str, Any]) -> None:
                 destination = image_dir / row["relative_image_path"]
                 _download(row["source_image_url"], destination, args.proxy, resume=True)
+
+            with ThreadPoolExecutor(max_workers=args.download_workers) as executor:
+                pending = executor.map(download_row, selected)
+                for _ in tqdm(
+                    pending,
+                    total=len(selected),
+                    desc="COCO images",
+                    unit="image",
+                    disable=args.no_progress,
+                ):
+                    pass
             summary["images"] = len(selected)
     else:
         summary = {"train": len(train_rows), "dev": len(dev_rows), "images": len(selected)}
