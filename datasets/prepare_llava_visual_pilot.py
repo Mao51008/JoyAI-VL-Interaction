@@ -105,9 +105,12 @@ def select_single_turn_rows(rows: list[dict[str, Any]], count: int) -> list[dict
         image = _coco_url(str(row.get("image", "")))
         if image is None:
             continue
-        sample_id = "llava:" + str(row.get("id", ""))
-        if sample_id == "llava:":
+        source_id = str(row.get("id", ""))
+        image_name = str(row.get("image", ""))
+        if not source_id or not image_name:
             continue
+        sample_key = f"{source_id}\0{image_name}\0{prompt}"
+        sample_id = "llava:" + hashlib.sha256(sample_key.encode("utf-8")).hexdigest()[:20]
         source_url, relative_path = image
         selected.append(
             (
