@@ -1,8 +1,7 @@
 """Build bounded training manifests for the audio-understanding pilot.
 
     The script does not download media.  VoiceAssistant rows retain only user-audio
-    to assistant-text turns; Clotho-AQA rows retain only unanimous three-annotator
-    answers.
+    to assistant-text turns; Clotho-AQA rows retain exact-answer consensus.
 """
 
 from __future__ import annotations
@@ -91,7 +90,7 @@ def load_clotho_consensus(path: Path, split: str) -> tuple[list[dict[str, Any]],
     for (filename, question), answers in grouped.items():
         counts = Counter(answers)
         answer, votes = max(counts.items(), key=lambda item: (item[1], item[0]))
-        if len(answers) != 3 or votes != 3:
+        if votes < 2:
             rejected += 1
             continue
         sample_id = "clotho_aqa:" + hashlib.sha256(
@@ -110,7 +109,7 @@ def load_clotho_consensus(path: Path, split: str) -> tuple[list[dict[str, Any]],
                     "dataset": "Clotho-AQA",
                     "answer_votes": votes,
                     "annotation_count": len(answers),
-                    "consensus_rule": "all_three_exact_answers",
+                    "consensus_rule": "at_least_two_exact_answers",
                 },
             }
         )
