@@ -224,7 +224,10 @@ def collate_vision_distillation(
     ]
     full_messages = [
         *prompt_messages,
-        {"role": "assistant", "content": row["teacher_response"]},
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": row["teacher_response"]}],
+        },
     ]
     prompt = processor.apply_chat_template(
         prompt_messages,

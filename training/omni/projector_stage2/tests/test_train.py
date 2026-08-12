@@ -114,8 +114,18 @@ class ChatTokenizer:
 
 
 class VisionProcessor:
+    def __init__(self):
+        self.calls = []
+
     def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, return_dict, return_tensors):
         assert tokenize and return_dict and return_tensors == "pt"
+        self.calls.append(messages)
+        for message in messages:
+            if message["role"] == "assistant":
+                assert isinstance(message["content"], list)
+                assert len(message["content"]) == 1
+                assert message["content"][0]["type"] == "text"
+                assert isinstance(message["content"][0]["text"], str)
         has_response = any(message["role"] == "assistant" for message in messages)
         ids = [1, 2, 3, 4] if has_response else [1, 2, 3]
         return {
@@ -191,11 +201,13 @@ def test_vision_distillation_uses_only_fixed_teacher_response(tmp_path):
     manifest = tmp_path / "vision.jsonl"
     manifest.write_text(json.dumps(row) + "\n", encoding="utf-8")
     loaded = load_vision_distillation_manifest(manifest)
-    batch = collate_vision_distillation(loaded[0], VisionProcessor())
+    processor = VisionProcessor()
+    batch = collate_vision_distillation(loaded[0], processor)
     assert batch.modality == "vision_distillation"
     assert batch.task_types == ["vision_distillation"]
     assert batch.labels.tolist() == [[-100, -100, -100, 4]]
     assert batch.vision_inputs["pixel_values"].shape == (1, 3)
+    assert processor.calls[1][-1]["content"] == [{"type": "text", "text": "A fixture image."}]
 
 
 def test_mixed_source_preserves_all_batches():
