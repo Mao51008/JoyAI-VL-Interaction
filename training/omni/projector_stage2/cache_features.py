@@ -39,7 +39,7 @@ def _load_manifest(path: Path) -> list[dict[str, Any]]:
 
 
 def _load_rows(
-    manifests: list[Path], limit: int | None
+    manifests: list[Path], limit: int | None, training_task: str | None = None
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     rows: list[dict[str, Any]] = []
     fingerprints: list[dict[str, str]] = []
@@ -47,6 +47,8 @@ def _load_rows(
     for manifest in manifests:
         resolved = manifest.resolve()
         for row in _load_manifest(resolved):
+            if training_task is not None and row.get("training_task") != training_task:
+                continue
             sample_id = str(row["sample_id"])
             if sample_id in seen_ids:
                 raise ValueError(f"duplicate sample_id across manifests: {sample_id}")
@@ -149,6 +151,7 @@ def cache_features(
     progress_file: Path | None = None,
     progress_every: int = 100,
     no_progress: bool = False,
+    training_task: str | None = None,
 ) -> dict[str, Any]:
     """Extract frozen ASR features once; refuse to reuse an output directory."""
     if output_dir.exists():
@@ -159,7 +162,7 @@ def cache_features(
         raise ValueError("shard_size must be positive")
     if progress_every <= 0:
         raise ValueError("progress_every must be positive")
-    all_rows, manifest_fingerprints = _load_rows(manifests, limit)
+    all_rows, manifest_fingerprints = _load_rows(manifests, limit, training_task)
     rows = _select_shard_rows(all_rows, num_shards, shard_index)
     cache_part_index = shard_index
 
@@ -317,12 +320,7 @@ def merge_feature_cache_parts(
             raise ValueError(f"unsupported cache schema in {part_dir}")
         identity = {
             key: metadata.get(key)
-            for key in (
-                "audio_model",
-                "audio_model_revision",
-                "audio_model_config_sha256",
-                "target_sample_rate",
-            )
+            for key in ("audio_model", "audio_model_revision", "audio_model_config_sha256")
         }
         if reference is None:
             reference = identity
@@ -341,12 +339,22 @@ def merge_feature_cache_parts(
             ):
                 raise ValueError(f"cache part fingerprint mismatch: {sample_id}")
             seen.add(sample_id)
-            merged.append(
-                {
-                    **record,
-                    "shard": os.path.relpath(part_dir / record["shard"], output_dir),
-                }
-            )
+            if "shard" in record:
+                merged.append(
+                    {
+                        **record,
+                        "shard": os.path.relpath(part_dir / record["shard"], output_dir),
+                    }
+                )
+            elif "path" in record:
+                merged.append(
+                    {
+                        **record,
+                        "path": os.path.relpath(part_dir / record["path"], output_dir),
+                    }
+                )
+            else:
+                raise ValueError(f"cache record lacks shard/path: {sample_id}")
     missing = [sample_id for sample_id in expected if sample_id not in seen]
     if missing:
         raise ValueError(f"cache parts are incomplete: missing={missing[:5]}")
@@ -360,7 +368,7 @@ def merge_feature_cache_parts(
         "total_samples": len(expected_rows),
         "samples": len(merged),
         "parts": [str(directory.resolve()) for directory in part_dirs],
-        "shards": len({record["shard"] for record in merged}),
+        "shards": len({record.get("shard", record.get("path")) for record in merged}),
     }
     (output_dir / "index.json").write_text(
         json.dumps(merged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -387,6 +395,7 @@ def main() -> None:
     parser.add_argument("--progress-file", type=Path)
     parser.add_argument("--progress-every", type=int, default=100)
     parser.add_argument("--no-progress", action="store_true")
+    parser.add_argument("--training-task")
     args = parser.parse_args()
     if args.merge_part:
         result = merge_feature_cache_parts(
@@ -411,6 +420,7 @@ def main() -> None:
             progress_file=args.progress_file,
             progress_every=args.progress_every,
             no_progress=args.no_progress,
+            training_task=args.training_task,
         )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
 
