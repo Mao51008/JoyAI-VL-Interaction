@@ -39,7 +39,10 @@ def _load_manifest(path: Path) -> list[dict[str, Any]]:
 
 
 def _load_rows(
-    manifests: list[Path], limit: int | None, training_task: str | None = None
+    manifests: list[Path],
+    limit: int | None,
+    training_task: str | None = None,
+    provenance_dataset: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     rows: list[dict[str, Any]] = []
     fingerprints: list[dict[str, str]] = []
@@ -49,6 +52,10 @@ def _load_rows(
         for row in _load_manifest(resolved):
             if training_task is not None and row.get("training_task") != training_task:
                 continue
+            if provenance_dataset is not None:
+                provenance = row.get("provenance", {})
+                if not isinstance(provenance, dict) or provenance.get("dataset") != provenance_dataset:
+                    continue
             sample_id = str(row["sample_id"])
             if sample_id in seen_ids:
                 raise ValueError(f"duplicate sample_id across manifests: {sample_id}")
@@ -152,6 +159,7 @@ def cache_features(
     progress_every: int = 100,
     no_progress: bool = False,
     training_task: str | None = None,
+    provenance_dataset: str | None = None,
 ) -> dict[str, Any]:
     """Extract frozen ASR features once; refuse to reuse an output directory."""
     if output_dir.exists():
@@ -162,7 +170,9 @@ def cache_features(
         raise ValueError("shard_size must be positive")
     if progress_every <= 0:
         raise ValueError("progress_every must be positive")
-    all_rows, manifest_fingerprints = _load_rows(manifests, limit, training_task)
+    all_rows, manifest_fingerprints = _load_rows(
+        manifests, limit, training_task, provenance_dataset
+    )
     rows = _select_shard_rows(all_rows, num_shards, shard_index)
     cache_part_index = shard_index
 
@@ -396,6 +406,7 @@ def main() -> None:
     parser.add_argument("--progress-every", type=int, default=100)
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--training-task")
+    parser.add_argument("--provenance-dataset")
     args = parser.parse_args()
     if args.merge_part:
         result = merge_feature_cache_parts(
@@ -421,6 +432,7 @@ def main() -> None:
             progress_every=args.progress_every,
             no_progress=args.no_progress,
             training_task=args.training_task,
+            provenance_dataset=args.provenance_dataset,
         )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
 

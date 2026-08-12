@@ -8,6 +8,7 @@ TRAIN_MANIFEST="${TRAIN_MANIFEST:?set TRAIN_MANIFEST}"
 DEV_MANIFEST="${DEV_MANIFEST:?set DEV_MANIFEST}"
 OUTPUT_ROOT="${OUTPUT_ROOT:?set OUTPUT_ROOT}"
 TRAINING_TASK="${TRAINING_TASK:-}"
+PROVENANCE_DATASET="${PROVENANCE_DATASET:-}"
 WORKERS=4
 
 test ! -e "$OUTPUT_ROOT"
@@ -18,6 +19,9 @@ pids=()
 task_args=()
 if [ -n "$TRAINING_TASK" ]; then
   task_args+=(--training-task "$TRAINING_TASK")
+fi
+if [ -n "$PROVENANCE_DATASET" ]; then
+  task_args+=(--provenance-dataset "$PROVENANCE_DATASET")
 fi
 for shard_index in 0 1 2 3; do
   CUDA_VISIBLE_DEVICES="$shard_index" "$PYTHON_BIN" -m training.omni.projector_stage2.cache_features \
