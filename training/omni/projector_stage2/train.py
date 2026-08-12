@@ -463,9 +463,9 @@ def collate_cached_audio_conversations(
     tokenizer: Any,
     feature_cache: Any,
     audio_placeholder_id: int,
-    max_length: int = 4096,
+    max_length: int = 2048,
 ) -> Stage2ConversationBatch:
-    """Create text tensors plus padded cached ASR features and replacement masks."""
+    """Create bounded text tensors plus padded cached ASR features and replacement masks."""
     import torch
     from torch.nn.utils.rnn import pad_sequence
 
