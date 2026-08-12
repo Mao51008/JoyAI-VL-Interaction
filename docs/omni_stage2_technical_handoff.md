@@ -57,17 +57,17 @@ nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=c
 Qwen3-ASR-1.7B:
 /data/maoyy/models/Qwen3-ASR-1.7B
 
-JoyAI-VL-Interaction（Stage2 待微调主模型）:
+JoyAI-VL-Interaction（Stage2 待微调主模型；也是视觉教师的原始基座）:
 /data/maoyy/models/jdopensource/JoyAI-VL-Interaction
 
-Qwen3-VL-4B-Instruct（仅离线视觉教师）:
+Qwen3-VL-4B-Instruct（运行时总结模型；不参与本阶段训练或蒸馏）:
 /data/maoyy/models/Qwen3-VL-4B-Instruct
 
 Qwen3-TTS:
 /data/maoyy/models/Qwen3-TTS-12Hz-1.7B-CustomVoice
 ~~~
 
-Stage2 必须加载 JoyAI-VL-Interaction。Qwen3-VL-4B-Instruct 只能用于生成固定的视觉教师回复，绝不能作为 Stage2 的 `--llm-model`。Stage2 runtime 从冻结 feature cache 读取 ASR 特征，--asr-model 不能取代必需的 --feature-dir。
+Stage2 必须加载 JoyAI-VL-Interaction。视觉教师也必须是训练前、未经过本轮 Stage2 更新的原始 JoyAI-VL-Interaction。Qwen3-VL-4B-Instruct 是线上总结模型，本阶段完全不用：既不能作为 Stage2 的 `--llm-model`，也不能生成教师回复。Stage2 runtime 从冻结 feature cache 读取 ASR 特征，--asr-model 不能取代必需的 --feature-dir。
 
 唯一通过 SHA256 校验的候选 Stage1 初始化：
 
@@ -127,20 +127,20 @@ dialogue_history, provenance
 
 因此 Clotho/VoiceAssistant 的 generic JSONL 不能直接传给 --train-manifest，必须先适配并为每条记录建立匹配的冻结 ASR feature cache。
 
-视觉 retention 数据已经完成：
+视觉 retention 的图像和 source manifest 已完成，但教师标签需要重生成：
 
 ~~~text
 图像目录：
 /data/maoyy/datasets/vlm/coco_selected
 
-训练教师 manifest，2702 条：
+错误教师训练 manifest，2702 条，保留追溯但禁止训练：
 /data/maoyy/datasets/audio_understanding_pilot/llava/manifests_direct/teacher_train_complete.jsonl
 
-验证教师 manifest，298 条：
+错误教师验证 manifest，298 条，保留追溯但禁止训练：
 /data/maoyy/datasets/audio_understanding_pilot/llava/manifests_direct/teacher_dev.jsonl
 ~~~
 
-教师是本机 Qwen3-VL-4B-Instruct，确定性生成 do_sample=False、max_new_tokens=128。训练时不重新加载教师。旧 llava/images 已删除；HF coco2014_hf 的 image_id 是 Karpathy 重排索引，不能按 LLaVA 原 filename 直接匹配。
+上述标签错误地由 Qwen3-VL-4B-Instruct（总结模型）生成，不能作为蒸馏目标。必须以训练开始前、未经过本轮更新的原始 JoyAI-VL-Interaction，使用 do_sample=False、max_new_tokens=128，重新生成到新的 teacher_joyai_train_complete.jsonl 和 teacher_joyai_dev.jsonl；训练时不重新加载教师。旧 llava/images 已删除；HF coco2014_hf 的 image_id 是 Karpathy 重排索引，不能按 LLaVA 原 filename 直接匹配。
 
 ## 已知工作树改动与错误
 
@@ -190,7 +190,7 @@ CPU preflight 模板：替换所有尖括号路径；不加载 GPU 模型。
 
 ~~~bash
 OUT=/data/maoyy/datasets/projector_stage2/<new_preflight_name>
-$TRAIN_PY -m training.omni.projector_stage2.train   --train-manifest /data/maoyy/datasets/projector_stage2/<new_audio_train>.jsonl   --dev-manifest /data/maoyy/datasets/projector_stage2/<new_audio_dev>.jsonl   --vision-train-manifest /data/maoyy/datasets/audio_understanding_pilot/llava/manifests_direct/teacher_train_complete.jsonl   --vision-dev-manifest /data/maoyy/datasets/audio_understanding_pilot/llava/manifests_direct/teacher_dev.jsonl   --output-dir "$OUT"   --lora-rank 8 --lora-alpha 16   --projector-learning-rate 3e-6 --lora-learning-rate 1e-5   --gradient-accumulation-steps 8 --asr-replay-ratio 0.3   --steps 1000 --validation-every 100 --warmup-steps 100 --preflight
+$TRAIN_PY -m training.omni.projector_stage2.train   --train-manifest /data/maoyy/datasets/projector_stage2/<new_audio_train>.jsonl   --dev-manifest /data/maoyy/datasets/projector_stage2/<new_audio_dev>.jsonl   --vision-train-manifest /data/maoyy/datasets/audio_understanding_pilot/llava/manifests_direct/teacher_joyai_train_complete.jsonl   --vision-dev-manifest /data/maoyy/datasets/audio_understanding_pilot/llava/manifests_direct/teacher_joyai_dev.jsonl   --output-dir "$OUT"   --lora-rank 8 --lora-alpha 16   --projector-learning-rate 3e-6 --lora-learning-rate 1e-5   --gradient-accumulation-steps 8 --asr-replay-ratio 0.3   --steps 1000 --validation-every 100 --warmup-steps 100 --preflight
 ~~~
 
 ### GPU pilot，必须另获用户授权
@@ -217,8 +217,8 @@ torchrun --standalone --nproc_per_node=4 -m training.omni.projector_stage2.train
   --init-projector-sha256 4e1573a3091d7ed438af16cee130d28e11b9701f5c22eb830e179e2ef315a22c \
   --train-manifest /data/maoyy/datasets/projector_stage2/<new_audio_train>.jsonl \
   --dev-manifest /data/maoyy/datasets/projector_stage2/<new_audio_dev>.jsonl \
-  --vision-train-manifest /data/maoyy/datasets/audio_understanding_pilot/llava/manifests_direct/teacher_train_complete.jsonl \
-  --vision-dev-manifest /data/maoyy/datasets/audio_understanding_pilot/llava/manifests_direct/teacher_dev.jsonl \
+  --vision-train-manifest /data/maoyy/datasets/audio_understanding_pilot/llava/manifests_direct/teacher_joyai_train_complete.jsonl \
+  --vision-dev-manifest /data/maoyy/datasets/audio_understanding_pilot/llava/manifests_direct/teacher_joyai_dev.jsonl \
   --output-dir "$OUT" --batch-size 1 --gradient-accumulation-steps 8 --max-cached-feature-shards 8 \
   --lora-rank 8 --lora-alpha 16 --projector-learning-rate 3e-6 --lora-learning-rate 1e-5 \
   --weight-decay 0.01 --max-grad-norm 1.0 --asr-replay-ratio 0.3 \
