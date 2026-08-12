@@ -978,6 +978,9 @@ def build_model_from_pretrained(
         if not hasattr(llm, "gradient_checkpointing_enable"):
             raise TypeError("LLM does not support gradient checkpointing")
         llm.gradient_checkpointing_enable()
+        if not hasattr(llm, "enable_input_require_grads"):
+            raise TypeError("LLM cannot preserve LoRA gradients with gradient checkpointing")
+        llm.enable_input_require_grads()
         if hasattr(llm, "config"):
             llm.config.use_cache = False
     model = build_stage2_model(
