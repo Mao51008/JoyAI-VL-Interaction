@@ -113,9 +113,12 @@ done
 | --- | --- | --- |
 | SpokenWOZ 历史基线 | /data/maoyy/datasets/projector_stage2/spokenwoz_turns_20260807/train.jsonl 和 dev.jsonl | 74,524 train / 9,169 dev；只作历史基线/schema/cache 验证。 |
 | SpokenWOZ feature cache | /data/maoyy/datasets/projector_stage2/spokenwoz_feature_cache_4gpu_20260807/merged | 仅匹配 SpokenWOZ manifests。 |
-| Clotho-AQA 共识 | /data/maoyy/datasets/audio_understanding_pilot/manifests/clotho_aqa_consensus.jsonl | 至少两人答案完全一致；待转换和建 cache。 |
-| VoiceAssistant-400K | /data/maoyy/datasets/audio_understanding_pilot/manifests/voiceassistant_single_turn.jsonl | 已选 20,000 条；待固定 dev、转换、建 cache。 |
-| LibriSpeech | /data/maoyy/datasets/projector_stage1/librispeech_train100_20260804 | ASR replay；待纳入正式 Stage2 manifest/cache。 |
+| Stage2 最终 audio manifest | /data/maoyy/datasets/audio_understanding_pilot/formal_audio_stage2_20260812/train.jsonl 和 dev.jsonl | 已完成；40,222 train / 512 独立 dev。训练集含 VoiceAssistant 17,953、Clotho-AQA 6,180、LibriSpeech ASR 16,089（40%）。 |
+| 最终来源子 manifest | /data/maoyy/datasets/audio_understanding_pilot/formal_audio_stage2_20260812/subsets/{voiceassistant,clotho_aqa,librispeech_asr}/ | 用于来源配比核验与缓存索引筛选；分别为 17,953/109、6,180/198、16,089/205 条 train/dev。 |
+| Stage2 统一 feature cache | /data/maoyy/datasets/audio_understanding_pilot/cache_audio_stage2_merged_20260812 | 已完成；40,734 条记录，索引引用 VoiceAssistant/Clotho 分片及 Stage1 LibriSpeech 原缓存，不复制特征。 |
+| Clotho-AQA 共识源 | /data/maoyy/datasets/audio_understanding_pilot/manifests/clotho_aqa_consensus.jsonl | 至少两人答案完全一致；已转换并缓存。 |
+| VoiceAssistant-400K 源 | /data/maoyy/datasets/audio_understanding_pilot/manifests/voiceassistant_single_turn.jsonl | 已选 20,000 条；已转换并缓存。 |
+| LibriSpeech 源 | /data/maoyy/datasets/projector_stage1/librispeech_train100_20260804 | ASR replay；已按最终 manifest 复用 Stage1 cache。 |
 
 Stage2 audio loader 只接受以下正式字段：
 
