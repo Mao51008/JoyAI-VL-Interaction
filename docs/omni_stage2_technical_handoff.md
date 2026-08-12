@@ -57,14 +57,17 @@ nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=c
 Qwen3-ASR-1.7B:
 /data/maoyy/models/Qwen3-ASR-1.7B
 
-Qwen3-VL-4B-Instruct:
+JoyAI-VL-Interaction（Stage2 待微调主模型）:
+/data/maoyy/models/jdopensource/JoyAI-VL-Interaction
+
+Qwen3-VL-4B-Instruct（仅离线视觉教师）:
 /data/maoyy/models/Qwen3-VL-4B-Instruct
 
 Qwen3-TTS:
 /data/maoyy/models/Qwen3-TTS-12Hz-1.7B-CustomVoice
 ~~~
 
-Stage2 当前加载 Qwen3-VL-4B-Instruct。Stage2 runtime 从冻结 feature cache 读取 ASR 特征，--asr-model 不能取代必需的 --feature-dir。
+Stage2 必须加载 JoyAI-VL-Interaction。Qwen3-VL-4B-Instruct 只能用于生成固定的视觉教师回复，绝不能作为 Stage2 的 `--llm-model`。Stage2 runtime 从冻结 feature cache 读取 ASR 特征，--asr-model 不能取代必需的 --feature-dir。
 
 唯一通过 SHA256 校验的候选 Stage1 初始化：
 
@@ -79,7 +82,7 @@ input_size=2048, output_size=4096, hidden_size=4096, dropout=0.0
 
 ## LoRA 的精确配置
 
-Qwen3-VL-4B 本机 safetensors index 已确认：文本 decoder 共 36 层，层名为 model.language_model.layers.0 到 35。
+JoyAI-VL-Interaction 本机 safetensors index 已确认：文本 decoder 共 36 层，hidden size 为 4096，层名为 model.language_model.layers.0 到 35。
 
 第一条可复现的 LoRA 实验固定为全部 36 层的 self_attn.q_proj 和 self_attn.v_proj，共 72 个 target。超参：
 
@@ -168,7 +171,7 @@ $TRAIN_PY - <<'PY'
 import torch, torchvision
 from transformers import AutoProcessor
 print(torch.__version__, torchvision.__version__)
-print(type(AutoProcessor.from_pretrained('/data/maoyy/models/Qwen3-VL-4B-Instruct')).__name__)
+print(type(AutoProcessor.from_pretrained('/data/maoyy/models/jdopensource/JoyAI-VL-Interaction')).__name__)
 PY
 ~~~
 
@@ -206,7 +209,21 @@ for LAYER in $(seq 0 35); do
   LORA_TARGETS+=(--lora-target "model.language_model.layers.$LAYER.self_attn.v_proj")
 done
 
-torchrun --standalone --nproc_per_node=4   -m training.omni.projector_stage2.train   --distributed --run --dtype bfloat16 --gradient-checkpointing   --llm-model /data/maoyy/models/Qwen3-VL-4B-Instruct   --feature-dir "$CACHE"   --projector-in-features 2048 --projector-out-features 4096   --init-projector-checkpoint /data/maoyy/datasets/projector_stage1/librispeech_train100_20260804/full100h_projector_only_init95_lr3e-5_3ep_20260806_run2/best.pt   --init-projector-sha256 4e1573a3091d7ed438af16cee130d28e11b9701f5c22eb830e179e2ef315a22c   --train-manifest /data/maoyy/datasets/projector_stage2/<new_audio_train>.jsonl   --dev-manifest /data/maoyy/datasets/projector_stage2/<new_audio_dev>.jsonl   --vision-train-manifest /data/maoyy/datasets/audio_understanding_pilot/llava/manifests_direct/teacher_train_complete.jsonl   --vision-dev-manifest /data/maoyy/datasets/audio_understanding_pilot/llava/manifests_direct/teacher_dev.jsonl   --output-dir "$OUT"   --batch-size 1 --gradient-accumulation-steps 8 --max-cached-feature-shards 8   --lora-rank 8 --lora-alpha 16   --projector-learning-rate 3e-6 --lora-learning-rate 1e-5   --weight-decay 0.01 --max-grad-norm 1.0   --asr-replay-ratio 0.3 --steps <pilot_steps>   --validation-every <interval> --warmup-steps <warmup_steps>   "${LORA_TARGETS[@]}"
+torchrun --standalone --nproc_per_node=4 -m training.omni.projector_stage2.train \
+  --distributed --run --dtype bfloat16 --gradient-checkpointing \
+  --llm-model /data/maoyy/models/jdopensource/JoyAI-VL-Interaction \
+  --feature-dir "$CACHE" --projector-in-features 2048 --projector-out-features 4096 \
+  --init-projector-checkpoint /data/maoyy/datasets/projector_stage1/librispeech_train100_20260804/full100h_projector_only_init95_lr3e-5_3ep_20260806_run2/best.pt \
+  --init-projector-sha256 4e1573a3091d7ed438af16cee130d28e11b9701f5c22eb830e179e2ef315a22c \
+  --train-manifest /data/maoyy/datasets/projector_stage2/<new_audio_train>.jsonl \
+  --dev-manifest /data/maoyy/datasets/projector_stage2/<new_audio_dev>.jsonl \
+  --vision-train-manifest /data/maoyy/datasets/audio_understanding_pilot/llava/manifests_direct/teacher_train_complete.jsonl \
+  --vision-dev-manifest /data/maoyy/datasets/audio_understanding_pilot/llava/manifests_direct/teacher_dev.jsonl \
+  --output-dir "$OUT" --batch-size 1 --gradient-accumulation-steps 8 --max-cached-feature-shards 8 \
+  --lora-rank 8 --lora-alpha 16 --projector-learning-rate 3e-6 --lora-learning-rate 1e-5 \
+  --weight-decay 0.01 --max-grad-norm 1.0 --asr-replay-ratio 0.3 \
+  --steps <pilot_steps> --validation-every <interval> --warmup-steps <warmup_steps> \
+  "${LORA_TARGETS[@]}"
 ~~~
 
 ## 评测与交接要求
