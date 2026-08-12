@@ -1158,6 +1158,7 @@ def train_model(
     train_batches: Iterable[Any],
     dev_batches: Iterable[Any],
     config: Stage2Config,
+    validation_sources: dict[str, Iterable[Any]] | None = None,
 ) -> dict[str, Any]:
     """Train an injected model for CPU tests or a future authorized runtime."""
     import torch
@@ -1193,6 +1194,12 @@ def train_model(
         raise TypeError("train and dev batches must be re-iterable sized sources")
     if len(train_batches) == 0 or len(dev_batches) == 0:
         raise ValueError("train and dev batches must be non-empty")
+    if validation_sources is not None:
+        if not validation_sources or any(
+            not hasattr(source, "__len__") or len(source) == 0
+            for source in validation_sources.values()
+        ):
+            raise ValueError("validation sources must be non-empty and sized")
     records: list[dict[str, Any]] = []
     best_validation = float("inf")
     bad_checks = 0
@@ -1279,20 +1286,31 @@ def train_model(
         if step % config.validation_every == 0 or step == config.steps:
             model.eval()
             with torch.no_grad():
+                sources = validation_sources or {"mixed": dev_batches}
                 validation_total = torch.zeros((), device=trainables[0].device)
                 validation_count = torch.zeros((), device=trainables[0].device)
-                for batch in islice(iter(dev_batches), config.max_validation_batches):
-                    token_count = _supervised_token_count(batch)
-                    validation_total += _loss_value(model(batch)).detach() * token_count
-                    validation_count += token_count
-            if distributed:
-                torch.distributed.all_reduce(validation_total)
-                torch.distributed.all_reduce(validation_count)
+                validation_metrics: dict[str, float] = {}
+                for name, source in sources.items():
+                    source_total = torch.zeros((), device=trainables[0].device)
+                    source_count = torch.zeros((), device=trainables[0].device)
+                    for batch in islice(iter(source), config.max_validation_batches):
+                        token_count = _supervised_token_count(batch)
+                        source_total += _loss_value(model(batch)).detach() * token_count
+                        source_count += token_count
+                    if distributed:
+                        torch.distributed.all_reduce(source_total)
+                        torch.distributed.all_reduce(source_count)
+                    if source_count.item() <= 0:
+                        raise ValueError(f"validation source has no supervised target tokens: {name}")
+                    validation_metrics[name] = float(source_total / source_count)
+                    validation_total += source_total
+                    validation_count += source_count
             if validation_count.item() <= 0:
                 raise ValueError("validation batches have no supervised target tokens")
             validation_loss = float(validation_total / validation_count)
             record["validation_loss"] = validation_loss
             record["validation_supervised_tokens"] = int(validation_count)
+            record["validation_by_source"] = validation_metrics
             if validation_loss < best_validation:
                 best_validation = validation_loss
                 bad_checks = 0
@@ -1527,6 +1545,25 @@ def main(argv: list[str] | None = None) -> int:
             dev_rows, tokenizer, args.feature_dir, int(audio_placeholder_id),
             args.batch_size, args.max_cached_feature_shards,
         )
+        validation_sources: dict[str, Iterable[Stage2ConversationBatch]] = {}
+        for name, rows in (
+            ("asr_transcription", [row for row in dev_rows if row["training_task"] == "asr_transcription"]),
+            (
+                "audio_dialogue",
+                [
+                    row for row in dev_rows
+                    if row["provenance"].get("dataset") == "shenyunhang/VoiceAssistant-400K"
+                ],
+            ),
+            (
+                "environment_audio_qa",
+                [row for row in dev_rows if row["provenance"].get("dataset") == "Clotho-AQA"],
+            ),
+        ):
+            validation_sources[name] = CachedConversationBatchSource(
+                rows, tokenizer, args.feature_dir, int(audio_placeholder_id),
+                args.batch_size, args.max_cached_feature_shards,
+            )
         if processor is not None:
             vision_train_rows = vision_train_rows[rank::world_size]
             vision_dev_rows = vision_dev_rows[rank::world_size]
@@ -1545,7 +1582,12 @@ def main(argv: list[str] | None = None) -> int:
             dev_batches = MixedStage2BatchSource(
                 [dev_batches, VisionDistillationBatchSource(vision_dev_rows, processor)],
             )
-        result = train_model(model, train_batches, dev_batches, config)
+            validation_sources["vision_distillation"] = VisionDistillationBatchSource(
+                vision_dev_rows, processor
+            )
+        result = train_model(
+            model, train_batches, dev_batches, config, validation_sources=validation_sources
+        )
     if rank == 0:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     if distributed:
