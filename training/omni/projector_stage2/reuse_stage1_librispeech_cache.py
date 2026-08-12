@@ -64,20 +64,23 @@ def reuse_cache(
             raise ValueError(f"Stage1 cache lacks replay sample: {sample_id}")
         if cached.get("media_sha256") != row.get("clip_sha256"):
             raise ValueError(f"audio hash mismatch for replay sample: {sample_id}")
-        shard = cache / str(cached["shard"])
-        if not shard.is_file():
-            raise FileNotFoundError(f"Stage1 feature shard is missing: {shard}")
-        migrated.append(
-            {
-                "sample_id": sample_id,
-                "shard": os.path.relpath(shard, output_dir),
-                "offset": int(cached["offset"]),
-                "tokens": int(cached["tokens"]),
-                "clip_sha256": row["clip_sha256"],
-                "source_audio_sha256": row["source_audio_sha256"],
-                "audio_model_config_sha256": _sha256(config),
-            }
-        )
+        source_path = cache / str(cached.get("shard", cached.get("path", "")))
+        if not source_path.is_file():
+            raise FileNotFoundError(f"Stage1 feature file is missing: {source_path}")
+        migrated_row = {
+            "sample_id": sample_id,
+            "tokens": int(cached["tokens"]),
+            "clip_sha256": row["clip_sha256"],
+            "source_audio_sha256": row["source_audio_sha256"],
+            "audio_model_config_sha256": _sha256(config),
+        }
+        if "shard" in cached:
+            migrated_row.update(
+                shard=os.path.relpath(source_path, output_dir), offset=int(cached["offset"])
+            )
+        else:
+            migrated_row["path"] = os.path.relpath(source_path, output_dir)
+        migrated.append(migrated_row)
     if len({row["sample_id"] for row in migrated}) != len(migrated):
         raise ValueError("duplicate ASR replay sample_id")
     output_dir.mkdir(parents=True)
@@ -95,7 +98,7 @@ def reuse_cache(
                 "source_stage1_dev_cache": str(stage1_dev_cache.resolve()),
                 "total_samples": len(migrated),
                 "samples": len(migrated),
-                "shards": len({row["shard"] for row in migrated}),
+                "shards": len({row.get("shard", row.get("path")) for row in migrated}),
             },
             ensure_ascii=False,
             indent=2,
@@ -104,7 +107,10 @@ def reuse_cache(
         + "\n",
         encoding="utf-8",
     )
-    return {"reused_samples": len(migrated), "source_shards": len({row["shard"] for row in migrated})}
+    return {
+        "reused_samples": len(migrated),
+        "source_shards": len({row.get("shard", row.get("path")) for row in migrated}),
+    }
 
 
 def main() -> None:

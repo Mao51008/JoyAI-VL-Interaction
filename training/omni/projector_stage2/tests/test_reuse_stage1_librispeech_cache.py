@@ -20,10 +20,12 @@ def test_reuse_stage1_cache_creates_relative_shard_index(tmp_path):
         cache = tmp_path / f"{split}-cache"
         cache.mkdir()
         (cache / "shard-00000.pt").write_bytes(b"fixture")
-        (cache / "index.json").write_text(
-            json.dumps([{"sample_id": sample, "shard": "shard-00000.pt", "offset": 0, "tokens": 2, "media_sha256": sha}]),
-            encoding="utf-8",
-        )
+        entry = {"sample_id": sample, "tokens": 2, "media_sha256": sha}
+        if split == "train":
+            entry.update(shard="shard-00000.pt", offset=0)
+        else:
+            entry.update(path="shard-00000.pt")
+        (cache / "index.json").write_text(json.dumps([entry]), encoding="utf-8")
         caches.append(cache)
     train, dev = tmp_path / "train.jsonl", tmp_path / "dev.jsonl"
     train.write_text(json.dumps(_manifest_row("libri-train", "train", "train-sha")) + "\n")
@@ -35,3 +37,4 @@ def test_reuse_stage1_cache_creates_relative_shard_index(tmp_path):
     index = json.loads((tmp_path / "out" / "index.json").read_text())
     assert result == {"reused_samples": 2, "source_shards": 2}
     assert index[0]["shard"].startswith("..")
+    assert index[1]["path"].startswith("..")
