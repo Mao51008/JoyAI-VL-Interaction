@@ -55,7 +55,18 @@ def main() -> None:
     parser.add_argument("--output-manifest", type=Path, required=True)
     parser.add_argument("--teacher-model", required=True)
     args = parser.parse_args()
-    print(json.dumps(finalize(**vars(args)), ensure_ascii=False, sort_keys=True))
+    print(
+        json.dumps(
+            finalize(
+                source_manifest=args.source_manifest,
+                shards=args.shard,
+                output_manifest=args.output_manifest,
+                teacher_model=args.teacher_model,
+            ),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
 
 
 if __name__ == "__main__":
