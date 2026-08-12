@@ -1486,7 +1486,9 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("--vision-train-manifest and --vision-dev-manifest must be provided together")
             vision_train_rows = load_vision_distillation_manifest(args.vision_train_manifest)
             vision_dev_rows = load_vision_distillation_manifest(args.vision_dev_manifest)
-            processor = transformers.AutoProcessor.from_pretrained(args.llm_model)
+            processor = transformers.AutoProcessor.from_pretrained(
+                args.llm_model, fix_mistral_regex=True
+            )
         cache_metadata = validate_feature_cache(
             args.feature_dir, [*train_rows, *dev_rows]
         )
