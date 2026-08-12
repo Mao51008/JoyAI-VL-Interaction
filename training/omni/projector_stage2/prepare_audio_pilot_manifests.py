@@ -128,9 +128,19 @@ def _pilot_rows(
     return converted
 
 
-def _asr_rows(source_manifest: Path, split: str, no_progress: bool) -> list[dict[str, Any]]:
+def _asr_rows(
+    source_manifest: Path, split: str, count: int, no_progress: bool
+) -> list[dict[str, Any]]:
+    source_rows = sorted(
+        _read_jsonl(source_manifest),
+        key=lambda row: hashlib.sha256(str(row["sample_id"]).encode("utf-8")).hexdigest(),
+    )
+    if count > len(source_rows):
+        raise ValueError(
+            f"ASR replay needs {count} {split} samples but only {len(source_rows)} are available"
+        )
     converted: list[dict[str, Any]] = []
-    for source in _progress(_read_jsonl(source_manifest), "prepare ASR replay", no_progress):
+    for source in _progress(source_rows[:count], "prepare ASR replay", no_progress):
         audio = source.get("audio")
         metadata = source.get("metadata", {})
         if not isinstance(audio, list) or len(audio) != 1 or not isinstance(metadata, dict):
@@ -139,7 +149,7 @@ def _asr_rows(source_manifest: Path, split: str, no_progress: bool) -> list[dict
         if not target:
             raise ValueError(f"LibriSpeech target is empty: {source.get('sample_id')}")
         synthetic = {
-            "sample_id": f"asr_replay:{source['sample_id']}",
+            "sample_id": str(source["sample_id"]),
             "assistant_response": target,
             "provenance": dict(source.get("provenance", {})),
         }
@@ -165,36 +175,40 @@ def _write(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def prepare_manifests(
     *,
-    clotho_manifest: Path,
-    voice_manifest: Path,
+    clotho_manifest: Path | None,
+    voice_manifest: Path | None,
     asr_train_manifest: Path,
     asr_dev_manifest: Path,
     clotho_audio_root: Path,
     voice_audio_root: Path,
     output_dir: Path,
+    asr_replay_ratio: float = 0.4,
     no_progress: bool = False,
 ) -> dict[str, int]:
     if output_dir.exists():
         raise FileExistsError(f"refusing to reuse output directory: {output_dir}")
-    clotho_rows = _pilot_rows(
-        _read_jsonl(clotho_manifest),
-        clotho_manifest,
-        clotho_audio_root=clotho_audio_root,
-        voice_audio_root=voice_audio_root,
-        no_progress=no_progress,
+    if not 0 < asr_replay_ratio < 1:
+        raise ValueError("asr_replay_ratio must be in (0, 1)")
+    if clotho_manifest is None and voice_manifest is None:
+        raise ValueError("at least one pilot manifest is required")
+    clotho_rows = [] if clotho_manifest is None else _pilot_rows(
+        _read_jsonl(clotho_manifest), clotho_manifest, clotho_audio_root=clotho_audio_root,
+        voice_audio_root=voice_audio_root, no_progress=no_progress,
     )
-    voice_rows = _pilot_rows(
-        _read_jsonl(voice_manifest),
-        voice_manifest,
-        clotho_audio_root=clotho_audio_root,
-        voice_audio_root=voice_audio_root,
-        no_progress=no_progress,
+    voice_rows = [] if voice_manifest is None else _pilot_rows(
+        _read_jsonl(voice_manifest), voice_manifest, clotho_audio_root=clotho_audio_root,
+        voice_audio_root=voice_audio_root, no_progress=no_progress,
     )
     pilot_rows = [*clotho_rows, *voice_rows]
     train_rows = [row for row in pilot_rows if row["split"] == "train"]
     dev_rows = [row for row in pilot_rows if row["split"] == "dev"]
-    train_rows.extend(_asr_rows(asr_train_manifest, "train", no_progress))
-    dev_rows.extend(_asr_rows(asr_dev_manifest, "dev", no_progress))
+    replay_scale = asr_replay_ratio / (1.0 - asr_replay_ratio)
+    train_rows.extend(
+        _asr_rows(asr_train_manifest, "train", round(len(train_rows) * replay_scale), no_progress)
+    )
+    dev_rows.extend(
+        _asr_rows(asr_dev_manifest, "dev", round(len(dev_rows) * replay_scale), no_progress)
+    )
     sample_ids = [str(row["sample_id"]) for row in [*train_rows, *dev_rows]]
     if len(sample_ids) != len(set(sample_ids)):
         raise ValueError("duplicate sample_id across formal audio manifests")
@@ -206,13 +220,14 @@ def prepare_manifests(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--clotho-manifest", type=Path, required=True)
-    parser.add_argument("--voice-manifest", type=Path, required=True)
+    parser.add_argument("--clotho-manifest", type=Path)
+    parser.add_argument("--voice-manifest", type=Path)
     parser.add_argument("--asr-train-manifest", type=Path, required=True)
     parser.add_argument("--asr-dev-manifest", type=Path, required=True)
     parser.add_argument("--clotho-audio-root", type=Path, required=True)
     parser.add_argument("--voice-audio-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--asr-replay-ratio", type=float, default=0.4)
     parser.add_argument("--no-progress", action="store_true")
     args = parser.parse_args()
     print(json.dumps(prepare_manifests(**vars(args)), ensure_ascii=False, sort_keys=True))
