@@ -310,6 +310,7 @@ def merge_feature_cache_parts(
     part_dirs: list[Path],
     output_dir: Path,
     limit: int | None,
+    allow_unselected_cache_records: bool = False,
 ) -> dict[str, Any]:
     """Merge deterministic cache parts without copying their feature shard files."""
     if output_dir.exists():
@@ -342,6 +343,8 @@ def merge_feature_cache_parts(
                 raise ValueError(f"duplicate sample_id across cache parts: {sample_id}")
             source = expected.get(sample_id)
             if source is None:
+                if allow_unselected_cache_records:
+                    continue
                 raise ValueError(f"cache part contains unknown sample_id: {sample_id}")
             if (
                 record.get("clip_sha256") != source["clip_sha256"]
@@ -402,6 +405,7 @@ def main() -> None:
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--merge-part", type=Path, action="append")
+    parser.add_argument("--allow-unselected-cache-records", action="store_true")
     parser.add_argument("--progress-file", type=Path)
     parser.add_argument("--progress-every", type=int, default=100)
     parser.add_argument("--no-progress", action="store_true")
@@ -414,6 +418,7 @@ def main() -> None:
             part_dirs=args.merge_part,
             output_dir=args.output_dir,
             limit=args.limit,
+            allow_unselected_cache_records=args.allow_unselected_cache_records,
         )
     else:
         if args.audio_model is None:
