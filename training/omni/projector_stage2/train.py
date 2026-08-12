@@ -1550,7 +1550,13 @@ def main(argv: list[str] | None = None) -> int:
         if distributed:
             from torch.nn.parallel import DistributedDataParallel
 
-            model = DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
+            # Audio and vision microbatches exercise different trainable branches.
+            model = DistributedDataParallel(
+                model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=True,
+            )
         train_rows = train_rows[rank::world_size]
         dev_rows = dev_rows[rank::world_size]
         train_batches: Any = CachedConversationBatchSource(
