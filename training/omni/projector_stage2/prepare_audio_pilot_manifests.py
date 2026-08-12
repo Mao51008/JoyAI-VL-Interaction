@@ -194,6 +194,35 @@ def _asr_rows(
     return converted
 
 
+def _stratified_limit(rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    if limit <= 0 or limit > len(rows):
+        raise ValueError(f"invalid dev non-ASR limit {limit} for {len(rows)} rows")
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        source = str(row["provenance"].get("dataset", "unknown"))
+        groups.setdefault(source, []).append(row)
+    selected: list[dict[str, Any]] = []
+    remaining = limit
+    group_items = sorted(groups.items())
+    for index, (_, group) in enumerate(group_items):
+        quota = (
+            remaining
+            if index == len(group_items) - 1
+            else round(limit * len(group) / len(rows))
+        )
+        quota = min(quota, len(group))
+        selected.extend(
+            sorted(
+                group,
+                key=lambda row: hashlib.sha256(str(row["sample_id"]).encode("utf-8")).hexdigest(),
+            )[:quota]
+        )
+        remaining -= quota
+    if remaining:
+        raise ValueError("stratified dev selection could not satisfy the requested limit")
+    return selected
+
+
 def _write(path: Path, rows: list[dict[str, Any]]) -> None:
     with path.open("x", encoding="utf-8") as handle:
         for row in rows:
@@ -210,6 +239,7 @@ def prepare_manifests(
     voice_audio_root: Path,
     output_dir: Path,
     asr_replay_ratio: float = 0.4,
+    dev_limit: int | None = 512,
     no_progress: bool = False,
 ) -> dict[str, int]:
     if output_dir.exists():
@@ -233,6 +263,9 @@ def prepare_manifests(
     train_rows = [row for row in pilot_rows if row["split"] == "train"]
     dev_rows = [row for row in pilot_rows if row["split"] == "dev"]
     replay_scale = asr_replay_ratio / (1.0 - asr_replay_ratio)
+    if dev_limit is not None:
+        dev_non_asr_limit = round(dev_limit * (1.0 - asr_replay_ratio))
+        dev_rows = _stratified_limit(dev_rows, dev_non_asr_limit)
     train_rows.extend(
         _asr_rows(asr_train_manifest, "train", round(len(train_rows) * replay_scale), no_progress)
     )
@@ -258,6 +291,7 @@ def main() -> None:
     parser.add_argument("--voice-audio-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--asr-replay-ratio", type=float, default=0.4)
+    parser.add_argument("--dev-limit", type=int, default=512)
     parser.add_argument("--no-progress", action="store_true")
     args = parser.parse_args()
     print(json.dumps(prepare_manifests(**vars(args)), ensure_ascii=False, sort_keys=True))

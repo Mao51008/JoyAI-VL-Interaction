@@ -54,7 +54,7 @@ def test_prepare_manifests_preserves_task_roles_and_source_provenance(tmp_path, 
     result = manifests.prepare_manifests(
         clotho_manifest=clotho, voice_manifest=voice, asr_train_manifest=asr_train,
         asr_dev_manifest=asr_dev, clotho_audio_root=tmp_path, voice_audio_root=tmp_path,
-        output_dir=tmp_path / "out", no_progress=True,
+        output_dir=tmp_path / "out", dev_limit=2, no_progress=True,
     )
     assert result == {"train": 2, "dev": 2}
     train = [json.loads(line) for line in (tmp_path / "out" / "train.jsonl").read_text().splitlines()]
