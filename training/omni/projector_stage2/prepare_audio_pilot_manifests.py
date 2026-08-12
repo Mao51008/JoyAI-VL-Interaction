@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,25 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not rows:
         raise ValueError(f"manifest is empty: {path}")
     return rows
+
+
+def _normalized_audio_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.casefold())
+
+
+def _clotho_audio_paths(audio_root: Path) -> dict[str, Path]:
+    paths = {path.name: path for path in audio_root.glob("*.wav")}
+    if not paths:
+        raise FileNotFoundError(f"Clotho audio directory is empty: {audio_root}")
+    normalized: dict[str, Path | None] = {}
+    for name, path in paths.items():
+        key = _normalized_audio_name(name)
+        normalized[key] = path if key not in normalized else None
+    resolved = dict(paths)
+    for key, path in normalized.items():
+        if path is not None:
+            resolved.setdefault(key, path)
+    return resolved
 
 
 def _progress(rows: Iterable[dict[str, Any]], description: str, no_progress: bool) -> Iterable[dict[str, Any]]:
@@ -87,6 +107,7 @@ def _pilot_rows(
     source_manifest: Path,
     *,
     clotho_audio_root: Path,
+    clotho_audio_paths: dict[str, Path],
     voice_audio_root: Path,
     no_progress: bool,
 ) -> list[dict[str, Any]]:
@@ -100,10 +121,16 @@ def _pilot_rows(
             question = str(source.get("question", "")).strip()
             if not question:
                 raise ValueError(f"Clotho question is empty: {source['sample_id']}")
+            source_name = str(source["source_audio_path"])
+            audio_path = clotho_audio_paths.get(source_name)
+            if audio_path is None:
+                audio_path = clotho_audio_paths.get(_normalized_audio_name(source_name))
+            if audio_path is None:
+                raise FileNotFoundError(f"Clotho audio is missing or ambiguous: {source_name}")
             converted.append(
                 _formal_row(
                     source,
-                    audio_path=clotho_audio_root / str(source["source_audio_path"]),
+                    audio_path=audio_path,
                     split=split,
                     training_task="dialogue_response",
                     dialogue_history=[{"role": "user", "text": question}],
@@ -191,12 +218,15 @@ def prepare_manifests(
         raise ValueError("asr_replay_ratio must be in (0, 1)")
     if clotho_manifest is None and voice_manifest is None:
         raise ValueError("at least one pilot manifest is required")
+    clotho_paths = _clotho_audio_paths(clotho_audio_root) if clotho_manifest is not None else {}
     clotho_rows = [] if clotho_manifest is None else _pilot_rows(
         _read_jsonl(clotho_manifest), clotho_manifest, clotho_audio_root=clotho_audio_root,
+        clotho_audio_paths=clotho_paths,
         voice_audio_root=voice_audio_root, no_progress=no_progress,
     )
     voice_rows = [] if voice_manifest is None else _pilot_rows(
         _read_jsonl(voice_manifest), voice_manifest, clotho_audio_root=clotho_audio_root,
+        clotho_audio_paths=clotho_paths,
         voice_audio_root=voice_audio_root, no_progress=no_progress,
     )
     pilot_rows = [*clotho_rows, *voice_rows]

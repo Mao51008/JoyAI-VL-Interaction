@@ -13,6 +13,8 @@ def test_prepare_manifests_preserves_task_roles_and_source_provenance(tmp_path, 
     voice = tmp_path / "voice.jsonl"
     asr_train = tmp_path / "asr_train.jsonl"
     asr_dev = tmp_path / "asr_dev.jsonl"
+    (tmp_path / "birds.wav").write_bytes(b"fixture")
+    (tmp_path / "user.wav").write_bytes(b"fixture")
     _write_jsonl(
         clotho,
         {
@@ -61,3 +63,10 @@ def test_prepare_manifests_preserves_task_roles_and_source_provenance(tmp_path, 
     assert train[1]["training_task"] == "asr_transcription"
     assert dev[0]["provenance"]["source_manifest"] == str(voice)
     assert dev[1]["user_text"] == "HELLO"
+
+
+def test_clotho_audio_paths_resolves_unique_punctuation_variant(tmp_path):
+    expected = tmp_path / "souffle_me.tallique.wav"
+    expected.write_bytes(b"fixture")
+    paths = manifests._clotho_audio_paths(tmp_path)
+    assert paths[manifests._normalized_audio_name("souffle_me_tallique.wav")] == expected
