@@ -7,6 +7,7 @@ AUDIO_MODEL="${AUDIO_MODEL:-/data/maoyy/models/Qwen3-ASR-1.7B}"
 TRAIN_MANIFEST="${TRAIN_MANIFEST:?set TRAIN_MANIFEST}"
 DEV_MANIFEST="${DEV_MANIFEST:?set DEV_MANIFEST}"
 OUTPUT_ROOT="${OUTPUT_ROOT:?set OUTPUT_ROOT}"
+TRAINING_TASK="${TRAINING_TASK:-}"
 WORKERS=4
 
 test ! -e "$OUTPUT_ROOT"
@@ -14,12 +15,17 @@ mkdir -p "$OUTPUT_ROOT/parts" "$OUTPUT_ROOT/logs"
 cd "$REPO_ROOT"
 
 pids=()
+task_args=()
+if [ -n "$TRAINING_TASK" ]; then
+  task_args+=(--training-task "$TRAINING_TASK")
+fi
 for shard_index in 0 1 2 3; do
   CUDA_VISIBLE_DEVICES="$shard_index" "$PYTHON_BIN" -m training.omni.projector_stage2.cache_features \
     --manifest "$TRAIN_MANIFEST" --manifest "$DEV_MANIFEST" \
     --audio-model "$AUDIO_MODEL" --output-dir "$OUTPUT_ROOT/parts/worker-$shard_index" \
     --device cuda:0 --num-shards "$WORKERS" --shard-index "$shard_index" \
     --progress-file "$OUTPUT_ROOT/parts/worker-$shard_index/progress.json" \
+    "${task_args[@]}" \
     >"$OUTPUT_ROOT/logs/worker-$shard_index.log" 2>&1 &
   pids+=("$!")
 done
@@ -40,6 +46,11 @@ while :; do
 done
 printf '\n'
 for pid in "${pids[@]}"; do wait "$pid"; done
+
+if [ -n "$TRAINING_TASK" ]; then
+  echo "task-filtered cache parts are ready; merge them with the complementary cache separately"
+  exit 0
+fi
 
 "$PYTHON_BIN" -m training.omni.projector_stage2.cache_features \
   --manifest "$TRAIN_MANIFEST" --manifest "$DEV_MANIFEST" --output-dir "$OUTPUT_ROOT/merged" \
