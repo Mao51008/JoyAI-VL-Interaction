@@ -114,7 +114,9 @@ def main(argv: list[str] | None = None) -> int:
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
     dtype = getattr(torch, args.dtype)
-    processor = AutoProcessor.from_pretrained(args.llm_model, revision=args.teacher_revision)
+    processor = AutoProcessor.from_pretrained(
+        args.llm_model, revision=args.teacher_revision, fix_mistral_regex=True
+    )
     model = AutoModelForImageTextToText.from_pretrained(
         args.llm_model, revision=args.teacher_revision, torch_dtype=dtype
     ).to(args.device)
