@@ -13,6 +13,7 @@ import json
 import math
 import os
 import random
+import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import nullcontext
@@ -1166,6 +1167,21 @@ def train_model(
     distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
     rank = torch.distributed.get_rank() if distributed else 0
     world_size = torch.distributed.get_world_size() if distributed else 1
+    debug_microbatch_timing = os.environ.get("STAGE2_DEBUG_MICROBATCH_TIMING") == "1"
+
+    def trace_microbatch(phase: str, step: int, microbatch_index: int, batch: Any) -> None:
+        if not debug_microbatch_timing:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(device=trainables[0].device)
+        sample_ids = getattr(batch, "sample_ids", None) or ["unknown"]
+        print(
+            "stage2_debug "
+            f"rank={rank} step={step} microbatch={microbatch_index + 1} "
+            f"phase={phase} elapsed_s={time.monotonic():.6f} "
+            f"modality={getattr(batch, 'modality', 'audio')} sample_ids={sample_ids}",
+            flush=True,
+        )
 
     if rank == 0:
         validate_config(config)
@@ -1256,9 +1272,12 @@ def train_model(
                 else nullcontext()
             )
             with sync_context:
+                trace_microbatch("before_forward", step, microbatch_index, batch)
                 loss = _loss_value(model(batch))
+                trace_microbatch("after_forward", step, microbatch_index, batch)
                 loss_scale = token_count * world_size / float(global_token_count)
                 (loss * loss_scale).backward()
+                trace_microbatch("after_backward", step, microbatch_index, batch)
             weighted_loss_sum += loss.detach() * token_count
         grad_norm = torch.nn.utils.clip_grad_norm_(trainables, config.max_grad_norm)
         optimizer.step()
