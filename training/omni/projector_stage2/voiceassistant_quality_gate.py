@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-KNOWN_AUDIO_LABEL_MISMATCHES = {"voiceassistant:0204465"}
+KNOWN_UNRESOLVED_ASR_METADATA_CONFLICTS = {"voiceassistant:0204465"}
 
 
 def normalize_text(value: str) -> str:
@@ -67,14 +67,14 @@ def gate_rows(
         if transcript is None:
             raise ValueError(f"candidate has no fixed-ASR result: {sample_id}")
         consistency, score = lexical_consistency(question, transcript)
-        known_bad = sample_id in KNOWN_AUDIO_LABEL_MISMATCHES
+        known_conflict = sample_id in KNOWN_UNRESOLVED_ASR_METADATA_CONFLICTS
         row["fixed_asr_transcript"] = transcript
         row["audio_question_consistency"] = {
             "method": "normalized_lexical_overlap_v1",
             "score": score,
-            "status": "consistent" if consistency == "consistent" and not known_bad else "quarantine",
-            "confidence": "high" if consistency == "consistent" and not known_bad else "low",
-            "review_status": "pending_answer_review" if consistency == "consistent" and not known_bad else "not_required",
+            "status": "consistent" if consistency == "consistent" and not known_conflict else "quarantine",
+            "confidence": "high" if consistency == "consistent" and not known_conflict else "low",
+            "review_status": "pending_answer_review" if consistency == "consistent" and not known_conflict else "not_required",
             "asr_mismatch_is_not_audio_error": True,
         }
         row["answer_quality_review"] = {
@@ -83,11 +83,11 @@ def gate_rows(
             "fact_or_safety": bool(row.get("fact_or_safety", False)),
         }
         row.setdefault("provenance", {})["voiceassistant_quality_gate"] = "v1"
-        if consistency == "consistent" and not known_bad:
+        if consistency == "consistent" and not known_conflict:
             ready.append(row)
         else:
             row["quarantine_reason"] = (
-                "known_audio_label_mismatch" if known_bad
+                "known_unresolved_asr_metadata_conflict" if known_conflict
                 else "asr_question_low_confidence" if consistency == "low_confidence"
                 else "asr_question_mismatch"
             )
@@ -112,7 +112,7 @@ def write_gate_output(candidate_manifest: Path, asr_manifest: Path, output_dir: 
         "fixed_asr_sha256": _sha256(asr_manifest),
         "answer_review_candidates": len(ready),
         "quarantine": len(quarantine),
-        "known_audio_label_mismatches": sorted(KNOWN_AUDIO_LABEL_MISMATCHES),
+        "known_unresolved_asr_metadata_conflicts": sorted(KNOWN_UNRESOLVED_ASR_METADATA_CONFLICTS),
     }
     (output_dir / "audit.json").write_text(json.dumps(audit, indent=2) + "\n", encoding="utf-8")
     return {"answer_review_candidates": len(ready), "quarantine": len(quarantine)}
