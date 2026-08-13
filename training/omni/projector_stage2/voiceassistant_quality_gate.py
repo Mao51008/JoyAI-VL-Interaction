@@ -30,7 +30,7 @@ def lexical_consistency(question: str, transcript: str) -> tuple[str, float]:
     overlap = len(question_tokens & transcript_tokens) / len(question_tokens)
     if overlap >= 0.85:
         return "consistent", overlap
-    if overlap >= 0.6:
+    if overlap >= 0.4:
         return "low_confidence", overlap
     return "mismatch", overlap
 
