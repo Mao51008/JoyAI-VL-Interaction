@@ -151,6 +151,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--system-prompt-suffix")
+    parser.add_argument("--system-prompt-suffix-file", type=Path)
     args = parser.parse_args(argv)
     if args.output.exists():
         raise FileExistsError(f"refusing to overwrite output: {args.output}")
@@ -167,6 +168,10 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError(f"unsupported checkpoint format: {state.get('format')!r}")
     lora_targets, lora_rank = _checkpoint_lora_layout(state)
     rows = select_task_rows(load_manifest(args.manifest), args.task)
+    if args.system_prompt_suffix is not None and args.system_prompt_suffix_file is not None:
+        raise ValueError("provide only one system prompt suffix source")
+    if args.system_prompt_suffix_file is not None:
+        args.system_prompt_suffix = args.system_prompt_suffix_file.read_text(encoding="utf-8")
     if args.system_prompt_suffix is not None:
         if args.task != "dialogue_response":
             raise ValueError("--system-prompt-suffix is only valid for dialogue_response")
