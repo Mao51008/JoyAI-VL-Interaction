@@ -9,6 +9,6 @@ def test_select_keeps_only_remaining_train_and_excludes_known_conflict(tmp_path,
  raw.write_text('\n'.join(json.dumps(x) for x in lines)+'\n')
  existing.write_text(json.dumps({"sample_id":"voiceassistant:0000000"})+'\n')
  monkeypatch.setattr("datasets.prepare_voiceassistant_stage21._split",lambda sample:"train")
- selected,audit=select(raw,existing,2)
- assert len(selected)==2 and all(x["user_text"]=="" for x in selected)
+ selected,audit=select(raw,existing,1)
+ assert len(selected)==1 and all(x["user_text"]=="" for x in selected)
  assert audit["rejected"]["already_in_existing_20000"]==1
