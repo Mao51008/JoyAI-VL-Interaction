@@ -18,14 +18,15 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def finalize(
-    source_manifest: Path,
+    source_manifest: Path | list[Path],
     shards: list[Path],
     output_manifest: Path,
     teacher_model: str,
 ) -> dict[str, int]:
     if output_manifest.exists():
         raise FileExistsError(f"refusing to overwrite: {output_manifest}")
-    source_rows = _load_jsonl(source_manifest)
+    source_paths = source_manifest if isinstance(source_manifest, list) else [source_manifest]
+    source_rows = [row for path in source_paths for row in _load_jsonl(path)]
     teacher_rows = [row for shard in shards for row in _load_jsonl(shard)]
     source_ids = [str(row["sample_id"]) for row in source_rows]
     teacher_ids = [str(row.get("sample_id", "")) for row in teacher_rows]
@@ -50,7 +51,7 @@ def finalize(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source-manifest", type=Path, required=True)
+    parser.add_argument("--source-manifest", type=Path, action="append", required=True)
     parser.add_argument("--shard", type=Path, action="append", required=True)
     parser.add_argument("--output-manifest", type=Path, required=True)
     parser.add_argument("--teacher-model", required=True)
