@@ -1,8 +1,5 @@
 import json
 
-import pytest
-
-from training.omni.projector_stage2.gold_transcript_diagnostic import seed_rows, validate_rows
 from training.omni.projector_stage2.voiceassistant_quality_gate import gate_rows
 
 
@@ -22,9 +19,11 @@ def test_gate_quarantines_known_audio_label_mismatch_and_preserves_review_status
     assert quarantine[0]["answer_quality_review"]["required_for_training"]
 
 
-def test_gold_seed_requires_independent_gold_and_fixed_asr_fields():
-    rows = seed_rows()
-    validate_rows(rows)
-    rows[0].pop("fixed_asr_transcript")
-    with pytest.raises(ValueError, match="fixed_asr_transcript"):
-        validate_rows(rows)
+def test_gate_quarantines_ambiguous_asr_without_claiming_audio_is_wrong():
+    ready, quarantine = gate_rows(
+        [{"sample_id": "voice:ambiguous", "question": "How far is Moon from Earth?"}],
+        [{"sample_id": "voice:ambiguous", "fixed_asr_transcript": "How far Moon"}],
+    )
+    assert not ready
+    assert quarantine[0]["quarantine_reason"] == "asr_question_low_confidence"
+    assert quarantine[0]["audio_question_consistency"]["confidence"] == "low"

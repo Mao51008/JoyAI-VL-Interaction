@@ -21,14 +21,18 @@ def normalize_text(value: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
 
 
-def lexical_consistency(question: str, transcript: str) -> tuple[bool, float]:
+def lexical_consistency(question: str, transcript: str) -> tuple[str, float]:
     """A conservative, explainable screening score; human review remains authoritative."""
     question_tokens = set(normalize_text(question).split())
     transcript_tokens = set(normalize_text(transcript).split())
     if not question_tokens or not transcript_tokens:
-        return False, 0.0
+        return "low_confidence", 0.0
     overlap = len(question_tokens & transcript_tokens) / len(question_tokens)
-    return overlap >= 0.6, overlap
+    if overlap >= 0.85:
+        return "consistent", overlap
+    if overlap >= 0.6:
+        return "low_confidence", overlap
+    return "mismatch", overlap
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -62,13 +66,15 @@ def gate_rows(
         transcript = transcripts.get(sample_id)
         if transcript is None:
             raise ValueError(f"candidate has no fixed-ASR result: {sample_id}")
-        consistent, score = lexical_consistency(question, transcript)
+        consistency, score = lexical_consistency(question, transcript)
         known_bad = sample_id in KNOWN_AUDIO_LABEL_MISMATCHES
         row["fixed_asr_transcript"] = transcript
         row["audio_question_consistency"] = {
             "method": "normalized_lexical_overlap_v1",
             "score": score,
-            "status": "consistent" if consistent and not known_bad else "needs_human_review",
+            "status": "consistent" if consistency == "consistent" and not known_bad else "quarantine",
+            "confidence": "high" if consistency == "consistent" and not known_bad else "low",
+            "review_status": "pending_answer_review" if consistency == "consistent" and not known_bad else "not_required",
             "asr_mismatch_is_not_audio_error": True,
         }
         row["answer_quality_review"] = {
@@ -77,10 +83,14 @@ def gate_rows(
             "fact_or_safety": bool(row.get("fact_or_safety", False)),
         }
         row.setdefault("provenance", {})["voiceassistant_quality_gate"] = "v1"
-        if consistent and not known_bad:
+        if consistency == "consistent" and not known_bad:
             ready.append(row)
         else:
-            row["quarantine_reason"] = "known_audio_label_mismatch" if known_bad else "asr_question_mismatch"
+            row["quarantine_reason"] = (
+                "known_audio_label_mismatch" if known_bad
+                else "asr_question_low_confidence" if consistency == "low_confidence"
+                else "asr_question_mismatch"
+            )
             quarantine.append(row)
     return ready, quarantine
 
