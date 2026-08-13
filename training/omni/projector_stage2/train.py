@@ -686,6 +686,34 @@ def load_stage1_projector_initialization(
     }
 
 
+def load_stage2_trainable_initialization(
+    model: Any, checkpoint: Path, expected_sha256: str
+) -> dict[str, Any]:
+    """Initialize projector and LoRA from a Stage2 checkpoint, without optimizer state."""
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"stage-two checkpoint does not exist: {checkpoint}")
+    actual_sha256 = _sha256(checkpoint)
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            f"stage-two checkpoint SHA256 mismatch: expected={expected_sha256}, actual={actual_sha256}"
+        )
+    import torch
+
+    state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    if state.get("format") != "projector-stage2-v2":
+        raise ValueError("checkpoint is not a projector-stage2-v2 checkpoint")
+    trainable_state = state.get("trainable_state")
+    if not isinstance(trainable_state, dict) or not trainable_state:
+        raise ValueError("stage-two checkpoint has no trainable_state")
+    _missing, unexpected = model.load_state_dict(trainable_state, strict=False)
+    if unexpected:
+        raise ValueError(f"stage-two checkpoint has unknown weights: {unexpected[:3]}")
+    return {
+        "checkpoint": str(checkpoint.resolve()),
+        "sha256": actual_sha256,
+        "format": state["format"],
+        "source_step": int(state.get("step", 0)),
+    }
 def load_manifest(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         raise FileNotFoundError(f"manifest does not exist: {path}")
@@ -1498,6 +1526,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--projector-in-features", type=int)
     parser.add_argument("--projector-out-features", type=int)
     parser.add_argument("--init-projector-checkpoint", type=Path)
+    parser.add_argument("--init-stage2-checkpoint", type=Path)
+    parser.add_argument("--init-stage2-sha256")
     parser.add_argument(
         "--init-projector-sha256", default=FROZEN_STAGE1_PROJECTOR_SHA256
     )
@@ -1608,6 +1638,12 @@ def main(argv: list[str] | None = None) -> int:
             args.gradient_checkpointing,
         )
         model.feature_cache_metadata = cache_metadata
+        if (args.init_stage2_checkpoint is None) != (args.init_stage2_sha256 is None):
+            raise ValueError("--init-stage2-checkpoint and --init-stage2-sha256 must be provided together")
+        if args.init_stage2_checkpoint is not None:
+            model.stage2_initialization = load_stage2_trainable_initialization(
+                model, args.init_stage2_checkpoint, args.init_stage2_sha256
+            )
         freeze_asr_and_select_trainables(model, args.asr_encoder_prefix, args.projector_prefix)
         if distributed:
             from torch.nn.parallel import DistributedDataParallel
