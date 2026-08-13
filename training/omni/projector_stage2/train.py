@@ -91,7 +91,6 @@ class Stage2Config:
     max_validation_batches: int | None = None
     warmup_steps: int = 100
     min_learning_rate_ratio: float = 0.1
-    text_teacher_kl_weight: float = 0.0
 
 
 @dataclass
@@ -741,8 +740,6 @@ def validate_config(config: Stage2Config) -> None:
         )
     if config.weight_decay < 0:
         raise ValueError("weight_decay cannot be negative")
-    if config.text_teacher_kl_weight < 0:
-        raise ValueError("text_teacher_kl_weight cannot be negative")
     if config.gradient_accumulation_steps <= 0:
         raise ValueError("gradient_accumulation_steps must be positive")
     if (config.vision_train_manifest is None) != (config.vision_dev_manifest is None):
@@ -1006,24 +1003,6 @@ def build_model_from_pretrained(
 def _loss_value(output: Any) -> Any:
     return (
         output["loss"] if isinstance(output, dict) else getattr(output, "loss", output)
-    )
-
-
-def _loss_with_optional_text_teacher_kl(output: Any, batch: Any, weight: float) -> Any:
-    """Preserve CE exactly when the optional teacher loss is disabled."""
-    loss = _loss_value(output)
-    if weight == 0:
-        return loss
-    if not isinstance(output, dict) or not {"logits", "teacher_logits"} <= output.keys():
-        raise ValueError("text-teacher KL requires student and frozen-teacher logits")
-    teacher_labels = getattr(batch, "teacher_labels", None)
-    if teacher_labels is None:
-        raise ValueError("text-teacher KL requires a paired fixed-ASR text batch")
-    from .text_teacher_kl import answer_token_kl
-
-    return loss + answer_token_kl(
-        output["logits"], batch.labels.to(output["logits"].device), output["teacher_logits"],
-        teacher_labels.to(output["logits"].device), weight,
     )
 
 
@@ -1442,7 +1421,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-validation-batches", type=int)
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--min-learning-rate-ratio", type=float, default=0.1)
-    parser.add_argument("--text-teacher-kl-weight", type=float, default=0.0)
     parser.add_argument("--early-stopping-patience", type=int, default=0)
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument(
@@ -1512,7 +1490,6 @@ def main(argv: list[str] | None = None) -> int:
         max_validation_batches=args.max_validation_batches,
         warmup_steps=args.warmup_steps,
         min_learning_rate_ratio=args.min_learning_rate_ratio,
-        text_teacher_kl_weight=args.text_teacher_kl_weight,
     )
     if not args.run:
         result = run_preflight(config)
