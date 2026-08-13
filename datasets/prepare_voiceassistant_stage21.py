@@ -11,7 +11,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from prepare_audio_understanding_pilot import _split, _voiceassistant_row
+from datasets.prepare_audio_understanding_pilot import _split, _voiceassistant_row
 
 KNOWN_CONFLICT = "voiceassistant:0204465"
 
