@@ -56,10 +56,13 @@ def main() -> None:
     parser.add_argument("--output-manifest", type=Path, required=True)
     parser.add_argument("--teacher-model", required=True)
     args = parser.parse_args()
+    source_manifest: Path | list[Path] = (
+        args.source_manifest[0] if len(args.source_manifest) == 1 else args.source_manifest
+    )
     print(
         json.dumps(
             finalize(
-                source_manifest=args.source_manifest,
+                source_manifest=source_manifest,
                 shards=args.shard,
                 output_manifest=args.output_manifest,
                 teacher_model=args.teacher_model,
