@@ -35,7 +35,7 @@ def question_type(question: str) -> str:
         return "quantity"
     if re.search(
         r"\b(what|which).*(sound|noise|animal|instrument|vehicle|object|thing)"
-        r"|\bsource\b|\bwhat can be heard\b",
+        r"|\bsource\b|\bwhat (can be |is )?heard\b",
         normalized,
     ):
         return "source_object"

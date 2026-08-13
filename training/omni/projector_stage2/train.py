@@ -183,6 +183,61 @@ class CachedConversationBatchSource:
             )
 
 
+class WeightedAudioBatchSource(CachedConversationBatchSource):
+    """Cover VoiceAssistant once, then sample audio sources by fixed weight."""
+
+    _DATASETS = {
+        "voiceassistant": "shenyunhang/VoiceAssistant-400K",
+        "clotho": "Clotho-AQA",
+        "librispeech": "LibriSpeech",
+    }
+
+    def __init__(
+        self, rows: Sequence[dict[str, Any]], tokenizer: Any, feature_dir: Path,
+        audio_placeholder_id: int, batch_size: int, max_cached_shards: int, *,
+        voiceassistant_weight: float = 0.5, clotho_weight: float = 0.15,
+        librispeech_weight: float = 0.35, seed: int = 3407,
+        cache_factory: Callable[[Path, int], Any] | None = None,
+    ) -> None:
+        super().__init__(rows, tokenizer, feature_dir, audio_placeholder_id, batch_size,
+                         max_cached_shards, shuffle=False, seed=seed, cache_factory=cache_factory)
+        self.weights = (voiceassistant_weight, clotho_weight, librispeech_weight)
+        if any(weight <= 0 for weight in self.weights) or not math.isclose(sum(self.weights), 1.0, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError("audio sampling weights must be positive and sum to 1")
+        self.groups = {name: [dict(row) for row in self.rows if row.get("provenance", {}).get("dataset") == dataset] for name, dataset in self._DATASETS.items()}
+        missing = [name for name, group in self.groups.items() if not group]
+        if missing:
+            raise ValueError("weighted audio sampler requires non-empty groups: " + ", ".join(missing))
+
+    def _rows_for_epoch(self, epoch: int) -> list[dict[str, Any]]:
+        rng = random.Random(self.seed + epoch)
+        voice = [dict(row) for row in self.groups["voiceassistant"]]
+        rng.shuffle(voice)
+        total = round(len(voice) / self.weights[0])
+        clotho_count = round(total * self.weights[1])
+        librispeech_count = total - len(voice) - clotho_count
+        rows = voice
+        rows.extend(dict(row) for row in rng.choices(self.groups["clotho"], k=clotho_count))
+        rows.extend(dict(row) for row in rng.choices(self.groups["librispeech"], k=librispeech_count))
+        rng.shuffle(rows)
+        return rows
+
+    def __len__(self) -> int:
+        total = round(len(self.groups["voiceassistant"]) / self.weights[0])
+        return (total + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self) -> Iterator[Stage2ConversationBatch]:
+        if self.cache_factory is None:
+            from training.omni.projector_stage1.feature_cache import FeatureCache
+            feature_cache = FeatureCache(self.feature_dir, max_loaded_shards=self.max_cached_shards)
+        else:
+            feature_cache = self.cache_factory(self.feature_dir, self.max_cached_shards)
+        rows = self._rows_for_epoch(self._epoch)
+        self._epoch += 1
+        for index in range(0, len(rows), self.batch_size):
+            yield collate_cached_audio_conversations(rows[index : index + self.batch_size], self.tokenizer, feature_cache, self.audio_placeholder_id)
+
+
 def load_vision_distillation_manifest(path: Path) -> list[dict[str, Any]]:
     """Load fixed teacher-response image examples without accepting unlabeled images."""
     if not path.is_file():
@@ -1416,6 +1471,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--shuffle-seed", type=int, default=3407)
     parser.add_argument("--asr-replay-ratio", type=float, default=0.3)
+    parser.add_argument(
+        "--weighted-audio-sampling",
+        action="store_true",
+        help="Use deterministic 50/15/35 VoiceAssistant/Clotho/LibriSpeech sampling",
+    )
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--validation-every", type=int, default=100)
     parser.add_argument("--max-validation-batches", type=int)
@@ -1561,13 +1621,19 @@ def main(argv: list[str] | None = None) -> int:
             )
         train_rows = train_rows[rank::world_size]
         dev_rows = dev_rows[rank::world_size]
-        train_batches: Any = CachedConversationBatchSource(
-            train_rows, tokenizer, args.feature_dir, int(audio_placeholder_id),
-            args.batch_size, args.max_cached_feature_shards,
-            shuffle=True,
-            seed=args.shuffle_seed + rank,
-            asr_replay_ratio=args.asr_replay_ratio,
-        )
+        if args.weighted_audio_sampling:
+            train_batches: Any = WeightedAudioBatchSource(
+                train_rows, tokenizer, args.feature_dir, int(audio_placeholder_id),
+                args.batch_size, args.max_cached_feature_shards,
+                seed=args.shuffle_seed + rank,
+            )
+        else:
+            train_batches = CachedConversationBatchSource(
+                train_rows, tokenizer, args.feature_dir, int(audio_placeholder_id),
+                args.batch_size, args.max_cached_feature_shards,
+                shuffle=True, seed=args.shuffle_seed + rank,
+                asr_replay_ratio=args.asr_replay_ratio,
+            )
         dev_batches: Any = CachedConversationBatchSource(
             dev_rows, tokenizer, args.feature_dir, int(audio_placeholder_id),
             args.batch_size, args.max_cached_feature_shards,

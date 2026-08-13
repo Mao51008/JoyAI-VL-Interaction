@@ -26,6 +26,7 @@ from training.omni.projector_stage2.train import (
     load_stage1_projector_initialization,
     MixedStage2BatchSource,
     run_preflight,
+    WeightedAudioBatchSource,
     train_model,
 )
 
@@ -332,6 +333,46 @@ def test_cached_batch_source_preserves_explicit_task_assignments():
     task_types = [task for batch in source for task in batch.task_types]
     assert task_types.count("asr_transcription") == 4
     assert task_types.count("dialogue_response") == 6
+
+
+@pytest.mark.skipif(torch is None, reason="PyTorch is not installed")
+def test_weighted_audio_source_covers_voiceassistant_with_fixed_mix():
+    class Cache:
+        def get(self, sample_id):
+            return {"features": torch.ones(1, 2)}
+
+    def rows(dataset, count, task="dialogue_response"):
+        result = []
+        for index in range(count):
+            row = _row(f"{dataset}-{index}")
+            row["provenance"] = {"dataset": dataset}
+            row["training_task"] = task
+            result.append(row)
+        return result
+
+    source = WeightedAudioBatchSource(
+        [
+            *rows("shenyunhang/VoiceAssistant-400K", 10),
+            *rows("Clotho-AQA", 3),
+            *rows("LibriSpeech", 4, "asr_transcription"),
+        ],
+        ChatTokenizer(),
+        Path("cache"),
+        7,
+        batch_size=1,
+        max_cached_shards=1,
+        seed=23,
+        cache_factory=lambda *_: Cache(),
+    )
+    sample_ids = [batch.sample_ids[0] for batch in source]
+    assert len(sample_ids) == 20
+    assert sum(sample_id.startswith("shenyunhang/VoiceAssistant-400K") for sample_id in sample_ids) == 10
+    assert sum(sample_id.startswith("Clotho-AQA") for sample_id in sample_ids) == 3
+    assert sum(sample_id.startswith("LibriSpeech") for sample_id in sample_ids) == 7
+    assert {
+        sample_id for sample_id in sample_ids
+        if sample_id.startswith("shenyunhang/VoiceAssistant-400K")
+    } == {f"shenyunhang/VoiceAssistant-400K-{index}" for index in range(10)}
 
 
 @pytest.mark.skipif(torch is None, reason="PyTorch is not installed")
