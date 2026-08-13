@@ -422,7 +422,7 @@ def _build_supervised_sequence(
                 "content": (
                     ASR_SYSTEM_PROMPT
                     if training_task == "asr_transcription"
-                    else _system_prompt(str(row["sample_id"]))
+                    else str(row.get("system_prompt_override") or _system_prompt(str(row["sample_id"])))
                 ),
             },
             *history,

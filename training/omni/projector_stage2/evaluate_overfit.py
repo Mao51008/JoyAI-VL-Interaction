@@ -150,6 +150,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--no-progress", action="store_true")
+    parser.add_argument("--system-prompt-suffix")
     args = parser.parse_args(argv)
     if args.output.exists():
         raise FileExistsError(f"refusing to overwrite output: {args.output}")
@@ -166,6 +167,15 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError(f"unsupported checkpoint format: {state.get('format')!r}")
     lora_targets, lora_rank = _checkpoint_lora_layout(state)
     rows = select_task_rows(load_manifest(args.manifest), args.task)
+    if args.system_prompt_suffix is not None:
+        if args.task != "dialogue_response":
+            raise ValueError("--system-prompt-suffix is only valid for dialogue_response")
+        from .train import _system_prompt
+        suffix = args.system_prompt_suffix.strip()
+        if not suffix:
+            raise ValueError("--system-prompt-suffix cannot be empty")
+        for row in rows:
+            row["system_prompt_override"] = f"{_system_prompt(str(row['sample_id']))}\n{suffix}"
     if args.max_samples is not None:
         rows = rows[: args.max_samples]
     validate_feature_cache(args.feature_dir, rows)
@@ -235,6 +245,7 @@ def main(argv: list[str] | None = None) -> int:
         "checkpoint": str(args.checkpoint.resolve()),
         "manifest": str(args.manifest.resolve()),
         "task": args.task,
+        "system_prompt_suffix": args.system_prompt_suffix,
         "summary": summarise_records(records, args.task),
         "records": records,
     }

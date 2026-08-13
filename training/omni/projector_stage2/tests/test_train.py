@@ -439,6 +439,14 @@ def test_sequence_rejects_legacy_text_only_rows():
         )
 
 
+def test_sequence_uses_explicit_system_prompt_override_only_when_requested():
+    tokenizer = ChatTokenizer()
+    row = _row()
+    row["system_prompt_override"] = "Base prompt\nListen to the user's audio and answer the request directly."
+    _build_supervised_sequence(row, tokenizer, 7, 1, 4096)
+    assert tokenizer.calls[0][0][0]["content"] == row["system_prompt_override"]
+
+
 def test_feature_cache_validation_rejects_manifest_fingerprint_mismatch(tmp_path):
     cache = tmp_path / "cache"
     cache.mkdir()
