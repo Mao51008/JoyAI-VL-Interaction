@@ -14,17 +14,20 @@ DEFAULT_CATEGORIES = ("00A", "0M0", "0MA", "S0A", "SM0", "SMA")
 
 def parse_sample_key(key: str) -> tuple[str, float, float]:
     """Parse ACAVCaps keys whose timestamp decimal components may be omitted."""
-    parts = key.rsplit("_", 4)
-    if len(parts) == 5:
-        video_id, start_int, start_decimal, end_int, end_decimal = parts
+    if len(key) < 14 or key[11] != "_":
+        raise ValueError(f"invalid ACAVCaps sample key: {key}")
+    video_id = key[:11]
+    parts = key[12:].split("_")
+    if len(parts) == 4:
+        start_int, start_decimal, end_int, end_decimal = parts
         start = float(f"{start_int}.{start_decimal}")
         end = float(f"{end_int}.{end_decimal}")
-    elif len(parts) == 4:
-        video_id, start_int, start_decimal, end_int = parts
+    elif len(parts) == 3:
+        start_int, start_decimal, end_int = parts
         start = float(f"{start_int}.{start_decimal}")
         end = float(end_int)
-    elif len(parts) == 3:
-        video_id, start_int, end_int = parts
+    elif len(parts) == 2:
+        start_int, end_int = parts
         start = float(start_int)
         end = float(end_int)
     else:
