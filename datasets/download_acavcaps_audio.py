@@ -36,7 +36,7 @@ def yt_dlp_command(row: dict[str, Any], audio_root: Path, yt_dlp: str, proxy: st
         f"https://www.youtube.com/watch?v={row['video_id']}",
     ]
     if proxy:
-        command[1:1] = ["--proxy", proxy]
+        command[1:1] = ["--proxy", proxy, "--downloader-args", f"ffmpeg_i:-http_proxy {proxy}"]
     return command
 
 

@@ -22,6 +22,7 @@ class DownloadAcavcapsAudioTest(unittest.TestCase):
         command = DOWNLOADER.yt_dlp_command(row, Path("/data/maoyy/audio"), "yt-dlp", "http://127.0.0.1:17897")
         self.assertIn("*85.9075-95.9075", command)
         self.assertIn("http://127.0.0.1:17897", command)
+        self.assertIn("ffmpeg_i:-http_proxy http://127.0.0.1:17897", command)
         self.assertIn("https://www.youtube.com/watch?v=wn17EHKNLoE", command)
         output = command[command.index("--output") + 1].replace("\\", "/")
         self.assertEqual(output, "/data/maoyy/audio/00A/wn17EHKNLoE_85_9075_95_9075.%(ext)s")
