@@ -56,41 +56,50 @@ def filter_rows_by_input_tokens(
     feature_dir: Path,
     audio_placeholder_id: int,
     max_input_tokens: int,
+    max_audio_tokens: int,
     max_cached_feature_shards: int,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Discard rows whose original text-plus-audio sequence exceeds the hard limit."""
-    if max_input_tokens <= 0:
-        raise ValueError("max_input_tokens must be positive")
+    """Discard rows that exceed either the total or audio-token hard limit."""
+    if min(max_input_tokens, max_audio_tokens) <= 0:
+        raise ValueError("max_input_tokens and max_audio_tokens must be positive")
     from training.omni.projector_stage1.feature_cache import FeatureCache
 
     cache = FeatureCache(feature_dir, max_loaded_shards=max_cached_feature_shards)
     kept: list[dict[str, Any]] = []
-    dropped = 0
+    dropped_input = 0
+    dropped_audio = 0
     longest_kept = 0
     longest_dropped = 0
     for row in rows:
         feature = cache.get(str(row["sample_id"]))["features"]
+        audio_tokens = int(feature.shape[0])
         sequence = _build_supervised_sequence(
             row,
             tokenizer,
             audio_placeholder_id,
-            int(feature.shape[0]),
+            audio_tokens,
             max_length=2**31 - 1,
         )
         token_count = len(sequence["input_ids"])
-        if token_count > max_input_tokens:
-            dropped += 1
+        if audio_tokens > max_audio_tokens:
+            dropped_audio += 1
+            longest_dropped = max(longest_dropped, token_count)
+        elif token_count > max_input_tokens:
+            dropped_input += 1
             longest_dropped = max(longest_dropped, token_count)
         else:
             kept.append(row)
             longest_kept = max(longest_kept, token_count)
     if not kept:
-        raise ValueError("all samples exceed max_input_tokens")
+        raise ValueError("all samples exceed the configured token limits")
     return kept, {
         "max_input_tokens": max_input_tokens,
+        "max_audio_tokens": max_audio_tokens,
         "input_samples": len(rows),
         "kept_samples": len(kept),
-        "dropped_samples": dropped,
+        "dropped_samples": dropped_input + dropped_audio,
+        "dropped_for_input_tokens": dropped_input,
+        "dropped_for_audio_tokens": dropped_audio,
         "longest_kept_tokens": longest_kept,
         "longest_dropped_tokens": longest_dropped,
     }
@@ -101,7 +110,8 @@ def run_training(
     llm_model: str, batch_size: int, max_cached_feature_shards: int, steps: int,
     learning_rate: float, weight_decay: float, gradient_accumulation_steps: int,
     validation_every: int, warmup_steps: int, max_grad_norm: float, seed: int,
-    device: str, no_progress: bool, max_input_tokens: int = 2048,
+    device: str, no_progress: bool, max_input_tokens: int = 1536,
+    max_audio_tokens: int = 512,
     distributed: bool = False,
 ) -> dict[str, Any]:
     """Load JoyAI only after explicit authorization and train exactly the projector."""
@@ -125,10 +135,12 @@ def run_training(
     if rank == 0:
         train_rows, train_filter = filter_rows_by_input_tokens(
             train_rows, tokenizer, feature_dir, int(placeholder_id), max_input_tokens,
+            max_audio_tokens,
             max_cached_feature_shards,
         )
         dev_rows, dev_filter = filter_rows_by_input_tokens(
             dev_rows, tokenizer, feature_dir, int(placeholder_id), max_input_tokens,
+            max_audio_tokens,
             max_cached_feature_shards,
         )
         filtered_rows: list[Any] = [train_rows, dev_rows, train_filter, dev_filter]
@@ -192,7 +204,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--validation-every", type=int, default=100)
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--max-input-tokens", type=int, default=2048)
+    parser.add_argument("--max-input-tokens", type=int, default=1536)
+    parser.add_argument("--max-audio-tokens", type=int, default=512)
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--no-progress", action="store_true")
