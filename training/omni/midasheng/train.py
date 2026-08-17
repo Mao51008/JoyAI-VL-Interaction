@@ -54,7 +54,7 @@ def run_training(
     llm_model: str, batch_size: int, max_cached_feature_shards: int, steps: int,
     learning_rate: float, weight_decay: float, gradient_accumulation_steps: int,
     validation_every: int, warmup_steps: int, max_grad_norm: float, seed: int,
-    device: str, no_progress: bool,
+    device: str, no_progress: bool, distributed: bool = False,
 ) -> dict[str, Any]:
     """Load JoyAI only after explicit authorization and train exactly the projector."""
     preflight_result = preflight(
@@ -64,6 +64,11 @@ def run_training(
     import torch
     from transformers import AutoModelForImageTextToText, AutoTokenizer
 
+    if distributed != torch.distributed.is_initialized():
+        raise RuntimeError("distributed flag and process-group state differ")
+    rank = torch.distributed.get_rank() if distributed else 0
+    world_size = torch.distributed.get_world_size() if distributed else 1
+
     tokenizer = AutoTokenizer.from_pretrained(llm_model, fix_mistral_regex=True)
     placeholder_id = tokenizer.convert_tokens_to_ids("<|vision_pad|>")
     if placeholder_id is None or placeholder_id == getattr(tokenizer, "unk_token_id", None):
@@ -72,6 +77,13 @@ def run_training(
         AutoModelForImageTextToText.from_pretrained(llm_model, dtype=torch.bfloat16),
     ).to(device=device, dtype=torch.bfloat16)
     train_rows, dev_rows = load_manifest(train_manifest), load_manifest(dev_manifest)
+    train_rows, dev_rows = train_rows[rank::world_size], dev_rows[rank::world_size]
+    if not train_rows or not dev_rows:
+        raise ValueError("every DDP rank must receive train and dev samples")
+    if distributed:
+        from torch.nn.parallel import DistributedDataParallel
+
+        model = DistributedDataParallel(model, device_ids=[torch.cuda.current_device()])
     train_batches = CachedConversationBatchSource(
         train_rows, tokenizer, feature_dir, int(placeholder_id), batch_size,
         max_cached_feature_shards, shuffle=True, seed=seed,
@@ -90,10 +102,13 @@ def run_training(
         no_progress=no_progress,
     )
     result = train_model(model, train_batches, dev_batches, config)
-    (output_dir / "preflight.json").write_text(
-        json.dumps(preflight_result, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    if rank == 0:
+        (output_dir / "preflight.json").write_text(
+            json.dumps(preflight_result, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    if distributed:
+        torch.distributed.barrier()
     return {"preflight": preflight_result, "training": result}
 
 
@@ -116,8 +131,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--no-progress", action="store_true")
+    parser.add_argument("--distributed", action="store_true")
     parser.add_argument("--run", action="store_true")
     args = parser.parse_args(argv)
+    if args.distributed:
+        import torch
+
+        local_rank = int(__import__("os").environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        torch.distributed.init_process_group("nccl")
+        args.device = f"cuda:{local_rank}"
     if args.run:
         if not args.llm_model:
             parser.error("--run requires --llm-model")
@@ -129,7 +152,10 @@ def main(argv: list[str] | None = None) -> int:
             train_manifest=args.train_manifest, dev_manifest=args.dev_manifest,
             feature_dir=args.feature_dir, output_dir=args.output_dir,
         )
-    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    if not args.distributed or __import__("torch").distributed.get_rank() == 0:
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    if args.distributed:
+        __import__("torch").distributed.destroy_process_group()
     return 0
 
 
