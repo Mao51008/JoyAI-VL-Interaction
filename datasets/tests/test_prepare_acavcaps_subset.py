@@ -20,6 +20,9 @@ class PrepareAcavcapsSubsetTest(unittest.TestCase):
             ("wn17EHKNLoE", 85.9075, 95.9075),
         )
 
+    def test_parse_sample_key_accepts_omitted_end_decimal(self) -> None:
+        self.assertEqual(PREPARE.parse_sample_key("woMpG3UGsTs_51_0_61"), ("woMpG3UGsTs", 51.0, 61.0))
+
     def test_subset_uses_first_bounded_samples_per_category(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
