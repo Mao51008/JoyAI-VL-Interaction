@@ -38,4 +38,5 @@ class Phase1SamplingTest(unittest.TestCase):
             rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(result["task_counts"], {"voiceassistant": 2, "librispeech": 1, "clotho_aqa": 1})
             self.assertTrue(all("midasheng_phase1_sampler" in row["metadata"] for row in rows))
+            self.assertTrue(all(row["sample_id"].startswith("midasheng-") for row in rows))
             self.assertTrue(all(path.read_text(encoding="utf-8").count("\n") == 1 for path in source_paths.values()))

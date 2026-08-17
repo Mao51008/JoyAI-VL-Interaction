@@ -40,10 +40,15 @@ def prepare_manifest(
     with output_manifest.open("x", encoding="utf-8") as handle:
         for task, draw_index, row in draws:
             metadata = dict(row.get("metadata", {}))
+            source_sample_id = str(row.get("sample_id", "")).strip()
+            if not source_sample_id:
+                raise ValueError(f"{task} sampler source has no sample_id")
+            row["sample_id"] = f"midasheng-{task}-{draw_index:08d}-{source_sample_id}"
             metadata["midasheng_phase1_sampler"] = {
                 "task": task,
                 "draw_index": draw_index,
                 "seed": seed,
+                "source_sample_id": source_sample_id,
             }
             row["metadata"] = metadata
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")

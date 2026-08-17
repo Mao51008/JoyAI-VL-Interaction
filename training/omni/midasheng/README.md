@@ -42,4 +42,14 @@ python -m training.omni.midasheng.cache_features \
   --device cuda:0
 ```
 
-缓存产生的是 Stage 2 formal-manifest 兼容格式，不能交给旧的 ASR-only `projector_stage1.train`：后者会把 VoiceAssistant 和 Clotho-AQA 错误地改写成转录提示。Phase 1 训练入口必须使用 `training.omni.midasheng` 的任务感知 collator，并将 `--output-dir` 限定在 `$ROOT/runs/`。
+缓存产生的是 Stage 2 formal-manifest 兼容格式，不能交给旧的 ASR-only `projector_stage1.train`：后者会把 VoiceAssistant 和 Clotho-AQA 错误地改写成转录提示。使用新的任务感知入口，并将 `--output-dir` 限定在 `$ROOT/runs/`：
+
+```bash
+python -m training.omni.midasheng.train \
+  --train-manifest "$ROOT"/manifests/phase1_train_100k.jsonl \
+  --dev-manifest "$ROOT"/manifests/phase1_dev.jsonl \
+  --feature-dir "$ROOT"/features/phase1_train_and_dev \
+  --output-dir "$ROOT"/runs/phase1_001
+```
+
+上面的默认行为只执行 CPU preflight。GPU 空闲并经用户授权后，追加 `--run`、`--llm-model /data/maoyy/models/jdopensource/JoyAI-VL-Interaction` 和明确的训练参数才会加载 JoyAI 并训练。
