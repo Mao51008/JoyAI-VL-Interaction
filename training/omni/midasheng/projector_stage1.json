@@ -1,0 +1,21 @@
+{
+  "stage": "midasheng_projector_only_audio_alignment",
+  "audio_model": "/data/maoyy/models/midashenglm-7b-1021-bf16",
+  "audio_model_revision": "76c3019",
+  "joyai_model": "/data/maoyy/models/jdopensource/JoyAI-VL-Interaction",
+  "projector": {
+    "input_size": 1280,
+    "output_size": 4096,
+    "hidden_size": 4096,
+    "dropout": 0.0
+  },
+  "optimizer": {
+    "name": "adamw",
+    "learning_rate": 0.0001,
+    "weight_decay": 0.01
+  },
+  "precision": "bf16",
+  "gradient_checkpointing": true,
+  "save_projector_only": true,
+  "dimensions_require_probe": false
+}
