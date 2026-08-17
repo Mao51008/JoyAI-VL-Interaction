@@ -183,6 +183,61 @@ class CachedConversationBatchSource:
             )
 
 
+class WeightedAudioBatchSource(CachedConversationBatchSource):
+    """Cover VoiceAssistant once, then sample audio sources by fixed weight."""
+
+    _DATASETS = {
+        "voiceassistant": "shenyunhang/VoiceAssistant-400K",
+        "clotho": "Clotho-AQA",
+        "librispeech": "LibriSpeech",
+    }
+
+    def __init__(
+        self, rows: Sequence[dict[str, Any]], tokenizer: Any, feature_dir: Path,
+        audio_placeholder_id: int, batch_size: int, max_cached_shards: int, *,
+        voiceassistant_weight: float = 0.5, clotho_weight: float = 0.15,
+        librispeech_weight: float = 0.35, seed: int = 3407,
+        cache_factory: Callable[[Path, int], Any] | None = None,
+    ) -> None:
+        super().__init__(rows, tokenizer, feature_dir, audio_placeholder_id, batch_size,
+                         max_cached_shards, shuffle=False, seed=seed, cache_factory=cache_factory)
+        self.weights = (voiceassistant_weight, clotho_weight, librispeech_weight)
+        if any(weight <= 0 for weight in self.weights) or not math.isclose(sum(self.weights), 1.0, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError("audio sampling weights must be positive and sum to 1")
+        self.groups = {name: [dict(row) for row in self.rows if row.get("provenance", {}).get("dataset") == dataset] for name, dataset in self._DATASETS.items()}
+        missing = [name for name, group in self.groups.items() if not group]
+        if missing:
+            raise ValueError("weighted audio sampler requires non-empty groups: " + ", ".join(missing))
+
+    def _rows_for_epoch(self, epoch: int) -> list[dict[str, Any]]:
+        rng = random.Random(self.seed + epoch)
+        voice = [dict(row) for row in self.groups["voiceassistant"]]
+        rng.shuffle(voice)
+        total = round(len(voice) / self.weights[0])
+        clotho_count = round(total * self.weights[1])
+        librispeech_count = total - len(voice) - clotho_count
+        rows = voice
+        rows.extend(dict(row) for row in rng.choices(self.groups["clotho"], k=clotho_count))
+        rows.extend(dict(row) for row in rng.choices(self.groups["librispeech"], k=librispeech_count))
+        rng.shuffle(rows)
+        return rows
+
+    def __len__(self) -> int:
+        total = round(len(self.groups["voiceassistant"]) / self.weights[0])
+        return (total + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self) -> Iterator[Stage2ConversationBatch]:
+        if self.cache_factory is None:
+            from training.omni.projector_stage1.feature_cache import FeatureCache
+            feature_cache = FeatureCache(self.feature_dir, max_loaded_shards=self.max_cached_shards)
+        else:
+            feature_cache = self.cache_factory(self.feature_dir, self.max_cached_shards)
+        rows = self._rows_for_epoch(self._epoch)
+        self._epoch += 1
+        for index in range(0, len(rows), self.batch_size):
+            yield collate_cached_audio_conversations(rows[index : index + self.batch_size], self.tokenizer, feature_cache, self.audio_placeholder_id)
+
+
 def load_vision_distillation_manifest(path: Path) -> list[dict[str, Any]]:
     """Load fixed teacher-response image examples without accepting unlabeled images."""
     if not path.is_file():
@@ -631,6 +686,34 @@ def load_stage1_projector_initialization(
     }
 
 
+def load_stage2_trainable_initialization(
+    model: Any, checkpoint: Path, expected_sha256: str
+) -> dict[str, Any]:
+    """Initialize projector and LoRA from a Stage2 checkpoint, without optimizer state."""
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"stage-two checkpoint does not exist: {checkpoint}")
+    actual_sha256 = _sha256(checkpoint)
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            f"stage-two checkpoint SHA256 mismatch: expected={expected_sha256}, actual={actual_sha256}"
+        )
+    import torch
+
+    state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    if state.get("format") != "projector-stage2-v2":
+        raise ValueError("checkpoint is not a projector-stage2-v2 checkpoint")
+    trainable_state = state.get("trainable_state")
+    if not isinstance(trainable_state, dict) or not trainable_state:
+        raise ValueError("stage-two checkpoint has no trainable_state")
+    _missing, unexpected = model.load_state_dict(trainable_state, strict=False)
+    if unexpected:
+        raise ValueError(f"stage-two checkpoint has unknown weights: {unexpected[:3]}")
+    return {
+        "checkpoint": str(checkpoint.resolve()),
+        "sha256": actual_sha256,
+        "format": state["format"],
+        "source_step": int(state.get("step", 0)),
+    }
 def load_manifest(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         raise FileNotFoundError(f"manifest does not exist: {path}")
@@ -1419,6 +1502,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--shuffle-seed", type=int, default=3407)
     parser.add_argument("--asr-replay-ratio", type=float, default=0.3)
+    parser.add_argument(
+        "--weighted-audio-sampling",
+        action="store_true",
+        help="Use deterministic 50/15/35 VoiceAssistant/Clotho/LibriSpeech sampling",
+    )
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--validation-every", type=int, default=100)
     parser.add_argument("--max-validation-batches", type=int)
@@ -1441,6 +1529,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--projector-in-features", type=int)
     parser.add_argument("--projector-out-features", type=int)
     parser.add_argument("--init-projector-checkpoint", type=Path)
+    parser.add_argument("--init-stage2-checkpoint", type=Path)
+    parser.add_argument("--init-stage2-sha256")
     parser.add_argument(
         "--init-projector-sha256", default=FROZEN_STAGE1_PROJECTOR_SHA256
     )
@@ -1551,6 +1641,12 @@ def main(argv: list[str] | None = None) -> int:
             args.gradient_checkpointing,
         )
         model.feature_cache_metadata = cache_metadata
+        if (args.init_stage2_checkpoint is None) != (args.init_stage2_sha256 is None):
+            raise ValueError("--init-stage2-checkpoint and --init-stage2-sha256 must be provided together")
+        if args.init_stage2_checkpoint is not None:
+            model.stage2_initialization = load_stage2_trainable_initialization(
+                model, args.init_stage2_checkpoint, args.init_stage2_sha256
+            )
         freeze_asr_and_select_trainables(model, args.asr_encoder_prefix, args.projector_prefix)
         if distributed:
             from torch.nn.parallel import DistributedDataParallel
@@ -1564,13 +1660,19 @@ def main(argv: list[str] | None = None) -> int:
             )
         train_rows = train_rows[rank::world_size]
         dev_rows = dev_rows[rank::world_size]
-        train_batches: Any = CachedConversationBatchSource(
-            train_rows, tokenizer, args.feature_dir, int(audio_placeholder_id),
-            args.batch_size, args.max_cached_feature_shards,
-            shuffle=True,
-            seed=args.shuffle_seed + rank,
-            asr_replay_ratio=args.asr_replay_ratio,
-        )
+        if args.weighted_audio_sampling:
+            train_batches: Any = WeightedAudioBatchSource(
+                train_rows, tokenizer, args.feature_dir, int(audio_placeholder_id),
+                args.batch_size, args.max_cached_feature_shards,
+                seed=args.shuffle_seed + rank,
+            )
+        else:
+            train_batches = CachedConversationBatchSource(
+                train_rows, tokenizer, args.feature_dir, int(audio_placeholder_id),
+                args.batch_size, args.max_cached_feature_shards,
+                shuffle=True, seed=args.shuffle_seed + rank,
+                asr_replay_ratio=args.asr_replay_ratio,
+            )
         dev_batches: Any = CachedConversationBatchSource(
             dev_rows, tokenizer, args.feature_dir, int(audio_placeholder_id),
             args.batch_size, args.max_cached_feature_shards,

@@ -27,7 +27,7 @@ def _rows(path: Path) -> list[dict[str, Any]]:
     except json.JSONDecodeError:
         return [json.loads(line) for line in contents.splitlines() if line.strip()]
     if not isinstance(loaded, list):
-        raise ValueError(f"cache index must be a JSON array or JSONL: {path}")
+        return [loaded]
     return loaded
 
 
