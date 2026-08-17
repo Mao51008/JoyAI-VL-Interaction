@@ -15,6 +15,7 @@
 - 输入为单声道 16 kHz waveform，缓存其带有效 mask 截断的原始 1280 维特征；
 - 项目 projector 配置为 `LayerNorm(1280) → Linear(1280, 4096) → GELU → Dropout(0) → Linear(4096, 4096)`；
 - 仅训练该 projector；MiDasheng、JoyAI 和视觉路径均冻结；不加载 LoRA；
+- 训练前按原始完整的文本加音频占位 token 计数过滤样本；默认硬上限为 2048，超过即丢弃，不截断或删减历史；
 - task sampler 固定为 VoiceAssistant 50%、LibriSpeech 25%、Clotho-AQA 25%，以有放回抽样实现，绝不按 manifest 自然行数混合。
 
 ## 操作顺序
