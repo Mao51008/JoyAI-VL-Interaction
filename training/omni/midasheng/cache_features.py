@@ -126,19 +126,52 @@ def cache_features(
     return metadata
 
 
+def merge_feature_cache_parts(
+    *, manifests: list[Path], part_dirs: list[Path], output_dir: Path, limit: int | None = None
+) -> dict[str, Any]:
+    """Merge train/dev indices without copying any cached feature shard."""
+    from training.omni.projector_stage2.cache_features import merge_feature_cache_parts as merge_base
+
+    part_metadata = [json.loads((directory / "metadata.json").read_text(encoding="utf-8")) for directory in part_dirs]
+    if not part_metadata:
+        raise ValueError("at least one cache part is required")
+    keys = ("feature_source", "audio_model", "audio_model_revision", "audio_encoder_dim", "sample_rate", "config_sha256")
+    identity = {key: part_metadata[0].get(key) for key in keys}
+    if any({key: metadata.get(key) for key in keys} != identity for metadata in part_metadata[1:]):
+        raise ValueError("cache parts do not use the same MiDasheng encoder identity")
+    metadata = merge_base(manifests=manifests, part_dirs=part_dirs, output_dir=output_dir, limit=limit)
+    metadata.update(identity)
+    (output_dir / "metadata.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return metadata
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, action="append", required=True)
-    parser.add_argument("--model-dir", type=Path, required=True)
+    parser.add_argument("--model-dir", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--shard-size", type=int, default=256)
     parser.add_argument("--model-revision", default="76c3019")
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--merge-part", type=Path, action="append")
     args = parser.parse_args()
     arguments = vars(args)
     arguments["manifests"] = arguments.pop("manifest")
-    print(json.dumps(cache_features(**arguments), ensure_ascii=False, indent=2))
+    if arguments.pop("merge_part"):
+        if arguments["model_dir"] is not None:
+            parser.error("--model-dir cannot be used with --merge-part")
+        result = merge_feature_cache_parts(
+            manifests=arguments["manifests"], part_dirs=args.merge_part,
+            output_dir=arguments["output_dir"], limit=arguments["limit"],
+        )
+    else:
+        if arguments["model_dir"] is None:
+            parser.error("--model-dir is required unless --merge-part is used")
+        result = cache_features(**arguments)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
