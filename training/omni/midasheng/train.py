@@ -11,6 +11,7 @@ from training.omni.projector_stage2.cache_features import validate_feature_cache
 from training.omni.projector_stage2.train import (
     CachedConversationBatchSource,
     Stage2Config,
+    _build_supervised_sequence,
     load_manifest,
     train_model,
     validate_manifests,
@@ -49,12 +50,59 @@ def preflight(
     return result
 
 
+def filter_rows_by_input_tokens(
+    rows: list[dict[str, Any]],
+    tokenizer: Any,
+    feature_dir: Path,
+    audio_placeholder_id: int,
+    max_input_tokens: int,
+    max_cached_feature_shards: int,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Discard rows whose original text-plus-audio sequence exceeds the hard limit."""
+    if max_input_tokens <= 0:
+        raise ValueError("max_input_tokens must be positive")
+    from training.omni.projector_stage1.feature_cache import FeatureCache
+
+    cache = FeatureCache(feature_dir, max_loaded_shards=max_cached_feature_shards)
+    kept: list[dict[str, Any]] = []
+    dropped = 0
+    longest_kept = 0
+    longest_dropped = 0
+    for row in rows:
+        feature = cache.get(str(row["sample_id"]))["features"]
+        sequence = _build_supervised_sequence(
+            row,
+            tokenizer,
+            audio_placeholder_id,
+            int(feature.shape[0]),
+            max_length=2**31 - 1,
+        )
+        token_count = len(sequence["input_ids"])
+        if token_count > max_input_tokens:
+            dropped += 1
+            longest_dropped = max(longest_dropped, token_count)
+        else:
+            kept.append(row)
+            longest_kept = max(longest_kept, token_count)
+    if not kept:
+        raise ValueError("all samples exceed max_input_tokens")
+    return kept, {
+        "max_input_tokens": max_input_tokens,
+        "input_samples": len(rows),
+        "kept_samples": len(kept),
+        "dropped_samples": dropped,
+        "longest_kept_tokens": longest_kept,
+        "longest_dropped_tokens": longest_dropped,
+    }
+
+
 def run_training(
     *, train_manifest: Path, dev_manifest: Path, feature_dir: Path, output_dir: Path,
     llm_model: str, batch_size: int, max_cached_feature_shards: int, steps: int,
     learning_rate: float, weight_decay: float, gradient_accumulation_steps: int,
     validation_every: int, warmup_steps: int, max_grad_norm: float, seed: int,
-    device: str, no_progress: bool, distributed: bool = False,
+    device: str, no_progress: bool, max_input_tokens: int = 2048,
+    distributed: bool = False,
 ) -> dict[str, Any]:
     """Load JoyAI only after explicit authorization and train exactly the projector."""
     preflight_result = preflight(
@@ -73,10 +121,26 @@ def run_training(
     placeholder_id = tokenizer.convert_tokens_to_ids("<|vision_pad|>")
     if placeholder_id is None or placeholder_id == getattr(tokenizer, "unk_token_id", None):
         raise ValueError("JoyAI tokenizer has no <|vision_pad|> placeholder")
+    train_rows, dev_rows = load_manifest(train_manifest), load_manifest(dev_manifest)
+    if rank == 0:
+        train_rows, train_filter = filter_rows_by_input_tokens(
+            train_rows, tokenizer, feature_dir, int(placeholder_id), max_input_tokens,
+            max_cached_feature_shards,
+        )
+        dev_rows, dev_filter = filter_rows_by_input_tokens(
+            dev_rows, tokenizer, feature_dir, int(placeholder_id), max_input_tokens,
+            max_cached_feature_shards,
+        )
+        filtered_rows: list[Any] = [train_rows, dev_rows, train_filter, dev_filter]
+    else:
+        filtered_rows = [None, None, None, None]
+    if distributed:
+        torch.distributed.broadcast_object_list(filtered_rows, src=0)
+    train_rows, dev_rows, train_filter, dev_filter = filtered_rows
+    preflight_result["input_token_filter"] = {"train": train_filter, "dev": dev_filter}
     model = build_phase1_model(
         AutoModelForImageTextToText.from_pretrained(llm_model, dtype=torch.bfloat16),
     ).to(device=device, dtype=torch.bfloat16)
-    train_rows, dev_rows = load_manifest(train_manifest), load_manifest(dev_manifest)
     train_rows, dev_rows = train_rows[rank::world_size], dev_rows[rank::world_size]
     if not train_rows or not dev_rows:
         raise ValueError("every DDP rank must receive train and dev samples")
@@ -128,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--validation-every", type=int, default=100)
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--max-input-tokens", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--no-progress", action="store_true")

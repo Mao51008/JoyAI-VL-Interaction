@@ -1302,6 +1302,9 @@ def train_model(
         ):
             raise ValueError("validation sources must be non-empty and sized")
     records: list[dict[str, Any]] = []
+    metrics_path = config.output_dir / "metrics.jsonl"
+    if rank == 0:
+        metrics_path.write_text("", encoding="utf-8")
     best_validation = float("inf")
     bad_checks = 0
     start_step = 0
@@ -1432,6 +1435,9 @@ def train_model(
                 bad_checks += 1
         if rank == 0:
             records.append(record)
+            with metrics_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+            _write_loss_curve(records, config.output_dir / "loss_curve.svg")
         if progress is not None:
             progress.update(1)
             progress.set_postfix(loss=f"{record['loss']:.4f}")
@@ -1451,9 +1457,6 @@ def train_model(
             records[-1]["step"],
             best_validation,
             config,
-        )
-        (config.output_dir / "metrics.jsonl").write_text(
-            "".join(json.dumps(row, sort_keys=True) + "\n" for row in records), encoding="utf-8"
         )
         _write_loss_curve(records, config.output_dir / "loss_curve.svg")
     return {
