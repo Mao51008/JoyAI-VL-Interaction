@@ -160,11 +160,12 @@ def main() -> None:
     args = parser.parse_args()
     arguments = vars(args)
     arguments["manifests"] = arguments.pop("manifest")
-    if arguments.pop("merge_part"):
+    merge_parts = arguments.pop("merge_part")
+    if merge_parts:
         if arguments["model_dir"] is not None:
             parser.error("--model-dir cannot be used with --merge-part")
         result = merge_feature_cache_parts(
-            manifests=arguments["manifests"], part_dirs=args.merge_part,
+            manifests=arguments["manifests"], part_dirs=merge_parts,
             output_dir=arguments["output_dir"], limit=arguments["limit"],
         )
     else:
