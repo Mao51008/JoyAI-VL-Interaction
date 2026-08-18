@@ -153,6 +153,14 @@ def filter_rows_by_audio_limit(
                   "max_audio_tokens": max_audio_tokens, "max_duration_ms": max_duration_ms}
 
 
+def load_joint_manifest(path: Path, max_audio_tokens: int) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Load a formal manifest and retain its root for raw audio resolution."""
+    rows, report = filter_rows_by_audio_limit(load_manifest(path), max_audio_tokens)
+    for row in rows:
+        row["_manifest_root"] = str(path.parent)
+    return rows, report
+
+
 def load_midasheng_projector_initialization(
     projector: Any, checkpoint: Path, expected_sha256: str, source_preflight: Path,
     audio_model: str,
@@ -371,16 +379,20 @@ def main(argv: list[str] | None = None) -> int:
     audio_encoder = audio_model.audio_encoder
     del audio_model; gc.collect()
     llm = AutoModelForImageTextToText.from_pretrained(args.llm_model, dtype=torch.bfloat16)
+    if not hasattr(audio_encoder, "gradient_checkpointing_enable"):
+        raise TypeError("MiDasheng audio encoder does not support gradient checkpointing")
+    audio_encoder.gradient_checkpointing_enable()
+    if not hasattr(llm, "gradient_checkpointing_enable") or not hasattr(llm, "enable_input_require_grads"):
+        raise TypeError("JoyAI language model does not support LoRA gradient checkpointing")
+    llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    llm.enable_input_require_grads()
+    llm.config.use_cache = False
     model, runtime_report = build_joint_model(audio_encoder, llm, projector_checkpoint=args.init_projector_checkpoint,
         projector_sha256=args.init_projector_sha256, projector_preflight=args.init_projector_preflight,
         audio_model=args.audio_model)
     model = model.to(device=args.device, dtype=torch.bfloat16)
-    train_rows, train_filter = filter_rows_by_audio_limit(
-        load_manifest(args.train_manifest), args.max_audio_tokens
-    )
-    dev_rows, dev_filter = filter_rows_by_audio_limit(
-        load_manifest(args.dev_manifest), args.max_audio_tokens
-    )
+    train_rows, train_filter = load_joint_manifest(args.train_manifest, args.max_audio_tokens)
+    dev_rows, dev_filter = load_joint_manifest(args.dev_manifest, args.max_audio_tokens)
     rank = torch.distributed.get_rank() if args.deepspeed else 0
     local_epoch_samples = math.ceil(args.samples_per_epoch / world_size)
     train_batches = JointRawAudioBatchSource(train_rows, tokenizer, int(placeholder_id), batch_size=args.batch_size,
