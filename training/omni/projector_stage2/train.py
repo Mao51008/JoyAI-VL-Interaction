@@ -1310,11 +1310,17 @@ def train_model(
             model=base_model, optimizer=optimizer, config=config.deepspeed_config
         )
         model = deepspeed_engine
-        boundary = getattr(getattr(base_model, "audio_encoder", None), "init_bn", None)
-        if hasattr(boundary, "assert_fp32"):
-            boundary.assert_fp32()
+        audio_encoder = getattr(base_model, "audio_encoder", None)
+        if audio_encoder is not None:
+            audio_encoder.float()
+            wrong_dtypes = [
+                name for name, parameter in audio_encoder.named_parameters()
+                if parameter.dtype != torch.float32
+            ]
+            if wrong_dtypes:
+                raise AssertionError(f"MiDasheng encoder parameters are not FP32: {wrong_dtypes[:3]}")
             print(
-                f"DeepSpeed rank={rank}: MiDasheng init_bn dtype={boundary.weight.dtype}",
+                f"DeepSpeed rank={rank}: MiDasheng encoder parameters dtype=torch.float32",
                 flush=True,
             )
 

@@ -300,12 +300,11 @@ def build_joint_model(audio_encoder: Any, llm: Any, *, projector_checkpoint: Pat
             device = next(self.parameters()).device
             waveform = batch.audio_features.to(device=device, dtype=torch.float32)
             lengths = batch.audio_attention_mask.to(device)
-            # MiDasheng keeps frontend BatchNorm in FP32; autocast restores BF16 for linears.
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                encoded, mask = self.audio_encoder(waveform, x_length=lengths)
+            encoded, mask = self.audio_encoder(waveform, x_length=lengths)
             if [int(value) for value in mask.sum(dim=1)] != [int(value) for value in batch.audio_placeholder_mask.sum(dim=1)]:
                 raise ValueError("MiDasheng encoder token count differs from audio placeholders")
-            projected = self.audio_projector(encoded)
+            projector_dtype = next(self.audio_projector.parameters()).dtype
+            projected = self.audio_projector(encoded.to(dtype=projector_dtype))
             ids = batch.input_ids.to(device); text = self.language_model.get_input_embeddings()(ids)
             embeds = replace_audio_placeholders(text, projected, batch.audio_placeholder_mask.to(device), mask.bool())
             return self.language_model(inputs_embeds=embeds, attention_mask=batch.attention_mask.to(device), labels=batch.labels.to(device))
@@ -433,8 +432,7 @@ def main(argv: list[str] | None = None) -> int:
         projector_sha256=args.init_projector_sha256, projector_preflight=args.init_projector_preflight,
         audio_model=args.audio_model)
     model = model.to(device=args.device, dtype=torch.bfloat16)
-    batch_norm_boundary = replace_midasheng_frontend_batch_norm(model.audio_encoder)
-    batch_norm_boundary.assert_fp32()
+    model.audio_encoder.float()
     train_rows, train_filter = load_joint_manifest(args.train_manifest, args.max_audio_tokens)
     dev_rows, dev_filter = load_joint_manifest(args.dev_manifest, args.max_audio_tokens)
     rank = torch.distributed.get_rank() if args.deepspeed else 0
