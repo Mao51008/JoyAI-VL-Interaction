@@ -298,8 +298,11 @@ def build_joint_model(audio_encoder: Any, llm: Any, *, projector_checkpoint: Pat
             super().__init__(); self.audio_encoder = audio_encoder; self.language_model = llm; self.audio_projector = projector
         def forward(self, batch: Any) -> Any:
             device = next(self.parameters()).device
-            waveform, lengths = batch.audio_features.to(device), batch.audio_attention_mask.to(device)
-            encoded, mask = self.audio_encoder(waveform, x_length=lengths)
+            waveform = batch.audio_features.to(device=device, dtype=torch.float32)
+            lengths = batch.audio_attention_mask.to(device)
+            # MiDasheng keeps frontend BatchNorm in FP32; autocast restores BF16 for linears.
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                encoded, mask = self.audio_encoder(waveform, x_length=lengths)
             if [int(value) for value in mask.sum(dim=1)] != [int(value) for value in batch.audio_placeholder_mask.sum(dim=1)]:
                 raise ValueError("MiDasheng encoder token count differs from audio placeholders")
             projected = self.audio_projector(encoded)
