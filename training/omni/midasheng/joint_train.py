@@ -473,7 +473,7 @@ def main(argv: list[str] | None = None) -> int:
     ])
     core_engine, _, _, _ = deepspeed.initialize(model=core, optimizer=core_optimizer,
         config=deepspeed_zero2_config(steps=steps_per_epoch * args.epochs, warmup_steps=args.warmup_steps))
-    args.output_dir.mkdir(parents=True)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
     encoder_optimizer = torch.optim.AdamW([p for p in encoder_branch.parameters() if p.requires_grad], lr=ENCODER_LR, weight_decay=0.01)
     encoder_scheduler = torch.optim.lr_scheduler.LambdaLR(
         encoder_optimizer,
