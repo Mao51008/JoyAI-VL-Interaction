@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from training.omni.projector_stage1.model import replace_audio_placeholders
+
 
 @dataclass(frozen=True)
 class HybridConfig:
@@ -74,3 +76,51 @@ class HybridTrainer:
         self.encoder_optimizer.load_state_dict(state["encoder_optimizer"])
         self.global_step, self.epoch = int(state["global_step"]), int(state["epoch"])
         self.core_engine.load_checkpoint(str(path.parent), tag=path.name + ".core")
+
+
+def build_audio_encoder_branch(audio_encoder: Any, device: str, distributed: bool) -> Any:
+    """Place the entire MiDasheng branch in FP32 DDP, outside DeepSpeed."""
+    import torch
+
+    audio_encoder = audio_encoder.to(device=device, dtype=torch.float32)
+    if distributed:
+        from torch.nn.parallel import DistributedDataParallel
+
+        audio_encoder = DistributedDataParallel(audio_encoder, device_ids=[torch.cuda.current_device()])
+    return audio_encoder
+
+
+def assert_hybrid_partition(encoder: Any, core: Any) -> None:
+    """Prove the FP32 Encoder is outside the BF16 DeepSpeed Core module tree."""
+    encoder_ids = {id(module) for module in getattr(encoder, "module", encoder).modules()}
+    core_names = {name for name, _module in core.named_modules()}
+    if any("audio_encoder" in name for name in core_names):
+        raise AssertionError("ProjectorLoraCore must not contain MiDasheng audio_encoder")
+    if any(id(module) in encoder_ids for _name, module in core.named_modules()):
+        raise AssertionError("Encoder module was attached to ProjectorLoraCore")
+
+
+def build_projector_lora_core(projector: Any, language_model: Any) -> Any:
+    """Build the DeepSpeed-owned BF16 half of the joint graph only."""
+    from torch import nn
+
+    class ProjectorLoraCore(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.audio_projector = projector
+            self.language_model = language_model
+
+        def forward(self, batch: Any, encoder_features: Any, encoder_mask: Any) -> Any:
+            device = next(self.parameters()).device
+            projected = self.audio_projector(encoder_features.to(device=device, dtype=next(self.audio_projector.parameters()).dtype))
+            ids = batch.input_ids.to(device)
+            text_embeddings = self.language_model.get_input_embeddings()(ids)
+            embeddings = replace_audio_placeholders(
+                text_embeddings, projected, batch.audio_placeholder_mask.to(device), encoder_mask.to(device).bool()
+            )
+            return self.language_model(
+                inputs_embeds=embeddings, attention_mask=batch.attention_mask.to(device), labels=batch.labels.to(device)
+            )
+
+    core = ProjectorLoraCore()
+    return core
