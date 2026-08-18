@@ -140,6 +140,19 @@ def _feature_tokens(waveform_samples: int, max_audio_tokens: int) -> int:
     return tokens
 
 
+def filter_rows_by_audio_limit(
+    rows: Sequence[dict[str, Any]], max_audio_tokens: int
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Use manifest duration to exclude clips that cannot fit 512 MiDasheng tokens."""
+    max_duration_ms = max_audio_tokens * 40  # 640 samples / 16 kHz = 40 ms per token.
+    kept = [row for row in rows if int(row["clip_duration_ms"]) <= max_duration_ms]
+    if not kept:
+        raise ValueError("all rows exceed the configured MiDasheng audio-token limit")
+    return kept, {"input_samples": len(rows), "kept_samples": len(kept),
+                  "dropped_for_audio_tokens": len(rows) - len(kept),
+                  "max_audio_tokens": max_audio_tokens, "max_duration_ms": max_duration_ms}
+
+
 def load_midasheng_projector_initialization(
     projector: Any, checkpoint: Path, expected_sha256: str, source_preflight: Path,
     audio_model: str,
@@ -360,7 +373,12 @@ def main(argv: list[str] | None = None) -> int:
         projector_sha256=args.init_projector_sha256, projector_preflight=args.init_projector_preflight,
         audio_model=args.audio_model)
     model = model.to(device=args.device, dtype=torch.bfloat16)
-    train_rows, dev_rows = load_manifest(args.train_manifest), load_manifest(args.dev_manifest)
+    train_rows, train_filter = filter_rows_by_audio_limit(
+        load_manifest(args.train_manifest), args.max_audio_tokens
+    )
+    dev_rows, dev_filter = filter_rows_by_audio_limit(
+        load_manifest(args.dev_manifest), args.max_audio_tokens
+    )
     rank = torch.distributed.get_rank() if args.deepspeed else 0
     local_epoch_samples = math.ceil(args.samples_per_epoch / world_size)
     train_batches = JointRawAudioBatchSource(train_rows, tokenizer, int(placeholder_id), batch_size=args.batch_size,
@@ -380,6 +398,7 @@ def main(argv: list[str] | None = None) -> int:
         deepspeed_config=deepspeed_zero2_config(steps=steps_per_epoch * args.epochs, warmup_steps=args.warmup_steps)
         if args.deepspeed else None)
     preflight["encoder"] = runtime_report
+    preflight["input_token_filter"] = {"train": train_filter, "dev": dev_filter}
     preflight["validation"] = {"sampling": "disabled", "sources": {
         task: {"samples": len(source.groups[task]), "fixed_complete_dev_set": True}
         for task, source in validation_sources.items()
