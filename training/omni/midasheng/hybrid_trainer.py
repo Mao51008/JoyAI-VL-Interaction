@@ -51,6 +51,23 @@ class HybridTrainer:
                 frozen_leaks += 1
         return nonzero, frozen_leaks
 
+    @staticmethod
+    def _parameter_signatures(module: Any, match: Any) -> dict[str, tuple[int, float, float]]:
+        """Small ZeRO-3-safe signatures of local parameter shards before an update."""
+        import torch
+
+        signatures = {}
+        for name, parameter in module.named_parameters():
+            if parameter.requires_grad and match(name):
+                shard = getattr(parameter, "ds_tensor", parameter).detach()
+                signatures[name] = (shard.numel(), float(shard.sum(dtype=torch.float64)), float(shard.abs().sum(dtype=torch.float64)))
+        return signatures
+
+    @classmethod
+    def _changed_parameter_count(cls, module: Any, match: Any, before: dict[str, tuple[int, float, float]]) -> int:
+        after = cls._parameter_signatures(module, match)
+        return sum(before[name] != after[name] for name in before)
+
     def run_update(self, microbatches: Iterable[Any]) -> float:
         import torch
         from contextlib import nullcontext
@@ -72,29 +89,31 @@ class HybridTrainer:
                 encoder_module = getattr(self.encoder, "module", self.encoder)
                 encoder_grads, encoder_frozen_leaks = self._gradient_counts(encoder_module, lambda _name: True)
                 core_module = getattr(self.core_engine, "module", self.core_engine)
-                projector_grads, core_frozen_leaks = self._gradient_counts(
-                    core_module, lambda name: "audio_projector" in name
-                )
-                lora_grads, lora_frozen_leaks = self._gradient_counts(
-                    core_module, lambda name: name.startswith("lora_") or ".lora_" in name
-                )
-                if not encoder_grads or not projector_grads or not lora_grads:
-                    raise AssertionError("missing Encoder, Projector, or LoRA gradient at update boundary")
-                if encoder_frozen_leaks or core_frozen_leaks or lora_frozen_leaks:
+                projector_match = lambda name: "audio_projector" in name
+                lora_match = lambda name: name.startswith("lora_") or ".lora_" in name
+                projector_before = self._parameter_signatures(core_module, projector_match)
+                lora_before = self._parameter_signatures(core_module, lora_match)
+                if not encoder_grads:
+                    raise AssertionError("missing Encoder gradient at update boundary")
+                if encoder_frozen_leaks:
                     raise AssertionError("frozen parameter received a gradient")
+                torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.config.max_grad_norm)
+                self.core_engine.step()
+                projector_updates = self._changed_parameter_count(core_module, projector_match, projector_before)
+                lora_updates = self._changed_parameter_count(core_module, lora_match, lora_before)
+                if not projector_updates or not lora_updates:
+                    raise AssertionError("Projector or LoRA parameters did not update at ZeRO-3 boundary")
+                self.encoder_optimizer.step()
+                if self.encoder_scheduler is not None:
+                    self.encoder_scheduler.step()
                 self.last_gradient_audit = {
                     "encoder_nonzero_gradients": encoder_grads,
-                    "projector_nonzero_gradients": projector_grads,
-                    "lora_nonzero_gradients": lora_grads,
+                    "projector_updated_shards": projector_updates,
+                    "lora_updated_shards": lora_updates,
                     "encoder_no_sync_microbatches": len(batches) - 1 if hasattr(self.encoder, "no_sync") else 0,
                     "core_steps": 1,
                     "encoder_steps": 1,
                 }
-                torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.config.max_grad_norm)
-                self.core_engine.step()
-                self.encoder_optimizer.step()
-                if self.encoder_scheduler is not None:
-                    self.encoder_scheduler.step()
             total += loss.detach()
         self.global_step += 1
         return float(total / len(batches))
