@@ -321,6 +321,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--samples-per-epoch", type=int, required=True); parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=1); parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--warmup-steps", type=int, default=100); parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--max-validation-batches", type=int)
     parser.add_argument("--max-input-tokens", type=int, default=1536)
     parser.add_argument("--max-audio-tokens", type=int, default=512)
     parser.add_argument("--init-projector-checkpoint", type=Path, required=True); parser.add_argument("--init-projector-sha256", required=True)
@@ -348,7 +349,8 @@ def main(argv: list[str] | None = None) -> int:
                  "training_schedule": {"epochs": args.epochs, "optimizer_steps_per_epoch": steps_per_epoch, "optimizer_steps": steps_per_epoch * args.epochs,
                  "per_device_batch_size": args.batch_size, "gradient_accumulation_steps": args.gradient_accumulation_steps,
                  "world_size": world_size, "effective_batch_size": args.batch_size * args.gradient_accumulation_steps * world_size, "warmup_steps": args.warmup_steps,
-                 "scheduler": "linear decay to 10% of each group LR", "max_grad_norm": args.max_grad_norm}}
+                 "scheduler": "linear decay to 10% of each group LR", "max_grad_norm": args.max_grad_norm,
+                 "max_validation_batches": args.max_validation_batches}}
     if not args.run:
         if args.output_dir.exists(): raise FileExistsError(f"refusing to reuse output directory: {args.output_dir}")
         args.output_dir.mkdir(parents=True); (args.output_dir / "preflight.json").write_text(json.dumps(preflight, indent=2) + "\n", encoding="utf-8"); print(json.dumps(preflight, indent=2)); return 0
@@ -395,6 +397,7 @@ def main(argv: list[str] | None = None) -> int:
         lora_learning_rate=LORA_LR, encoder_learning_rate=ENCODER_LR, steps=steps_per_epoch * args.epochs,
         validation_every=steps_per_epoch, gradient_accumulation_steps=args.gradient_accumulation_steps,
         warmup_steps=args.warmup_steps, max_grad_norm=args.max_grad_norm,
+        max_validation_batches=args.max_validation_batches,
         deepspeed_config=deepspeed_zero2_config(steps=steps_per_epoch * args.epochs, warmup_steps=args.warmup_steps)
         if args.deepspeed else None)
     preflight["encoder"] = runtime_report
