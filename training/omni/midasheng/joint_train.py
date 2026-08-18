@@ -31,6 +31,7 @@ from training.omni.projector_stage2.train import (
     train_model,
     validate_manifests,
 )
+from .hybrid_trainer import HybridConfig, HybridTrainer, assert_hybrid_partition, build_audio_encoder_branch, build_projector_lora_core
 
 TASK_WEIGHTS = {"voiceassistant": 0.50, "clotho_aqa": 0.30, "librispeech": 0.20}
 TASK_DATASETS = {
@@ -433,8 +434,9 @@ def main(argv: list[str] | None = None) -> int:
     model, runtime_report = build_joint_model(audio_encoder, llm, projector_checkpoint=args.init_projector_checkpoint,
         projector_sha256=args.init_projector_sha256, projector_preflight=args.init_projector_preflight,
         audio_model=args.audio_model)
-    model = model.to(device=args.device, dtype=torch.bfloat16)
-    model.audio_encoder.float()
+    encoder_branch = build_audio_encoder_branch(model.audio_encoder, args.device, args.deepspeed)
+    core = build_projector_lora_core(model.audio_projector, model.language_model).to(device=args.device, dtype=torch.bfloat16)
+    assert_hybrid_partition(encoder_branch, core)
     train_rows, train_filter = load_joint_manifest(args.train_manifest, args.max_audio_tokens)
     dev_rows, dev_filter = load_joint_manifest(args.dev_manifest, args.max_audio_tokens)
     rank = torch.distributed.get_rank() if args.deepspeed else 0
@@ -449,13 +451,6 @@ def main(argv: list[str] | None = None) -> int:
             max_audio_tokens=args.max_audio_tokens)
         for task in TASK_WEIGHTS
     }
-    config = Stage2Config(args.train_manifest, args.dev_manifest, args.output_dir, projector_learning_rate=PROJECTOR_LR,
-        lora_learning_rate=LORA_LR, encoder_learning_rate=ENCODER_LR, steps=steps_per_epoch * args.epochs,
-        validation_every=steps_per_epoch, gradient_accumulation_steps=args.gradient_accumulation_steps,
-        warmup_steps=args.warmup_steps, max_grad_norm=args.max_grad_norm,
-        max_validation_batches=args.max_validation_batches,
-        deepspeed_config=deepspeed_zero2_config(steps=steps_per_epoch * args.epochs, warmup_steps=args.warmup_steps)
-        if args.deepspeed else None)
     preflight["encoder"] = runtime_report
     preflight["input_token_filter"] = {"train": train_filter, "dev": dev_filter}
     preflight["validation"] = {"sampling": "disabled", "sources": {
@@ -463,7 +458,27 @@ def main(argv: list[str] | None = None) -> int:
         for task, source in validation_sources.items()
     }}
     print("JOINT_TRAINING_CONFIG=" + json.dumps(preflight, ensure_ascii=False, sort_keys=True), flush=True)
-    result = train_model(model, train_batches, validation_sources["voiceassistant"], config, validation_sources=validation_sources)
+    if not args.deepspeed:
+        raise RuntimeError("real joint training requires the hybrid DeepSpeed/DDP launcher")
+    core_parameters = [p for p in core.parameters() if p.requires_grad]
+    core_engine, _, _, _ = deepspeed.initialize(model=core, model_parameters=core_parameters,
+        config=deepspeed_zero2_config(steps=steps_per_epoch * args.epochs, warmup_steps=args.warmup_steps))
+    args.output_dir.mkdir(parents=True)
+    encoder_optimizer = torch.optim.AdamW([p for p in encoder_branch.parameters() if p.requires_grad], lr=ENCODER_LR, weight_decay=0.01)
+    trainer = HybridTrainer(encoder_branch, core_engine, encoder_optimizer,
+        HybridConfig(args.gradient_accumulation_steps, args.max_grad_norm))
+    iterator = iter(train_batches)
+    losses = []
+    for _step in range(steps_per_epoch * args.epochs):
+        micros = []
+        for _ in range(args.gradient_accumulation_steps):
+            try: micros.append(next(iterator))
+            except StopIteration: iterator = iter(train_batches); micros.append(next(iterator))
+        losses.append(trainer.run_update(micros))
+    validation = {name: trainer.validate(source) for name, source in validation_sources.items()}
+    trainer.save_checkpoint(args.output_dir / "hybrid.pt")
+    result = {"steps": trainer.global_step, "train_loss": losses[-1], "validation": validation,
+              "cuda_max_memory_allocated": torch.cuda.max_memory_allocated(), "cuda_max_memory_reserved": torch.cuda.max_memory_reserved()}
     (args.output_dir / "joint_training_report.json").write_text(
         json.dumps({"preflight": preflight, "runtime": runtime_report, "training": result}, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8"
     )

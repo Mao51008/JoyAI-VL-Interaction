@@ -47,8 +47,9 @@ class HybridTrainer:
             boundary = index + 1 == len(batches)
             sync = nullcontext() if boundary or not hasattr(self.encoder, "no_sync") else self.encoder.no_sync()
             with sync:
-                features, mask = self.encoder(batch.waveforms.float(), batch.lengths)
-                loss = self.core_engine(batch, encoder_to_core_features(features), mask)
+                features, mask = self.encoder(batch.audio_features.float(), batch.audio_attention_mask)
+                output = self.core_engine(batch, encoder_to_core_features(features), mask)
+                loss = output["loss"] if isinstance(output, dict) else getattr(output, "loss", output)
                 self.core_engine.backward(loss / len(batches))
             if boundary:
                 torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.config.max_grad_norm)
@@ -57,6 +58,20 @@ class HybridTrainer:
             total += loss.detach()
         self.global_step += 1
         return float(total / len(batches))
+
+    def validate(self, batches: Iterable[Any]) -> float:
+        import torch
+
+        total = 0.0; count = 0
+        self.encoder.eval(); self.core_engine.eval()
+        with torch.no_grad():
+            for batch in batches:
+                features, mask = self.encoder(batch.audio_features.float(), batch.audio_attention_mask)
+                output = self.core_engine(batch, encoder_to_core_features(features), mask)
+                loss = output["loss"] if isinstance(output, dict) else getattr(output, "loss", output)
+                total += float(loss); count += 1
+        if not count: raise ValueError("validation source is empty")
+        return total / count
 
     def save_checkpoint(self, path: Path) -> None:
         import torch
