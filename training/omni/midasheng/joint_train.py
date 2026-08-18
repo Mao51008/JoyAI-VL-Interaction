@@ -27,7 +27,6 @@ from training.omni.projector_stage2.train import (
     _build_supervised_sequence,
     _optimizer_parameter_groups as _stage2_optimizer_groups,
     inject_lora,
-    load_stage1_projector_initialization,
     load_manifest,
     train_model,
     validate_manifests,
@@ -121,6 +120,48 @@ def _feature_tokens(waveform_samples: int) -> int:
     return tokens
 
 
+def load_midasheng_projector_initialization(
+    projector: Any, checkpoint: Path, expected_sha256: str, source_preflight: Path,
+    audio_model: str,
+) -> dict[str, Any]:
+    """Load only a verified MiDasheng projector-only checkpoint; never any LoRA."""
+    if not checkpoint.is_file() or not source_preflight.is_file():
+        raise FileNotFoundError("projector checkpoint and its MiDasheng preflight.json must exist")
+    actual_sha256 = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise ValueError("projector checkpoint SHA256 mismatch")
+    provenance = json.loads(source_preflight.read_text(encoding="utf-8"))
+    feature_cache = provenance.get("feature_cache", {})
+    if (
+        provenance.get("audio_encoder", {}).get("feature_source") != "midashenglm.audio_encoder.raw"
+        or feature_cache.get("feature_source") != "midashenglm.audio_encoder.raw"
+        or feature_cache.get("audio_model") != audio_model
+        or feature_cache.get("audio_encoder_dim") != 1280
+    ):
+        raise ValueError("projector provenance is not the requested raw MiDashengLM Audio Encoder")
+    import torch
+    state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    if state.get("format") == "projector-stage1-v4":
+        weights = state.get("projector")
+        if state.get("config", {}).get("projector") != projector.export_config():
+            raise ValueError("MiDasheng projector checkpoint config does not match 1280→4096 projector")
+    elif state.get("format") == "projector-stage2-v2":
+        weights = {
+            name.removeprefix("audio_projector.").removeprefix("core.audio_projector."): value
+            for name, value in state.get("trainable_state", {}).items()
+            if name.startswith(("audio_projector.", "core.audio_projector."))
+        }
+    else:
+        raise ValueError("unsupported projector-only checkpoint format")
+    if set(weights) != set(projector.state_dict()):
+        raise ValueError("checkpoint does not contain exactly one compatible audio_projector state")
+    projector.load_state_dict(weights, strict=True)
+    return {"checkpoint": str(checkpoint.resolve()), "sha256": actual_sha256,
+            "source_preflight": str(source_preflight.resolve()),
+            "source_preflight_sha256": hashlib.sha256(source_preflight.read_bytes()).hexdigest(),
+            "format": state["format"], "audio_model": audio_model}
+
+
 class JointRawAudioBatchSource:
     """Deterministic task-level replacement sampler plus raw waveform collation."""
 
@@ -191,15 +232,16 @@ class JointRawAudioBatchSource:
 
 
 def build_joint_model(audio_encoder: Any, llm: Any, *, projector_checkpoint: Path,
-                      projector_sha256: str, dropout: float = 0.0) -> tuple[Any, dict[str, Any]]:
+                      projector_sha256: str, projector_preflight: Path, audio_model: str,
+                      dropout: float = 0.0) -> tuple[Any, dict[str, Any]]:
     import torch
     from torch import nn
     targets = language_all_linear_targets(llm)
     inject_lora(llm, targets, 8, 16.0)
     report = configure_high_encoder_blocks(audio_encoder)
     projector = AudioProjector(AudioProjectorConfig(1280, 4096, 4096, dropout))
-    projector_initialization = load_stage1_projector_initialization(
-        projector, projector_checkpoint, projector_sha256
+    projector_initialization = load_midasheng_projector_initialization(
+        projector, projector_checkpoint, projector_sha256, projector_preflight, audio_model
     )
     for name, parameter in llm.named_parameters():
         parameter.requires_grad_(".lora_" in name)
@@ -238,9 +280,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--train-manifest", type=Path, required=True); parser.add_argument("--dev-manifest", type=Path, required=True)
     parser.add_argument("--audio-model", required=True); parser.add_argument("--llm-model", required=True); parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--samples-per-epoch", type=int, required=True); parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--epochs", type=int, required=True); parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=1); parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--warmup-steps", type=int, default=100); parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--init-projector-checkpoint", type=Path, required=True); parser.add_argument("--init-projector-sha256", required=True)
+    parser.add_argument("--init-projector-preflight", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0"); parser.add_argument("--run", action="store_true")
     args = parser.parse_args(argv)
     manifests = validate_manifests(args.train_manifest, args.dev_manifest)
@@ -248,7 +291,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.epochs <= 0:
         parser.error("--epochs must be positive")
     preflight = {"status": "preflight-only", "manifests": manifests, "audio_model": {"path": args.audio_model, "checkpoint_kind": "MiDashengLM final checkpoint Audio Encoder"},
-                 "projector_initialization": {"checkpoint": str(args.init_projector_checkpoint), "sha256": args.init_projector_sha256},
+                 "projector_initialization": {"checkpoint": str(args.init_projector_checkpoint), "sha256": args.init_projector_sha256,
+                 "source_preflight": str(args.init_projector_preflight), "required_source": "midashenglm.audio_encoder.raw"},
                  "lora_initialization": "new random LoRA A; zero LoRA B; no previous LoRA loaded", "encoder": {"total_blocks": 32, "unfrozen_block_indices": list(range(24, 32))},
                  "learning_rates": {"midasheng_high_blocks": ENCODER_LR, "audio_projector": PROJECTOR_LR, "joyai_lora": LORA_LR},
                  "sampling": {"weights": TASK_WEIGHTS, "samples_per_epoch": args.samples_per_epoch, "counts": _task_counts(args.samples_per_epoch)},
@@ -271,7 +315,8 @@ def main(argv: list[str] | None = None) -> int:
     del audio_model; gc.collect()
     llm = AutoModelForImageTextToText.from_pretrained(args.llm_model, dtype=torch.bfloat16)
     model, runtime_report = build_joint_model(audio_encoder, llm, projector_checkpoint=args.init_projector_checkpoint,
-        projector_sha256=args.init_projector_sha256)
+        projector_sha256=args.init_projector_sha256, projector_preflight=args.init_projector_preflight,
+        audio_model=args.audio_model)
     model = model.to(device=args.device, dtype=torch.bfloat16)
     train_rows, dev_rows = load_manifest(args.train_manifest), load_manifest(args.dev_manifest)
     train_batches = JointRawAudioBatchSource(train_rows, tokenizer, int(placeholder_id), batch_size=args.batch_size,
