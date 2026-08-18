@@ -15,6 +15,7 @@ import random
 from collections import Counter
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -489,7 +490,10 @@ def main(argv: list[str] | None = None) -> int:
             try: micros.append(next(iterator))
             except StopIteration: iterator = iter(train_batches); micros.append(next(iterator))
         losses.append(trainer.run_update(micros))
-    validation = {name: trainer.validate(source) for name, source in validation_sources.items()}
+    validation = {
+        name: trainer.validate(source if args.max_validation_batches is None else islice(source, args.max_validation_batches))
+        for name, source in validation_sources.items()
+    }
     trainer.save_checkpoint(args.output_dir / "hybrid.pt")
     result = {"steps": trainer.global_step, "train_loss": losses[-1], "validation": validation,
               "cuda_max_memory_allocated": torch.cuda.max_memory_allocated(), "cuda_max_memory_reserved": torch.cuda.max_memory_reserved()}
