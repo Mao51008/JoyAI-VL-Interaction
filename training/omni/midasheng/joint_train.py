@@ -112,11 +112,15 @@ def language_all_linear_targets(llm: Any) -> list[str]:
     return targets
 
 
-def _feature_tokens(waveform_samples: int) -> int:
+def _feature_tokens(waveform_samples: int, max_audio_tokens: int) -> int:
     # DashengAudioTransformer uses floor(x_length / (hop_length * 4)), hop=160.
     tokens = waveform_samples // 640
     if tokens <= 0:
         raise ValueError("audio is shorter than one MiDasheng encoder token")
+    if tokens > max_audio_tokens:
+        raise ValueError(
+            f"MiDasheng audio token count {tokens} exceeds max_audio_tokens={max_audio_tokens}"
+        )
     return tokens
 
 
@@ -168,11 +172,14 @@ class JointRawAudioBatchSource:
     def __init__(self, rows: Sequence[dict[str, Any]], tokenizer: Any, placeholder_id: int, *,
                  batch_size: int, samples_per_epoch: int, seed: int, max_length: int = 2048,
                  task_weights: dict[str, float] = TASK_WEIGHTS,
-                 sample_with_replacement: bool = True) -> None:
+                 sample_with_replacement: bool = True, max_audio_tokens: int = 512) -> None:
+        if max_length <= 0 or max_audio_tokens <= 0:
+            raise ValueError("max_length and max_audio_tokens must be positive")
         self.tokenizer, self.placeholder_id = tokenizer, placeholder_id
         self.batch_size, self.samples_per_epoch, self.seed, self.max_length = batch_size, samples_per_epoch, seed, max_length
         self.task_weights = task_weights
         self.sample_with_replacement = sample_with_replacement
+        self.max_audio_tokens = max_audio_tokens
         self.groups = {task: [] for task in task_weights}
         for row in rows:
             task = classify_task(row)
@@ -217,7 +224,10 @@ class JointRawAudioBatchSource:
                 path = Path(row["_manifest_root"]) / row["audio_path"]
                 waveform = torch.from_numpy(_load_mono_audio(path, 16_000))
                 waveforms.append(waveform)
-                sequences.append(_build_supervised_sequence(row, self.tokenizer, self.placeholder_id, _feature_tokens(waveform.numel()), self.max_length))
+                sequences.append(_build_supervised_sequence(
+                    row, self.tokenizer, self.placeholder_id,
+                    _feature_tokens(waveform.numel(), self.max_audio_tokens), self.max_length,
+                ))
             audio = pad_sequence(waveforms, batch_first=True)
             lengths = torch.tensor([waveform.numel() for waveform in waveforms], dtype=torch.long)
             def pad(key: str, value: int | bool):
@@ -282,6 +292,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--samples-per-epoch", type=int, required=True); parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=1); parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--warmup-steps", type=int, default=100); parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--max-input-tokens", type=int, default=1536)
+    parser.add_argument("--max-audio-tokens", type=int, default=512)
     parser.add_argument("--init-projector-checkpoint", type=Path, required=True); parser.add_argument("--init-projector-sha256", required=True)
     parser.add_argument("--init-projector-preflight", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0"); parser.add_argument("--run", action="store_true")
@@ -296,6 +308,7 @@ def main(argv: list[str] | None = None) -> int:
                  "lora_initialization": "new random LoRA A; zero LoRA B; no previous LoRA loaded", "encoder": {"total_blocks": 32, "unfrozen_block_indices": list(range(24, 32))},
                  "learning_rates": {"midasheng_high_blocks": ENCODER_LR, "audio_projector": PROJECTOR_LR, "joyai_lora": LORA_LR},
                  "sampling": {"weights": TASK_WEIGHTS, "samples_per_epoch": args.samples_per_epoch, "counts": _task_counts(args.samples_per_epoch)},
+                 "sequence_limits": {"max_input_tokens": args.max_input_tokens, "max_midasheng_audio_tokens": args.max_audio_tokens},
                  "training_schedule": {"epochs": args.epochs, "optimizer_steps_per_epoch": steps_per_epoch, "optimizer_steps": steps_per_epoch * args.epochs,
                  "per_device_batch_size": args.batch_size, "gradient_accumulation_steps": args.gradient_accumulation_steps,
                  "effective_batch_size": args.batch_size * args.gradient_accumulation_steps, "warmup_steps": args.warmup_steps,
@@ -320,11 +333,13 @@ def main(argv: list[str] | None = None) -> int:
     model = model.to(device=args.device, dtype=torch.bfloat16)
     train_rows, dev_rows = load_manifest(args.train_manifest), load_manifest(args.dev_manifest)
     train_batches = JointRawAudioBatchSource(train_rows, tokenizer, int(placeholder_id), batch_size=args.batch_size,
-        samples_per_epoch=args.samples_per_epoch, seed=3407)
+        samples_per_epoch=args.samples_per_epoch, seed=3407, max_length=args.max_input_tokens,
+        max_audio_tokens=args.max_audio_tokens)
     validation_sources = {
         task: JointRawAudioBatchSource([row for row in dev_rows if classify_task(row) == task], tokenizer, int(placeholder_id),
             batch_size=args.batch_size, samples_per_epoch=sum(classify_task(row) == task for row in dev_rows), seed=3407,
-            task_weights={task: 1.0}, sample_with_replacement=False)
+            task_weights={task: 1.0}, sample_with_replacement=False, max_length=args.max_input_tokens,
+            max_audio_tokens=args.max_audio_tokens)
         for task in TASK_WEIGHTS
     }
     config = Stage2Config(args.train_manifest, args.dev_manifest, args.output_dir, projector_learning_rate=PROJECTOR_LR,
