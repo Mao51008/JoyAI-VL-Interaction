@@ -460,8 +460,13 @@ def main(argv: list[str] | None = None) -> int:
     print("JOINT_TRAINING_CONFIG=" + json.dumps(preflight, ensure_ascii=False, sort_keys=True), flush=True)
     if not args.deepspeed:
         raise RuntimeError("real joint training requires the hybrid DeepSpeed/DDP launcher")
-    core_parameters = [p for p in core.parameters() if p.requires_grad]
-    core_engine, _, _, _ = deepspeed.initialize(model=core, model_parameters=core_parameters,
+    projector_parameters = [p for n, p in core.named_parameters() if p.requires_grad and "audio_projector" in n]
+    lora_parameters = [p for n, p in core.named_parameters() if p.requires_grad and ".lora_" in n]
+    core_optimizer = torch.optim.AdamW([
+        {"params": projector_parameters, "lr": PROJECTOR_LR, "weight_decay": 0.01},
+        {"params": lora_parameters, "lr": LORA_LR, "weight_decay": 0.01},
+    ])
+    core_engine, _, _, _ = deepspeed.initialize(model=core, optimizer=core_optimizer,
         config=deepspeed_zero2_config(steps=steps_per_epoch * args.epochs, warmup_steps=args.warmup_steps))
     args.output_dir.mkdir(parents=True)
     encoder_optimizer = torch.optim.AdamW([p for p in encoder_branch.parameters() if p.requires_grad], lr=ENCODER_LR, weight_decay=0.01)
