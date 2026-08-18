@@ -52,21 +52,21 @@ class HybridTrainer:
         return nonzero, frozen_leaks
 
     @staticmethod
-    def _parameter_signatures(module: Any, match: Any) -> dict[str, tuple[int, float, float]]:
-        """Small ZeRO-3-safe signatures of local parameter shards before an update."""
+    def _gradient_hooks(module: Any, match: Any) -> tuple[dict[str, int], list[Any]]:
+        """Count nonzero finite parameter gradients before ZeRO-3 partitions them."""
         import torch
 
-        signatures = {}
+        counts = {"nonzero": 0}
+        handles = []
         for name, parameter in module.named_parameters():
             if parameter.requires_grad and match(name):
-                shard = getattr(parameter, "ds_tensor", parameter).detach()
-                signatures[name] = (shard.numel(), float(shard.sum(dtype=torch.float64)), float(shard.abs().sum(dtype=torch.float64)))
-        return signatures
-
-    @classmethod
-    def _changed_parameter_count(cls, module: Any, match: Any, before: dict[str, tuple[int, float, float]]) -> int:
-        after = cls._parameter_signatures(module, match)
-        return sum(before[name] != after[name] for name in before)
+                def hook(gradient: Any, *, parameter_name: str = name) -> Any:
+                    if not torch.isfinite(gradient).all():
+                        raise FloatingPointError(f"non-finite gradient: {parameter_name}")
+                    counts["nonzero"] += int(torch.count_nonzero(gradient).item() > 0)
+                    return gradient
+                handles.append(parameter.register_hook(hook))
+        return counts, handles
 
     def run_update(self, microbatches: Iterable[Any]) -> float:
         import torch
@@ -77,6 +77,11 @@ class HybridTrainer:
             raise ValueError("one update requires exactly gradient_accumulation_steps microbatches")
         self.encoder_optimizer.zero_grad(set_to_none=True)
         total = torch.zeros((), device=next(self.encoder.parameters()).device)
+        core_module = getattr(self.core_engine, "module", self.core_engine)
+        projector_match = lambda name: "audio_projector" in name
+        lora_match = lambda name: name.startswith("lora_") or ".lora_" in name
+        projector_hooks, projector_handles = self._gradient_hooks(core_module, projector_match)
+        lora_hooks, lora_handles = self._gradient_hooks(core_module, lora_match)
         for index, batch in enumerate(batches):
             boundary = index + 1 == len(batches)
             sync = nullcontext() if boundary or not hasattr(self.encoder, "no_sync") else self.encoder.no_sync()
@@ -88,33 +93,28 @@ class HybridTrainer:
             if boundary:
                 encoder_module = getattr(self.encoder, "module", self.encoder)
                 encoder_grads, encoder_frozen_leaks = self._gradient_counts(encoder_module, lambda _name: True)
-                core_module = getattr(self.core_engine, "module", self.core_engine)
-                projector_match = lambda name: "audio_projector" in name
-                lora_match = lambda name: name.startswith("lora_") or ".lora_" in name
-                projector_before = self._parameter_signatures(core_module, projector_match)
-                lora_before = self._parameter_signatures(core_module, lora_match)
                 if not encoder_grads:
                     raise AssertionError("missing Encoder gradient at update boundary")
+                if not projector_hooks["nonzero"] or not lora_hooks["nonzero"]:
+                    raise AssertionError("missing Projector or LoRA gradient at update boundary")
                 if encoder_frozen_leaks:
                     raise AssertionError("frozen parameter received a gradient")
                 torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.config.max_grad_norm)
                 self.core_engine.step()
-                projector_updates = self._changed_parameter_count(core_module, projector_match, projector_before)
-                lora_updates = self._changed_parameter_count(core_module, lora_match, lora_before)
-                if not projector_updates or not lora_updates:
-                    raise AssertionError("Projector or LoRA parameters did not update at ZeRO-3 boundary")
                 self.encoder_optimizer.step()
                 if self.encoder_scheduler is not None:
                     self.encoder_scheduler.step()
                 self.last_gradient_audit = {
                     "encoder_nonzero_gradients": encoder_grads,
-                    "projector_updated_shards": projector_updates,
-                    "lora_updated_shards": lora_updates,
+                    "projector_nonzero_gradients": projector_hooks["nonzero"],
+                    "lora_nonzero_gradients": lora_hooks["nonzero"],
                     "encoder_no_sync_microbatches": len(batches) - 1 if hasattr(self.encoder, "no_sync") else 0,
                     "core_steps": 1,
                     "encoder_steps": 1,
                 }
             total += loss.detach()
+        for handle in projector_handles + lora_handles:
+            handle.remove()
         self.global_step += 1
         return float(total / len(batches))
 
