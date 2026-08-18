@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import random
+import time
 from collections import Counter
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -64,6 +65,28 @@ def deepspeed_zero3_config(*, steps: int, warmup_steps: int) -> dict[str, Any]:
                       "warmup_max_lr": [PROJECTOR_LR, LORA_LR],
                       "warmup_num_steps": warmup_steps, "total_num_steps": steps}},
     }
+
+
+def write_loss_curve(points: list[dict[str, float]], path: Path) -> None:
+    """Write a dependency-free SVG curve for the assistant-token training loss."""
+    width, height, margin = 960, 480, 52
+    losses = [point["loss"] for point in points]
+    low, high = min(losses), max(losses)
+    span = max(high - low, 1e-8)
+    coordinates = []
+    for index, loss in enumerate(losses):
+        x = margin + (width - 2 * margin) * index / max(1, len(losses) - 1)
+        y = height - margin - (height - 2 * margin) * (loss - low) / span
+        coordinates.append(f"{x:.2f},{y:.2f}")
+    path.write_text(
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">'
+        f'<rect width="100%" height="100%" fill="white"/>'
+        f'<text x="{margin}" y="28" font-size="18">Joint training loss</text>'
+        f'<text x="{margin}" y="{height - 14}" font-size="12">step 1–{len(points)}</text>'
+        f'<text x="{width - 210}" y="{height - 14}" font-size="12">loss {low:.5f}–{high:.5f}</text>'
+        f'<polyline fill="none" stroke="#2563eb" stroke-width="2" points="{" ".join(coordinates)}"/>'
+        "</svg>\n", encoding="utf-8"
+    )
 
 
 def _task_counts(total: int, weights: dict[str, float] = TASK_WEIGHTS) -> dict[str, int]:
@@ -380,6 +403,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--epochs", type=int, default=1); parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--warmup-steps", type=int, default=100); parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--max-validation-batches", type=int)
+    parser.add_argument("--log-interval", type=int, default=1)
     parser.add_argument("--max-input-tokens", type=int, default=1536)
     parser.add_argument("--max-audio-tokens", type=int, default=512)
     parser.add_argument("--init-projector-checkpoint", type=Path, required=True); parser.add_argument("--init-projector-sha256", required=True)
@@ -397,6 +421,8 @@ def main(argv: list[str] | None = None) -> int:
     steps_per_epoch = math.ceil(args.samples_per_epoch / (args.batch_size * args.gradient_accumulation_steps * world_size))
     if args.epochs <= 0:
         parser.error("--epochs must be positive")
+    if args.log_interval <= 0:
+        parser.error("--log-interval must be positive")
     preflight = {"status": "preflight-only", "manifests": manifests, "audio_model": {"path": args.audio_model, "checkpoint_kind": "MiDashengLM final checkpoint Audio Encoder"},
                  "projector_initialization": {"checkpoint": str(args.init_projector_checkpoint), "sha256": args.init_projector_sha256,
                  "source_preflight": str(args.init_projector_preflight), "required_source": "midashenglm.audio_encoder.raw"},
@@ -408,7 +434,7 @@ def main(argv: list[str] | None = None) -> int:
                  "per_device_batch_size": args.batch_size, "gradient_accumulation_steps": args.gradient_accumulation_steps,
                  "world_size": world_size, "effective_batch_size": args.batch_size * args.gradient_accumulation_steps * world_size, "warmup_steps": args.warmup_steps,
                  "scheduler": "linear decay to 10% of each group LR", "max_grad_norm": args.max_grad_norm,
-                 "max_validation_batches": args.max_validation_batches}}
+                 "max_validation_batches": args.max_validation_batches, "log_interval": args.log_interval}}
     if not args.run:
         if args.output_dir.exists(): raise FileExistsError(f"refusing to reuse output directory: {args.output_dir}")
         args.output_dir.mkdir(parents=True); (args.output_dir / "preflight.json").write_text(json.dumps(preflight, indent=2) + "\n", encoding="utf-8"); print(json.dumps(preflight, indent=2)); return 0
@@ -484,13 +510,28 @@ def main(argv: list[str] | None = None) -> int:
     trainer = HybridTrainer(encoder_branch, core_engine, encoder_optimizer,
         HybridConfig(args.gradient_accumulation_steps, args.max_grad_norm), encoder_scheduler)
     iterator = iter(train_batches)
-    losses = []
+    losses: list[float] = []
+    loss_history: list[dict[str, float]] = []
+    started_at = time.monotonic()
     for _step in range(steps_per_epoch * args.epochs):
         micros = []
         for _ in range(args.gradient_accumulation_steps):
             try: micros.append(next(iterator))
             except StopIteration: iterator = iter(train_batches); micros.append(next(iterator))
-        losses.append(trainer.run_update(micros))
+        local_loss = trainer.run_update(micros)
+        loss_tensor = torch.tensor(local_loss, device=args.device)
+        torch.distributed.all_reduce(loss_tensor)
+        loss = float(loss_tensor / world_size)
+        losses.append(loss)
+        if trainer.global_step % args.log_interval == 0:
+            elapsed = time.monotonic() - started_at
+            record = {"step": trainer.global_step, "loss": loss, "elapsed_seconds": elapsed,
+                      "eta_seconds": elapsed * (steps_per_epoch * args.epochs - trainer.global_step) / trainer.global_step}
+            if rank == 0:
+                loss_history.append(record)
+                with (args.output_dir / "train_loss.jsonl").open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record) + "\n")
+                print("TRAIN_PROGRESS=" + json.dumps(record), flush=True)
     validation = {
         name: trainer.validate(source if args.max_validation_batches is None else islice(source, args.max_validation_batches))
         for name, source in validation_sources.items()
@@ -506,6 +547,8 @@ def main(argv: list[str] | None = None) -> int:
     result = {"steps": trainer.global_step, "train_loss": losses[-1], "validation": validation,
               "checkpoint_restored": True, "memory_by_rank": memory_by_rank, "gradient_audit": trainer.last_gradient_audit}
     if rank == 0:
+        (args.output_dir / "train_loss_curve.json").write_text(json.dumps(loss_history, indent=2) + "\n", encoding="utf-8")
+        write_loss_curve(loss_history, args.output_dir / "train_loss_curve.svg")
         (args.output_dir / "joint_training_report.json").write_text(
             json.dumps({"preflight": preflight, "runtime": runtime_report, "training": result}, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8"
         )
