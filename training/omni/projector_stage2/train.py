@@ -897,15 +897,17 @@ def freeze_asr_and_select_trainables(
     model: Any,
     asr_encoder_prefix: str = "audio_encoder",
     projector_prefix: str = "audio_projector",
+    allow_encoder_training: bool = False,
 ) -> list[Any]:
     """Freeze the ASR encoder/base LLM and expose projector plus LoRA parameters only."""
     for name, parameter in model.named_parameters():
-        parameter.requires_grad = (
+        parameter.requires_grad = parameter.requires_grad and (
             name.startswith((projector_prefix + ".", "lora_"))
             or ".audio_projector." in name
             or ".lora_" in name
+            or (allow_encoder_training and name.startswith(asr_encoder_prefix + "."))
         )
-        if name.startswith(asr_encoder_prefix + ".") and parameter.requires_grad:
+        if name.startswith(asr_encoder_prefix + ".") and parameter.requires_grad and not allow_encoder_training:
             raise AssertionError(f"ASR encoder parameter became trainable: {name}")
     trainables = [
         parameter for parameter in model.parameters() if parameter.requires_grad
@@ -1294,7 +1296,8 @@ def train_model(
         torch.distributed.barrier()
     base_model = getattr(model, "module", model)
     trainables = freeze_asr_and_select_trainables(
-        base_model, config.asr_encoder_prefix, config.projector_prefix
+        base_model, config.asr_encoder_prefix, config.projector_prefix,
+        allow_encoder_training=config.encoder_learning_rate is not None,
     )
     parameter_groups = _optimizer_parameter_groups(base_model, config)
     optimizer = torch.optim.AdamW(parameter_groups)
