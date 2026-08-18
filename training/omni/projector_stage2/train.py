@@ -1310,6 +1310,13 @@ def train_model(
             model=base_model, optimizer=optimizer, config=config.deepspeed_config
         )
         model = deepspeed_engine
+        boundary = getattr(getattr(base_model, "audio_encoder", None), "init_bn", None)
+        if hasattr(boundary, "assert_fp32"):
+            boundary.assert_fp32()
+            print(
+                f"DeepSpeed rank={rank}: MiDasheng init_bn dtype={boundary.weight.dtype}",
+                flush=True,
+            )
 
     def learning_rate_scale(step: int) -> float:
         if config.warmup_steps and step < config.warmup_steps:

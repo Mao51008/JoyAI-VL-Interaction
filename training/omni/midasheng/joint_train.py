@@ -321,18 +321,43 @@ def build_joint_model(audio_encoder: Any, llm: Any, *, projector_checkpoint: Pat
                    "trainable_parameter_counts": parameter_counts}
 
 
-def keep_midasheng_frontend_batch_norm_fp32(audio_encoder: Any) -> None:
-    """Preserve MiDasheng's frozen frontend BatchNorm FP32 island under BF16 training."""
+def replace_midasheng_frontend_batch_norm(audio_encoder: Any) -> Any:
+    """Install an explicit FP32 BatchNorm boundary; no forward hooks are used."""
     import torch
+    from torch import nn
+    from torch.nn import functional as functional
 
     batch_norm = getattr(audio_encoder, "init_bn", None)
     if batch_norm is None:
         raise TypeError("MiDasheng audio encoder does not expose init_bn")
-    batch_norm.float()
-    batch_norm.register_forward_pre_hook(lambda _module, inputs: (inputs[0].float(),))
-    batch_norm.register_forward_hook(
-        lambda _module, _inputs, output: output.to(dtype=torch.bfloat16)
-    )
+
+    class Fp32FrozenBatchNorm2d(nn.Module):
+        def __init__(self, source: Any) -> None:
+            super().__init__()
+            self.register_buffer("weight", source.weight.detach().float().clone())
+            self.register_buffer("bias", source.bias.detach().float().clone())
+            self.register_buffer("running_mean", source.running_mean.detach().float().clone())
+            self.register_buffer("running_var", source.running_var.detach().float().clone())
+            self.eps = float(source.eps)
+
+        def _apply(self, fn: Any) -> "Fp32FrozenBatchNorm2d":
+            # DeepSpeed BF16 conversion must not change this frozen FP32 boundary.
+            return self
+
+        def forward(self, inputs: Any) -> Any:
+            normalized = functional.batch_norm(
+                inputs.float(), self.running_mean, self.running_var, self.weight, self.bias,
+                training=False, momentum=0.0, eps=self.eps,
+            )
+            return normalized.to(dtype=torch.bfloat16)
+
+        def assert_fp32(self) -> None:
+            if any(t.dtype != torch.float32 for t in (self.weight, self.bias, self.running_mean, self.running_var)):
+                raise AssertionError("MiDasheng init_bn FP32 boundary was converted")
+
+    replacement = Fp32FrozenBatchNorm2d(batch_norm)
+    audio_encoder.init_bn = replacement
+    return replacement
 
 
 def optimizer_parameter_groups(model: Any, config: Stage2Config) -> list[dict[str, Any]]:
@@ -408,7 +433,8 @@ def main(argv: list[str] | None = None) -> int:
         projector_sha256=args.init_projector_sha256, projector_preflight=args.init_projector_preflight,
         audio_model=args.audio_model)
     model = model.to(device=args.device, dtype=torch.bfloat16)
-    keep_midasheng_frontend_batch_norm_fp32(model.audio_encoder)
+    batch_norm_boundary = replace_midasheng_frontend_batch_norm(model.audio_encoder)
+    batch_norm_boundary.assert_fp32()
     train_rows, train_filter = load_joint_manifest(args.train_manifest, args.max_audio_tokens)
     dev_rows, dev_filter = load_joint_manifest(args.dev_manifest, args.max_audio_tokens)
     rank = torch.distributed.get_rank() if args.deepspeed else 0
