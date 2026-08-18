@@ -15,9 +15,12 @@ class Encoder(torch.nn.Module):
         return C()
     def forward(self, waves, lengths): return (waves * self.weight).float(), torch.ones_like(waves, dtype=torch.bool)
 
-class Core:
-    def __init__(self): self.scale = torch.nn.Parameter(torch.tensor(1.0)); self.backward_calls = self.step_calls = 0
-    def __call__(self, batch, features, mask): assert features.dtype == torch.bfloat16; return (features.float() * self.scale).sum()
+class Core(torch.nn.Module):
+    def __init__(self):
+        super().__init__(); self.audio_projector = torch.nn.Parameter(torch.tensor(1.0)); self.lora_b = torch.nn.Parameter(torch.tensor(1.0)); self.backward_calls = self.step_calls = 0
+    def forward(self, batch, features, mask):
+        assert features.dtype == torch.bfloat16
+        return (features.float() * self.audio_projector * self.lora_b).sum()
     def backward(self, loss): self.backward_calls += 1; loss.backward()
     def step(self): self.step_calls += 1
     def save_checkpoint(self, *args, **kwargs): pass

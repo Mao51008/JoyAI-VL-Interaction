@@ -33,6 +33,23 @@ class HybridTrainer:
         )
         self.global_step = 0
         self.epoch = 0
+        self.last_gradient_audit: dict[str, int] = {}
+
+    @staticmethod
+    def _gradient_counts(module: Any, trainable_match: Any) -> tuple[int, int]:
+        """Return finite nonzero trainable gradients and frozen-gradient leaks."""
+        import torch
+
+        nonzero = frozen_leaks = 0
+        for name, parameter in module.named_parameters():
+            if parameter.requires_grad:
+                if trainable_match(name) and parameter.grad is not None:
+                    if not torch.isfinite(parameter.grad).all():
+                        raise FloatingPointError(f"non-finite gradient: {name}")
+                    nonzero += int(torch.count_nonzero(parameter.grad).item() > 0)
+            elif parameter.grad is not None:
+                frozen_leaks += 1
+        return nonzero, frozen_leaks
 
     def run_update(self, microbatches: Iterable[Any]) -> float:
         import torch
@@ -52,6 +69,27 @@ class HybridTrainer:
                 loss = output["loss"] if isinstance(output, dict) else getattr(output, "loss", output)
                 self.core_engine.backward(loss / len(batches))
             if boundary:
+                encoder_module = getattr(self.encoder, "module", self.encoder)
+                encoder_grads, encoder_frozen_leaks = self._gradient_counts(encoder_module, lambda _name: True)
+                core_module = getattr(self.core_engine, "module", self.core_engine)
+                projector_grads, core_frozen_leaks = self._gradient_counts(
+                    core_module, lambda name: "audio_projector" in name
+                )
+                lora_grads, lora_frozen_leaks = self._gradient_counts(
+                    core_module, lambda name: name.startswith("lora_") or ".lora_" in name
+                )
+                if not encoder_grads or not projector_grads or not lora_grads:
+                    raise AssertionError("missing Encoder, Projector, or LoRA gradient at update boundary")
+                if encoder_frozen_leaks or core_frozen_leaks or lora_frozen_leaks:
+                    raise AssertionError("frozen parameter received a gradient")
+                self.last_gradient_audit = {
+                    "encoder_nonzero_gradients": encoder_grads,
+                    "projector_nonzero_gradients": projector_grads,
+                    "lora_nonzero_gradients": lora_grads,
+                    "encoder_no_sync_microbatches": len(batches) - 1 if hasattr(self.encoder, "no_sync") else 0,
+                    "core_steps": 1,
+                    "encoder_steps": 1,
+                }
                 torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.config.max_grad_norm)
                 self.core_engine.step()
                 self.encoder_optimizer.step()
@@ -79,11 +117,15 @@ class HybridTrainer:
         import torch
 
         module = getattr(self.encoder, "module", self.encoder)
-        torch.save({"global_step": self.global_step, "epoch": self.epoch,
-                    "encoder_trainable": {n: p.detach().cpu() for n, p in module.named_parameters() if p.requires_grad},
-                    "encoder_optimizer": self.encoder_optimizer.state_dict(),
-                    "encoder_scheduler": None if self.encoder_scheduler is None else self.encoder_scheduler.state_dict()}, path)
         self.core_engine.save_checkpoint(str(path.parent), tag=path.name + ".core")
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if rank == 0:
+            torch.save({"global_step": self.global_step, "epoch": self.epoch,
+                        "encoder_trainable": {n: p.detach().cpu() for n, p in module.named_parameters() if p.requires_grad},
+                        "encoder_optimizer": self.encoder_optimizer.state_dict(),
+                        "encoder_scheduler": None if self.encoder_scheduler is None else self.encoder_scheduler.state_dict()}, path)
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
     def load_checkpoint(self, path: Path) -> None:
         import torch

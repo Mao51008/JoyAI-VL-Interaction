@@ -45,8 +45,8 @@ PROJECTOR_LR = 3e-6
 LORA_LR = 1e-5
 
 
-def deepspeed_zero2_config(*, steps: int, warmup_steps: int) -> dict[str, Any]:
-    """ZeRO-2 BF16 configuration for the two-group Projector/LoRA core.
+def deepspeed_zero3_config(*, steps: int, warmup_steps: int) -> dict[str, Any]:
+    """ZeRO-3 BF16 configuration for the two-group Projector/LoRA core.
 
     HybridTrainer owns the eight-microbatch accumulation boundary. DeepSpeed
     therefore sees one externally accumulated update at a time.
@@ -55,8 +55,9 @@ def deepspeed_zero2_config(*, steps: int, warmup_steps: int) -> dict[str, Any]:
         "train_micro_batch_size_per_gpu": 1,
         "gradient_accumulation_steps": 1,
         "bf16": {"enabled": True},
-        "zero_optimization": {"stage": 2, "overlap_comm": True, "contiguous_gradients": True,
-                              "reduce_scatter": True, "allgather_partitions": True},
+        "zero_optimization": {"stage": 3, "overlap_comm": True, "contiguous_gradients": True,
+                              "reduce_scatter": True, "allgather_partitions": True,
+                              "offload_optimizer": {"device": "none"}, "offload_param": {"device": "none"}},
         "gradient_clipping": 1.0,
         "zero_allow_untested_optimizer": True,
         "scheduler": {"type": "WarmupDecayLR", "params": {"warmup_min_lr": [0.0, 0.0],
@@ -472,7 +473,7 @@ def main(argv: list[str] | None = None) -> int:
         {"params": lora_parameters, "lr": LORA_LR, "weight_decay": 0.01},
     ])
     core_engine, _, _, _ = deepspeed.initialize(model=core, optimizer=core_optimizer,
-        config=deepspeed_zero2_config(steps=steps_per_epoch * args.epochs, warmup_steps=args.warmup_steps))
+        config=deepspeed_zero3_config(steps=steps_per_epoch * args.epochs, warmup_steps=args.warmup_steps))
     args.output_dir.mkdir(parents=True, exist_ok=True)
     encoder_optimizer = torch.optim.AdamW([p for p in encoder_branch.parameters() if p.requires_grad], lr=ENCODER_LR, weight_decay=0.01)
     encoder_scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -495,12 +496,20 @@ def main(argv: list[str] | None = None) -> int:
         for name, source in validation_sources.items()
     }
     trainer.save_checkpoint(args.output_dir / "hybrid.pt")
+    trainer.load_checkpoint(args.output_dir / "hybrid.pt")
+    memory_by_rank: list[dict[str, int] | None] = [None] * world_size
+    torch.distributed.all_gather_object(memory_by_rank, {
+        "rank": rank,
+        "max_memory_allocated": torch.cuda.max_memory_allocated(),
+        "max_memory_reserved": torch.cuda.max_memory_reserved(),
+    })
     result = {"steps": trainer.global_step, "train_loss": losses[-1], "validation": validation,
-              "cuda_max_memory_allocated": torch.cuda.max_memory_allocated(), "cuda_max_memory_reserved": torch.cuda.max_memory_reserved()}
-    (args.output_dir / "joint_training_report.json").write_text(
-        json.dumps({"preflight": preflight, "runtime": runtime_report, "training": result}, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8"
-    )
-    print(json.dumps({"preflight": preflight, "training": result}, ensure_ascii=False, default=str))
+              "checkpoint_restored": True, "memory_by_rank": memory_by_rank, "gradient_audit": trainer.last_gradient_audit}
+    if rank == 0:
+        (args.output_dir / "joint_training_report.json").write_text(
+            json.dumps({"preflight": preflight, "runtime": runtime_report, "training": result}, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8"
+        )
+    print("HYBRID_SMOKE_RESULT=" + json.dumps(result, ensure_ascii=False, default=str), flush=True)
     return 0
 
 
