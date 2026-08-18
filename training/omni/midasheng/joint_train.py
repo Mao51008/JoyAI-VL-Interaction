@@ -321,6 +321,20 @@ def build_joint_model(audio_encoder: Any, llm: Any, *, projector_checkpoint: Pat
                    "trainable_parameter_counts": parameter_counts}
 
 
+def keep_midasheng_frontend_batch_norm_fp32(audio_encoder: Any) -> None:
+    """Preserve MiDasheng's frozen frontend BatchNorm FP32 island under BF16 training."""
+    import torch
+
+    batch_norm = getattr(audio_encoder, "init_bn", None)
+    if batch_norm is None:
+        raise TypeError("MiDasheng audio encoder does not expose init_bn")
+    batch_norm.float()
+    batch_norm.register_forward_pre_hook(lambda _module, inputs: (inputs[0].float(),))
+    batch_norm.register_forward_hook(
+        lambda _module, _inputs, output: output.to(dtype=torch.bfloat16)
+    )
+
+
 def optimizer_parameter_groups(model: Any, config: Stage2Config) -> list[dict[str, Any]]:
     return _stage2_optimizer_groups(model, config)
 
@@ -394,6 +408,7 @@ def main(argv: list[str] | None = None) -> int:
         projector_sha256=args.init_projector_sha256, projector_preflight=args.init_projector_preflight,
         audio_model=args.audio_model)
     model = model.to(device=args.device, dtype=torch.bfloat16)
+    keep_midasheng_frontend_batch_norm_fp32(model.audio_encoder)
     train_rows, train_filter = load_joint_manifest(args.train_manifest, args.max_audio_tokens)
     dev_rows, dev_filter = load_joint_manifest(args.dev_manifest, args.max_audio_tokens)
     rank = torch.distributed.get_rank() if args.deepspeed else 0
