@@ -78,6 +78,7 @@ class Stage2Config:
     learning_rate: float | None = None
     projector_learning_rate: float = 3e-6
     lora_learning_rate: float = 1e-5
+    encoder_learning_rate: float | None = None
     weight_decay: float = 0.01
     gradient_accumulation_steps: int = 8
     max_grad_norm: float = 1.0
@@ -1108,11 +1109,16 @@ def _optimizer_parameter_groups(
     lora_lr = config.learning_rate or config.lora_learning_rate
     projector_parameters = []
     lora_parameters = []
+    encoder_parameters = []
     unexpected = []
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        if (
+        if config.encoder_learning_rate is not None and name.startswith(
+            config.asr_encoder_prefix + "."
+        ):
+            encoder_parameters.append(parameter)
+        elif (
             name.startswith(config.projector_prefix + ".")
             or ("." + config.projector_prefix + ".") in name
         ):
@@ -1124,6 +1130,15 @@ def _optimizer_parameter_groups(
     if unexpected:
         raise ValueError(f"unexpected trainable parameters: {unexpected}")
     groups = []
+    if encoder_parameters:
+        groups.append(
+            {
+                "params": encoder_parameters,
+                "lr": config.encoder_learning_rate,
+                "weight_decay": config.weight_decay,
+                "group_name": "midasheng_high_blocks",
+            }
+        )
     if projector_parameters:
         groups.append(
             {
@@ -1214,6 +1229,7 @@ def _save_checkpoint(
             "training_config": {
                 "projector_learning_rate": config.projector_learning_rate,
                 "lora_learning_rate": config.lora_learning_rate,
+                "encoder_learning_rate": config.encoder_learning_rate,
                 "legacy_learning_rate_override": config.learning_rate,
                 "weight_decay": config.weight_decay,
                 "gradient_accumulation_steps": config.gradient_accumulation_steps,
