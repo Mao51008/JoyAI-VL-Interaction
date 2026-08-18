@@ -23,11 +23,19 @@ class Core:
     def save_checkpoint(self, *args, **kwargs): pass
     def load_checkpoint(self, *args, **kwargs): pass
 
+
+class Scheduler:
+    def __init__(self): self.steps = 0
+    def step(self): self.steps += 1
+    def state_dict(self): return {"steps": self.steps}
+    def load_state_dict(self, state): self.steps = state["steps"]
+
 def test_eight_microbatches_use_one_boundary_and_keep_encoder_gradient():
     encoder, core = Encoder(), Core(); optimizer = torch.optim.AdamW(encoder.parameters(), lr=1e-3)
-    trainer = HybridTrainer(encoder, core, optimizer, HybridConfig(8))
-    batch = SimpleNamespace(waveforms=torch.ones(1), lengths=torch.ones(1, dtype=torch.long))
+    scheduler = Scheduler()
+    trainer = HybridTrainer(encoder, core, optimizer, HybridConfig(8), scheduler)
+    batch = SimpleNamespace(audio_features=torch.ones(1), audio_attention_mask=torch.ones(1, dtype=torch.long))
     trainer.run_update([batch] * 8)
     assert core.backward_calls == 8 and core.step_calls == 1
-    assert encoder.no_sync_calls == 7 and trainer.global_step == 1
+    assert encoder.no_sync_calls == 7 and trainer.global_step == 1 and scheduler.steps == 1
     assert encoder.weight.grad is not None

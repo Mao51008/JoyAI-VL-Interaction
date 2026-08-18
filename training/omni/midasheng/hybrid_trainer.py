@@ -27,9 +27,9 @@ class HybridTrainer:
     """Coordinate exactly one Encoder-DDP and one DeepSpeed-Core update boundary."""
 
     def __init__(self, encoder: Any, core_engine: Any, encoder_optimizer: Any,
-                 config: HybridConfig = HybridConfig()) -> None:
-        self.encoder, self.core_engine, self.encoder_optimizer, self.config = (
-            encoder, core_engine, encoder_optimizer, config
+                 config: HybridConfig = HybridConfig(), encoder_scheduler: Any | None = None) -> None:
+        self.encoder, self.core_engine, self.encoder_optimizer, self.config, self.encoder_scheduler = (
+            encoder, core_engine, encoder_optimizer, config, encoder_scheduler
         )
         self.global_step = 0
         self.epoch = 0
@@ -55,6 +55,8 @@ class HybridTrainer:
                 torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.config.max_grad_norm)
                 self.core_engine.step()
                 self.encoder_optimizer.step()
+                if self.encoder_scheduler is not None:
+                    self.encoder_scheduler.step()
             total += loss.detach()
         self.global_step += 1
         return float(total / len(batches))
@@ -79,7 +81,8 @@ class HybridTrainer:
         module = getattr(self.encoder, "module", self.encoder)
         torch.save({"global_step": self.global_step, "epoch": self.epoch,
                     "encoder_trainable": {n: p.detach().cpu() for n, p in module.named_parameters() if p.requires_grad},
-                    "encoder_optimizer": self.encoder_optimizer.state_dict()}, path)
+                    "encoder_optimizer": self.encoder_optimizer.state_dict(),
+                    "encoder_scheduler": None if self.encoder_scheduler is None else self.encoder_scheduler.state_dict()}, path)
         self.core_engine.save_checkpoint(str(path.parent), tag=path.name + ".core")
 
     def load_checkpoint(self, path: Path) -> None:
@@ -89,6 +92,8 @@ class HybridTrainer:
         module = getattr(self.encoder, "module", self.encoder)
         module.load_state_dict(state["encoder_trainable"], strict=False)
         self.encoder_optimizer.load_state_dict(state["encoder_optimizer"])
+        if self.encoder_scheduler is not None and state["encoder_scheduler"] is not None:
+            self.encoder_scheduler.load_state_dict(state["encoder_scheduler"])
         self.global_step, self.epoch = int(state["global_step"]), int(state["epoch"])
         self.core_engine.load_checkpoint(str(path.parent), tag=path.name + ".core")
 

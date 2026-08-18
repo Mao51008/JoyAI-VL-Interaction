@@ -45,17 +45,21 @@ LORA_LR = 1e-5
 
 
 def deepspeed_zero2_config(*, steps: int, warmup_steps: int) -> dict[str, Any]:
-    """ZeRO-2 BF16 configuration; parameter groups remain supplied by the trainer."""
+    """ZeRO-2 BF16 configuration for the two-group Projector/LoRA core.
+
+    HybridTrainer owns the eight-microbatch accumulation boundary. DeepSpeed
+    therefore sees one externally accumulated update at a time.
+    """
     return {
         "train_micro_batch_size_per_gpu": 1,
-        "gradient_accumulation_steps": 8,
+        "gradient_accumulation_steps": 1,
         "bf16": {"enabled": True},
         "zero_optimization": {"stage": 2, "overlap_comm": True, "contiguous_gradients": True,
                               "reduce_scatter": True, "allgather_partitions": True},
         "gradient_clipping": 1.0,
         "zero_allow_untested_optimizer": True,
-        "scheduler": {"type": "WarmupDecayLR", "params": {"warmup_min_lr": [0.0, 0.0, 0.0],
-                      "warmup_max_lr": [ENCODER_LR, PROJECTOR_LR, LORA_LR],
+        "scheduler": {"type": "WarmupDecayLR", "params": {"warmup_min_lr": [0.0, 0.0],
+                      "warmup_max_lr": [PROJECTOR_LR, LORA_LR],
                       "warmup_num_steps": warmup_steps, "total_num_steps": steps}},
     }
 
@@ -470,8 +474,13 @@ def main(argv: list[str] | None = None) -> int:
         config=deepspeed_zero2_config(steps=steps_per_epoch * args.epochs, warmup_steps=args.warmup_steps))
     args.output_dir.mkdir(parents=True)
     encoder_optimizer = torch.optim.AdamW([p for p in encoder_branch.parameters() if p.requires_grad], lr=ENCODER_LR, weight_decay=0.01)
+    encoder_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        encoder_optimizer,
+        lr_lambda=lambda step: (step + 1) / max(1, args.warmup_steps)
+        if step < args.warmup_steps else max(0.1, 1 - 0.9 * (step - args.warmup_steps) / max(1, steps_per_epoch * args.epochs - args.warmup_steps)),
+    )
     trainer = HybridTrainer(encoder_branch, core_engine, encoder_optimizer,
-        HybridConfig(args.gradient_accumulation_steps, args.max_grad_norm))
+        HybridConfig(args.gradient_accumulation_steps, args.max_grad_norm), encoder_scheduler)
     iterator = iter(train_batches)
     losses = []
     for _step in range(steps_per_epoch * args.epochs):
