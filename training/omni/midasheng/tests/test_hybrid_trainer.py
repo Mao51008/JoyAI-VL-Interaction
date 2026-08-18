@@ -22,7 +22,12 @@ class Core(torch.nn.Module):
         assert features.dtype == torch.bfloat16
         return (features.float() * self.audio_projector * self.lora_b).sum()
     def backward(self, loss): self.backward_calls += 1; loss.backward()
-    def step(self): self.step_calls += 1
+    def step(self):
+        self.step_calls += 1
+        with torch.no_grad():
+            for parameter in self.parameters():
+                if parameter.grad is not None:
+                    parameter.add_(parameter.grad, alpha=-1e-3)
     def save_checkpoint(self, *args, **kwargs): pass
     def load_checkpoint(self, *args, **kwargs): pass
 
