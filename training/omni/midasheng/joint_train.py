@@ -300,7 +300,9 @@ def build_joint_model(audio_encoder: Any, llm: Any, *, projector_checkpoint: Pat
             device = next(self.parameters()).device
             waveform = batch.audio_features.to(device=device, dtype=torch.float32)
             lengths = batch.audio_attention_mask.to(device)
-            encoded, mask = self.audio_encoder(waveform, x_length=lengths)
+            # DeepSpeed BF16 autocast must not enter MiDasheng's FP32 encoder graph.
+            with torch.autocast(device_type="cuda", enabled=False):
+                encoded, mask = self.audio_encoder(waveform, x_length=lengths)
             if [int(value) for value in mask.sum(dim=1)] != [int(value) for value in batch.audio_placeholder_mask.sum(dim=1)]:
                 raise ValueError("MiDasheng encoder token count differs from audio placeholders")
             projector_dtype = next(self.audio_projector.parameters()).dtype
