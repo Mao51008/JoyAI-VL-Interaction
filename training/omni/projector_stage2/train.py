@@ -1420,6 +1420,12 @@ def train_model(
             "learning_rates": learning_rates,
             "supervised_tokens": int(global_token_count),
             "gradient_norm": float(grad_norm),
+            "cuda_max_memory_allocated": torch.cuda.max_memory_allocated(
+                trainables[0].device
+            ) if torch.cuda.is_available() else 0,
+            "cuda_max_memory_reserved": torch.cuda.max_memory_reserved(
+                trainables[0].device
+            ) if torch.cuda.is_available() else 0,
             "task_samples": dict(
                 Counter(
                     task
