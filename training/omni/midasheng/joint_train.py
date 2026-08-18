@@ -43,6 +43,22 @@ PROJECTOR_LR = 3e-6
 LORA_LR = 1e-5
 
 
+def deepspeed_zero2_config(*, steps: int, warmup_steps: int) -> dict[str, Any]:
+    """ZeRO-2 BF16 configuration; parameter groups remain supplied by the trainer."""
+    return {
+        "train_micro_batch_size_per_gpu": 1,
+        "gradient_accumulation_steps": 8,
+        "bf16": {"enabled": True},
+        "zero_optimization": {"stage": 2, "overlap_comm": True, "contiguous_gradients": True,
+                              "reduce_scatter": True, "allgather_partitions": True},
+        "gradient_clipping": 1.0,
+        "zero_allow_untested_optimizer": True,
+        "scheduler": {"type": "WarmupDecayLR", "params": {"warmup_min_lr": [0.0, 0.0, 0.0],
+                      "warmup_max_lr": [ENCODER_LR, PROJECTOR_LR, LORA_LR],
+                      "warmup_num_steps": warmup_steps, "total_num_steps": steps}},
+    }
+
+
 def _task_counts(total: int, weights: dict[str, float] = TASK_WEIGHTS) -> dict[str, int]:
     if total <= 0:
         raise ValueError("samples_per_epoch must be positive")
@@ -296,10 +312,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-audio-tokens", type=int, default=512)
     parser.add_argument("--init-projector-checkpoint", type=Path, required=True); parser.add_argument("--init-projector-sha256", required=True)
     parser.add_argument("--init-projector-preflight", type=Path, required=True)
+    parser.add_argument("--deepspeed", action="store_true")
+    parser.add_argument("--local-rank", "--local_rank", type=int, default=-1)
     parser.add_argument("--device", default="cuda:0"); parser.add_argument("--run", action="store_true")
     args = parser.parse_args(argv)
     manifests = validate_manifests(args.train_manifest, args.dev_manifest)
-    steps_per_epoch = math.ceil(math.ceil(args.samples_per_epoch / args.batch_size) / args.gradient_accumulation_steps)
+    world_size = int(__import__("os").environ.get("WORLD_SIZE", "1"))
+    if args.deepspeed and world_size != 3:
+        parser.error("--deepspeed joint training requires exactly 3 ranks")
+    if args.deepspeed and (args.batch_size, args.gradient_accumulation_steps) != (1, 8):
+        parser.error("ZeRO-2 baseline requires micro batch 1 and gradient accumulation 8")
+    steps_per_epoch = math.ceil(args.samples_per_epoch / (args.batch_size * args.gradient_accumulation_steps * world_size))
     if args.epochs <= 0:
         parser.error("--epochs must be positive")
     preflight = {"status": "preflight-only", "manifests": manifests, "audio_model": {"path": args.audio_model, "checkpoint_kind": "MiDashengLM final checkpoint Audio Encoder"},
@@ -311,7 +334,7 @@ def main(argv: list[str] | None = None) -> int:
                  "sequence_limits": {"max_input_tokens": args.max_input_tokens, "max_midasheng_audio_tokens": args.max_audio_tokens},
                  "training_schedule": {"epochs": args.epochs, "optimizer_steps_per_epoch": steps_per_epoch, "optimizer_steps": steps_per_epoch * args.epochs,
                  "per_device_batch_size": args.batch_size, "gradient_accumulation_steps": args.gradient_accumulation_steps,
-                 "effective_batch_size": args.batch_size * args.gradient_accumulation_steps, "warmup_steps": args.warmup_steps,
+                 "world_size": world_size, "effective_batch_size": args.batch_size * args.gradient_accumulation_steps * world_size, "warmup_steps": args.warmup_steps,
                  "scheduler": "linear decay to 10% of each group LR", "max_grad_norm": args.max_grad_norm}}
     if not args.run:
         if args.output_dir.exists(): raise FileExistsError(f"refusing to reuse output directory: {args.output_dir}")
@@ -319,6 +342,12 @@ def main(argv: list[str] | None = None) -> int:
     import gc
     import torch
     from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
+    if args.deepspeed:
+        import deepspeed
+
+        deepspeed.init_distributed()
+        torch.cuda.set_device(args.local_rank)
+        args.device = f"cuda:{args.local_rank}"
     tokenizer = AutoTokenizer.from_pretrained(args.llm_model, fix_mistral_regex=True)
     placeholder_id = tokenizer.convert_tokens_to_ids("<|vision_pad|>")
     if placeholder_id is None or placeholder_id == getattr(tokenizer, "unk_token_id", None):
@@ -332,8 +361,10 @@ def main(argv: list[str] | None = None) -> int:
         audio_model=args.audio_model)
     model = model.to(device=args.device, dtype=torch.bfloat16)
     train_rows, dev_rows = load_manifest(args.train_manifest), load_manifest(args.dev_manifest)
+    rank = torch.distributed.get_rank() if args.deepspeed else 0
+    local_epoch_samples = math.ceil(args.samples_per_epoch / world_size)
     train_batches = JointRawAudioBatchSource(train_rows, tokenizer, int(placeholder_id), batch_size=args.batch_size,
-        samples_per_epoch=args.samples_per_epoch, seed=3407, max_length=args.max_input_tokens,
+        samples_per_epoch=local_epoch_samples, seed=3407 + rank, max_length=args.max_input_tokens,
         max_audio_tokens=args.max_audio_tokens)
     validation_sources = {
         task: JointRawAudioBatchSource([row for row in dev_rows if classify_task(row) == task], tokenizer, int(placeholder_id),
@@ -345,7 +376,9 @@ def main(argv: list[str] | None = None) -> int:
     config = Stage2Config(args.train_manifest, args.dev_manifest, args.output_dir, projector_learning_rate=PROJECTOR_LR,
         lora_learning_rate=LORA_LR, encoder_learning_rate=ENCODER_LR, steps=steps_per_epoch * args.epochs,
         validation_every=steps_per_epoch, gradient_accumulation_steps=args.gradient_accumulation_steps,
-        warmup_steps=args.warmup_steps, max_grad_norm=args.max_grad_norm)
+        warmup_steps=args.warmup_steps, max_grad_norm=args.max_grad_norm,
+        deepspeed_config=deepspeed_zero2_config(steps=steps_per_epoch * args.epochs, warmup_steps=args.warmup_steps)
+        if args.deepspeed else None)
     preflight["encoder"] = runtime_report
     preflight["validation"] = {"sampling": "disabled", "sources": {
         task: {"samples": len(source.groups[task]), "fixed_complete_dev_set": True}

@@ -92,6 +92,7 @@ class Stage2Config:
     max_validation_batches: int | None = None
     warmup_steps: int = 100
     min_learning_rate_ratio: float = 0.1
+    deepspeed_config: dict[str, Any] | None = None
 
 
 @dataclass
@@ -1301,6 +1302,14 @@ def train_model(
     )
     parameter_groups = _optimizer_parameter_groups(base_model, config)
     optimizer = torch.optim.AdamW(parameter_groups)
+    deepspeed_engine = None
+    if config.deepspeed_config is not None:
+        import deepspeed
+
+        deepspeed_engine, optimizer, _, scheduler = deepspeed.initialize(
+            model=base_model, optimizer=optimizer, config=config.deepspeed_config
+        )
+        model = deepspeed_engine
 
     def learning_rate_scale(step: int) -> float:
         if config.warmup_steps and step < config.warmup_steps:
@@ -1309,7 +1318,8 @@ def train_model(
         progress = min(1.0, max(0.0, (step - config.warmup_steps) / decay_steps))
         return 1.0 - (1.0 - config.min_learning_rate_ratio) * progress
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, learning_rate_scale)
+    if deepspeed_engine is None:
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, learning_rate_scale)
     if not hasattr(train_batches, "__len__") or not hasattr(dev_batches, "__len__"):
         raise TypeError("train and dev batches must be re-iterable sized sources")
     if len(train_batches) == 0 or len(dev_batches) == 0:
@@ -1362,7 +1372,8 @@ def train_model(
         learning_rates = {
             group["group_name"]: group["lr"] for group in optimizer.param_groups
         }
-        optimizer.zero_grad(set_to_none=True)
+        if deepspeed_engine is None:
+            optimizer.zero_grad(set_to_none=True)
         local_token_counts = [_supervised_token_count(batch) for batch in microbatches]
         global_token_count = torch.tensor(
             float(sum(local_token_counts)), device=trainables[0].device
@@ -1375,7 +1386,7 @@ def train_model(
         ):
             sync_context = (
                 model.no_sync()
-                if distributed and microbatch_index + 1 < len(microbatches)
+                if deepspeed_engine is None and distributed and microbatch_index + 1 < len(microbatches)
                 else nullcontext()
             )
             with sync_context:
@@ -1383,12 +1394,20 @@ def train_model(
                 loss = _loss_value(model(batch))
                 trace_microbatch("after_forward", step, microbatch_index, batch)
                 loss_scale = token_count * world_size / float(global_token_count)
-                (loss * loss_scale).backward()
+                if deepspeed_engine is None:
+                    (loss * loss_scale).backward()
+                else:
+                    deepspeed_engine.backward(loss * loss_scale)
                 trace_microbatch("after_backward", step, microbatch_index, batch)
             weighted_loss_sum += loss.detach() * token_count
-        grad_norm = torch.nn.utils.clip_grad_norm_(trainables, config.max_grad_norm)
-        optimizer.step()
-        scheduler.step()
+            if deepspeed_engine is not None:
+                deepspeed_engine.step()
+        if deepspeed_engine is None:
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainables, config.max_grad_norm)
+            optimizer.step()
+            scheduler.step()
+        else:
+            grad_norm = torch.zeros((), device=trainables[0].device)
         if distributed:
             torch.distributed.all_reduce(weighted_loss_sum)
         loss_value = weighted_loss_sum / global_token_count
