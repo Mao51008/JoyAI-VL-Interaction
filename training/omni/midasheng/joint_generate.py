@@ -9,15 +9,17 @@ from pathlib import Path
 from typing import Any
 
 from training.omni.projector_stage1.model import replace_audio_placeholders
+from training.omni.projector_stage1.projector import AudioProjector, AudioProjectorConfig
 from training.omni.projector_stage2.cache_features import _load_mono_audio
-from training.omni.projector_stage2.train import Stage2ConversationBatch, _build_supervised_sequence
+from training.omni.projector_stage2.train import Stage2ConversationBatch, _build_supervised_sequence, inject_lora
 
 from .hybrid_trainer import build_projector_lora_core
 from .joint_train import (
     TASK_WEIGHTS,
     _feature_tokens,
-    build_joint_model,
     classify_task,
+    configure_high_encoder_blocks,
+    language_all_linear_targets,
     load_joint_manifest,
 )
 
@@ -73,8 +75,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True); parser.add_argument("--checkpoint-dir", type=Path, required=True)
     parser.add_argument("--audio-model", required=True); parser.add_argument("--llm-model", required=True)
-    parser.add_argument("--init-projector-checkpoint", type=Path, required=True); parser.add_argument("--init-projector-sha256", required=True)
-    parser.add_argument("--init-projector-preflight", type=Path, required=True); parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--samples-per-task", type=int, default=20); parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--max-new-tokens", type=int, default=128); parser.add_argument("--max-input-tokens", type=int, default=1536); parser.add_argument("--max-audio-tokens", type=int, default=512)
     parser.add_argument("--local-rank", "--local_rank", type=int, default=-1)
@@ -95,12 +96,13 @@ def main() -> int:
     encoder = audio.audio_encoder; del audio
     llm = AutoModelForImageTextToText.from_pretrained(args.llm_model, dtype=torch.bfloat16)
     llm.config.use_cache = True
-    model, _ = build_joint_model(encoder, llm, projector_checkpoint=args.init_projector_checkpoint,
-        projector_sha256=args.init_projector_sha256, projector_preflight=args.init_projector_preflight, audio_model=args.audio_model)
-    encoder = model.audio_encoder.to(f"cuda:{args.local_rank}", dtype=torch.float32).eval()
+    inject_lora(llm, language_all_linear_targets(llm), 8, 16.0)
+    configure_high_encoder_blocks(encoder)
+    encoder = encoder.to(f"cuda:{args.local_rank}", dtype=torch.float32).eval()
     encoder_state = torch.load(args.checkpoint_dir / "hybrid.pt", map_location="cpu", weights_only=True)
     encoder.load_state_dict(encoder_state["encoder_trainable"], strict=False)
-    core = build_projector_lora_core(model.audio_projector, model.language_model).to(f"cuda:{args.local_rank}", dtype=torch.bfloat16).eval()
+    projector = AudioProjector(AudioProjectorConfig(1280, 4096, 4096, 0.0))
+    core = build_projector_lora_core(projector, llm).to(f"cuda:{args.local_rank}", dtype=torch.bfloat16).eval()
     trainable = [parameter for parameter in core.parameters() if parameter.requires_grad]
     engine, _, _, _ = deepspeed.initialize(model=core, optimizer=torch.optim.AdamW(trainable, lr=1e-5), config={
         "train_micro_batch_size_per_gpu": 1, "gradient_accumulation_steps": 1, "bf16": {"enabled": True},
