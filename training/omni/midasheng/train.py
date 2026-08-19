@@ -69,11 +69,16 @@ def filter_rows_by_input_tokens(
     kept: list[dict[str, Any]] = []
     dropped_input = 0
     dropped_audio = 0
+    dropped_too_short = 0
     longest_kept = 0
     longest_dropped = 0
     for row in rows:
         feature = cache.get(str(row["sample_id"]))["features"]
-        audio_tokens = subsampled_token_count(int(feature.shape[0]))
+        try:
+            audio_tokens = subsampled_token_count(int(feature.shape[0]))
+        except ValueError:
+            dropped_too_short += 1
+            continue
         sequence = _build_supervised_sequence(
             row,
             tokenizer,
@@ -101,6 +106,7 @@ def filter_rows_by_input_tokens(
         "dropped_samples": dropped_input + dropped_audio,
         "dropped_for_input_tokens": dropped_input,
         "dropped_for_audio_tokens": dropped_audio,
+        "dropped_for_projector_subsampling": dropped_too_short,
         "longest_kept_tokens": longest_kept,
         "longest_dropped_tokens": longest_dropped,
     }
