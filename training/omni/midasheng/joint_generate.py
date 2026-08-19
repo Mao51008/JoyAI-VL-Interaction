@@ -84,6 +84,7 @@ def main() -> int:
     if args.samples_per_task <= 0: parser.error("--samples-per-task must be positive")
     import torch
     import deepspeed
+    from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
     from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
 
     deepspeed.init_distributed(); torch.cuda.set_device(args.local_rank)
@@ -103,19 +104,20 @@ def main() -> int:
     encoder.load_state_dict(encoder_state["encoder_trainable"], strict=False)
     projector = AudioProjector(AudioProjectorConfig(1280, 4096, 4096, 0.0))
     core = build_projector_lora_core(projector, llm).to(f"cuda:{args.local_rank}", dtype=torch.bfloat16).eval()
-    trainable = [parameter for parameter in core.parameters() if parameter.requires_grad]
-    engine, _, _, _ = deepspeed.initialize(model=core, optimizer=torch.optim.AdamW(trainable, lr=1e-5), config={
-        "train_micro_batch_size_per_gpu": 1, "gradient_accumulation_steps": 1, "bf16": {"enabled": True},
-        "zero_optimization": {"stage": 3, "offload_optimizer": {"device": "none"}, "offload_param": {"device": "none"}},
-    })
-    loaded, _ = engine.load_checkpoint(str(args.checkpoint_dir), tag="hybrid.pt.core",
-                                       load_optimizer_states=False, load_lr_scheduler_states=False)
-    if loaded is None: raise RuntimeError("failed to load ZeRO-3 Core checkpoint")
+    # Evaluation has no backward pass: reconstruct only model weights on CPU instead
+    # of creating a ZeRO-3 optimizer and its gradient partitions on every GPU.
+    core_state = get_fp32_state_dict_from_zero_checkpoint(str(args.checkpoint_dir), tag="hybrid.pt.core")
+    incompatible = core.load_state_dict(core_state, strict=True)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise RuntimeError(f"unexpected Core checkpoint keys: {incompatible}")
+    del core_state
+    for parameter in core.parameters():
+        parameter.requires_grad_(False)
     records = []
     for index, row in enumerate(selected):
         if index % world != rank: continue
         batch = make_batch(row, tokenizer, int(placeholder_id), args.max_input_tokens, args.max_audio_tokens)
-        text, tokens, eos = generate(engine.module, encoder, batch, tokenizer, args.max_new_tokens)
+        text, tokens, eos = generate(core, encoder, batch, tokenizer, args.max_new_tokens)
         records.append({"sample_id": str(row["sample_id"]), "task": classify_task(row), "reference": row["user_text"] if classify_task(row) == "librispeech" else row["assistant_response"], "generation": text, "generated_tokens": tokens, "generated_eos": eos})
     gathered: list[list[dict[str, Any]] | None] = [None] * world
     torch.distributed.all_gather_object(gathered, records)
