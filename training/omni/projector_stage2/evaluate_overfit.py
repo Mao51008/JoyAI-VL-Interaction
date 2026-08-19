@@ -111,15 +111,19 @@ def _generate(model: Any, batch: Stage2ConversationBatch, tokenizer: Any, max_ne
     language_model = core_model.core.language_model
     device = next(core_model.parameters()).device
     input_ids = batch.input_ids.to(device)
-    audio = core_model.core.audio_projector(
-        batch.audio_features.to(device=device, dtype=next(core_model.parameters()).dtype)
-    )
+    projector = core_model.core.audio_projector
+    features = batch.audio_features.to(device=device, dtype=next(core_model.parameters()).dtype)
+    audio_mask = batch.audio_attention_mask.to(device)
+    if hasattr(projector, "official_projector"):
+        audio, audio_mask = projector(features, audio_mask)
+    else:
+        audio = projector(features)
     text_embeddings = language_model.get_input_embeddings()(input_ids)
     embeddings = replace_audio_placeholders(
         text_embeddings,
         audio,
         input_ids.eq(tokenizer.convert_tokens_to_ids("<|vision_pad|>")),
-        batch.audio_attention_mask.to(device),
+        audio_mask,
     )
     generated = language_model.generate(
         inputs_embeds=embeddings,
