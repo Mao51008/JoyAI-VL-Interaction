@@ -18,6 +18,7 @@ from training.omni.projector_stage2.train import (
 )
 
 from .model import build_phase1_model
+from .official_projector import build_frozen_projector_adapter, subsampled_token_count
 
 
 def preflight(
@@ -72,7 +73,7 @@ def filter_rows_by_input_tokens(
     longest_dropped = 0
     for row in rows:
         feature = cache.get(str(row["sample_id"]))["features"]
-        audio_tokens = int(feature.shape[0])
+        audio_tokens = subsampled_token_count(int(feature.shape[0]))
         sequence = _build_supervised_sequence(
             row,
             tokenizer,
@@ -107,7 +108,7 @@ def filter_rows_by_input_tokens(
 
 def run_training(
     *, train_manifest: Path, dev_manifest: Path, feature_dir: Path, output_dir: Path,
-    llm_model: str, batch_size: int, max_cached_feature_shards: int, steps: int,
+    llm_model: str, audio_model: str, batch_size: int, max_cached_feature_shards: int, steps: int,
     learning_rate: float, weight_decay: float, gradient_accumulation_steps: int,
     validation_every: int, warmup_steps: int, max_grad_norm: float, seed: int,
     device: str, no_progress: bool, max_input_tokens: int = 1536,
@@ -120,7 +121,7 @@ def run_training(
         feature_dir=feature_dir, output_dir=output_dir, create_output=False,
     )
     import torch
-    from transformers import AutoModelForImageTextToText, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
 
     if distributed != torch.distributed.is_initialized():
         raise RuntimeError("distributed flag and process-group state differ")
@@ -150,8 +151,14 @@ def run_training(
         torch.distributed.broadcast_object_list(filtered_rows, src=0)
     train_rows, dev_rows, train_filter, dev_filter = filtered_rows
     preflight_result["input_token_filter"] = {"train": train_filter, "dev": dev_filter}
+    audio_model_instance = AutoModelForCausalLM.from_pretrained(
+        audio_model, trust_remote_code=True, torch_dtype=torch.bfloat16
+    )
+    projector = build_frozen_projector_adapter(audio_model_instance.audio_projector)
+    del audio_model_instance
     model = build_phase1_model(
         AutoModelForImageTextToText.from_pretrained(llm_model, dtype=torch.bfloat16),
+        audio_projector=projector,
     ).to(device=device, dtype=torch.bfloat16)
     train_rows, dev_rows = train_rows[rank::world_size], dev_rows[rank::world_size]
     if not train_rows or not dev_rows:
@@ -162,11 +169,11 @@ def run_training(
         model = DistributedDataParallel(model, device_ids=[torch.cuda.current_device()])
     train_batches = CachedConversationBatchSource(
         train_rows, tokenizer, feature_dir, int(placeholder_id), batch_size,
-        max_cached_feature_shards, shuffle=True, seed=seed,
+        max_cached_feature_shards, shuffle=True, seed=seed, audio_token_factor=5,
     )
     dev_batches = CachedConversationBatchSource(
         dev_rows, tokenizer, feature_dir, int(placeholder_id), batch_size,
-        max_cached_feature_shards,
+        max_cached_feature_shards, audio_token_factor=5,
     )
     config = Stage2Config(
         train_manifest=train_manifest, dev_manifest=dev_manifest, output_dir=output_dir,
@@ -195,6 +202,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--feature-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--llm-model")
+    parser.add_argument("--audio-model")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-cached-feature-shards", type=int, default=8)
     parser.add_argument("--steps", type=int, default=1000)
@@ -220,8 +228,8 @@ def main(argv: list[str] | None = None) -> int:
         torch.distributed.init_process_group("nccl")
         args.device = f"cuda:{local_rank}"
     if args.run:
-        if not args.llm_model:
-            parser.error("--run requires --llm-model")
+        if not args.llm_model or not args.audio_model:
+            parser.error("--run requires --llm-model and --audio-model")
         arguments = vars(args)
         arguments.pop("run")
         result = run_training(**arguments)

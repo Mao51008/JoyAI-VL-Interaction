@@ -127,6 +127,7 @@ class CachedConversationBatchSource:
         seed: int = 3407,
         asr_replay_ratio: float = 0.0,
         cache_factory: Callable[[Path, int], Any] | None = None,
+        audio_token_factor: int = 1,
     ) -> None:
         if batch_size <= 0 or max_cached_shards <= 0:
             raise ValueError("batch_size and max_cached_shards must be positive")
@@ -142,6 +143,7 @@ class CachedConversationBatchSource:
         self.seed = seed
         self.asr_replay_ratio = asr_replay_ratio
         self.cache_factory = cache_factory
+        self.audio_token_factor = audio_token_factor
         self._epoch = 0
 
     def __len__(self) -> int:
@@ -182,6 +184,7 @@ class CachedConversationBatchSource:
                 self.tokenizer,
                 feature_cache,
                 self.audio_placeholder_id,
+                audio_token_factor=self.audio_token_factor,
             )
 
 

@@ -120,7 +120,7 @@ class CachedProjectorStage1Model(nn.Module):
     ) -> Any:
         projected = (
             self.audio_projector(audio_features, audio_attention_mask)
-            if hasattr(self.audio_projector, "k")
+            if hasattr(self.audio_projector, "k") or hasattr(self.audio_projector, "official_projector")
             else self.audio_projector(audio_features)
         )
         if isinstance(projected, tuple):

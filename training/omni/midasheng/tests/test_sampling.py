@@ -8,7 +8,7 @@ from training.omni.midasheng.sampling import PHASE1_TASK_WEIGHTS, sample_task_ro
 class Phase1SamplingTest(unittest.TestCase):
     def test_phase_one_counts_follow_explicit_weights(self) -> None:
         self.assertEqual(task_draw_counts(100, PHASE1_TASK_WEIGHTS), {
-            "voiceassistant": 50, "librispeech": 25, "clotho_aqa": 25,
+            "voiceassistant": 40, "librispeech": 40, "clotho_aqa": 20,
         })
 
     def test_task_sampling_is_seeded_and_uses_replacement(self) -> None:
@@ -16,7 +16,7 @@ class Phase1SamplingTest(unittest.TestCase):
         first = sample_task_rows(rows, total_examples=12, seed=7)
         self.assertEqual(first, sample_task_rows(rows, total_examples=12, seed=7))
         self.assertEqual({task: sum(task == value[0] for value in first) for task in rows}, {
-            "voiceassistant": 6, "librispeech": 3, "clotho_aqa": 3,
+            "voiceassistant": 5, "librispeech": 5, "clotho_aqa": 2,
         })
 
     def test_prepare_manifest_records_sampler_provenance_without_writing_sources(self) -> None:

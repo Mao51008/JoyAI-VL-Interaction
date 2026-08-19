@@ -55,5 +55,6 @@ def build_phase1_model(
             )
 
     model = Phase1Model()
-    freeze_for_projector_training(model, model.core.audio_projector)
+    trainable = getattr(model.core.audio_projector, "joyai_adapter", model.core.audio_projector)
+    freeze_for_projector_training(model, trainable)
     return model
