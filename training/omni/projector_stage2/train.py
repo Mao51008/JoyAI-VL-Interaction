@@ -1178,7 +1178,10 @@ def _write_loss_curve(records: list[dict[str, Any]], path: Path) -> None:
     values = [
         value
         for row in records
-        for value in (row.get("loss"), row.get("validation_loss"))
+        for value in (
+            row.get("loss"), row.get("validation_loss"),
+            *(row.get("validation_by_source") or {}).values(),
+        )
         if value is not None
     ]
     if not values:
@@ -1194,6 +1197,22 @@ def _write_loss_curve(records: list[dict[str, Any]], path: Path) -> None:
             for step, value in selected
         )
 
+    def points_for_source(name: str) -> str:
+        selected = [
+            (row["step"], row["validation_by_source"][name])
+            for row in records
+            if name in (row.get("validation_by_source") or {})
+        ]
+        return " ".join(
+            f"{40 + (step / max(1, records[-1]['step'])) * 640:.1f},"
+            f"{320 - ((value - low) / scale) * 280:.1f}"
+            for step, value in selected
+        )
+
+    source_colours = ("#16a34a", "#9333ea", "#ea580c", "#0891b2")
+    source_names = sorted(
+        {name for row in records for name in (row.get("validation_by_source") or {})}
+    )
     body = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">',
         '<rect width="100%" height="100%" fill="white"/>',
@@ -1201,8 +1220,16 @@ def _write_loss_curve(records: list[dict[str, Any]], path: Path) -> None:
         '<polyline fill="none" stroke="#dc2626" points="'
         + points("validation_loss")
         + '"/>',
-        "</svg>\n",
     ]
+    for index, name in enumerate(source_names):
+        body.append(
+            '<polyline fill="none" stroke="'
+            + source_colours[index % len(source_colours)]
+            + '" points="'
+            + points_for_source(name)
+            + '"/>'
+        )
+    body.append("</svg>\n")
     path.write_text("\n".join(body), encoding="utf-8")
 
 
@@ -1356,6 +1383,9 @@ def train_model(
     if rank == 0:
         metrics_path.write_text("", encoding="utf-8")
     best_validation = float("inf")
+    best_validation_by_source = {
+        name: float("inf") for name in (validation_sources or {})
+    }
     bad_checks = 0
     start_step = 0
     if config.resume_from is not None:
@@ -1483,6 +1513,19 @@ def train_model(
             record["validation_loss"] = validation_loss
             record["validation_supervised_tokens"] = int(validation_count)
             record["validation_by_source"] = validation_metrics
+            if rank == 0:
+                for name, source_loss in validation_metrics.items():
+                    if source_loss < best_validation_by_source[name]:
+                        best_validation_by_source[name] = source_loss
+                        _save_checkpoint(
+                            config.output_dir / f"best_{name}.pt",
+                            model,
+                            optimizer,
+                            scheduler,
+                            step,
+                            source_loss,
+                            config,
+                        )
             if validation_loss < best_validation:
                 best_validation = validation_loss
                 bad_checks = 0
@@ -1527,6 +1570,7 @@ def train_model(
     return {
         "steps": records[-1]["step"] if rank == 0 else config.steps,
         "best_validation_loss": best_validation,
+        "best_validation_by_source": best_validation_by_source,
         "records": records if rank == 0 else [],
     }
 
