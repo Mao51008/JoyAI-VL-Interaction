@@ -92,7 +92,7 @@ def main() -> None:
         "device": args.device,
         "prompt": OFFICIAL_ASR_PROMPT,
         "audio_preprocessing": "Official AutoProcessor.apply_chat_template audio path handling; no project preprocessing. Audio tensors stay float32.",
-        "model_dtype": "bfloat16 (native precision of the downloaded bf16 checkpoint)",
+        "model_dtype": "BF16 decoder with official audio encoder/projector kept FP32 for their BatchNorm frontend",
         "template_kwargs": {"tokenize": True, "add_generation_prompt": True, "add_special_tokens": True, "return_dict": True},
         "generation_kwargs": {},
         "generation_note": "Official README call: model.generate(**model_inputs); checkpoint generation_config is used unchanged.",
@@ -102,10 +102,11 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(
         args.model_dir, trust_remote_code=True, torch_dtype=torch.bfloat16
     ).to(args.device).eval()
-    # The checkpoint custom code leaves this BatchNorm in float32 while the BF16
-    # frontend feeds it BF16 activations.  This is an in-memory dtype alignment;
-    # it never writes to the checkpoint.
-    model.audio_encoder.init_bn.to(dtype=torch.bfloat16)
+    # Dasheng's frontend includes BatchNorm and expects FP32 activations.  The
+    # official model casts projected audio to the decoder embedding dtype later.
+    # This only changes runtime tensor dtypes; it never writes checkpoint files.
+    model.audio_encoder.float()
+    model.audio_projector.float()
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
     processor = AutoProcessor.from_pretrained(args.model_dir, trust_remote_code=True)
     totals = {key: 0 for key in ("word_errors", "insertions", "deletions", "substitutions", "reference_words", "char_errors", "char_insertions", "char_deletions", "char_substitutions", "reference_chars")}
@@ -114,7 +115,7 @@ def main() -> None:
             audio_path = record["audio"][0]["path"]
             reference = record["metadata"]["assistant_target_text"]
             messages: list[dict[str, Any]] = [{"role": "user", "content": [{"type": "text", "text": OFFICIAL_ASR_PROMPT}, {"type": "audio", "path": audio_path}]}]
-            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with torch.no_grad():
                 model_inputs = processor.apply_chat_template(
                     messages,
                     tokenize=True,
