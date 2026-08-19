@@ -102,6 +102,10 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(
         args.model_dir, trust_remote_code=True, torch_dtype=torch.bfloat16
     ).to(args.device).eval()
+    # The checkpoint custom code leaves this BatchNorm in float32 while the BF16
+    # frontend feeds it BF16 activations.  This is an in-memory dtype alignment;
+    # it never writes to the checkpoint.
+    model.audio_encoder.init_bn.to(dtype=torch.bfloat16)
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
     processor = AutoProcessor.from_pretrained(args.model_dir, trust_remote_code=True)
     totals = {key: 0 for key in ("word_errors", "insertions", "deletions", "substitutions", "reference_words", "char_errors", "char_insertions", "char_deletions", "char_substitutions", "reference_chars")}
