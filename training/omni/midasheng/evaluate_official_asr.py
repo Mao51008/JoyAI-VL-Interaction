@@ -91,14 +91,17 @@ def main() -> None:
         "samples": len(records),
         "device": args.device,
         "prompt": OFFICIAL_ASR_PROMPT,
-        "audio_preprocessing": "Official AutoProcessor.apply_chat_template audio path handling; no project preprocessing.",
+        "audio_preprocessing": "Official AutoProcessor.apply_chat_template audio path handling; no project preprocessing. Audio tensors stay float32.",
+        "model_dtype": "bfloat16 (native precision of the downloaded bf16 checkpoint)",
         "template_kwargs": {"tokenize": True, "add_generation_prompt": True, "add_special_tokens": True, "return_dict": True},
         "generation_kwargs": {},
         "generation_note": "Official README call: model.generate(**model_inputs); checkpoint generation_config is used unchanged.",
     }
     (args.output_dir / "run_config.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
-    model = AutoModelForCausalLM.from_pretrained(args.model_dir, trust_remote_code=True).to(args.device).eval()
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_dir, trust_remote_code=True, torch_dtype=torch.bfloat16
+    ).to(args.device).eval()
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
     processor = AutoProcessor.from_pretrained(args.model_dir, trust_remote_code=True)
     totals = {key: 0 for key in ("word_errors", "insertions", "deletions", "substitutions", "reference_words", "char_errors", "char_insertions", "char_deletions", "char_substitutions", "reference_chars")}
@@ -107,8 +110,18 @@ def main() -> None:
             audio_path = record["audio"][0]["path"]
             reference = record["metadata"]["assistant_target_text"]
             messages: list[dict[str, Any]] = [{"role": "user", "content": [{"type": "text", "text": OFFICIAL_ASR_PROMPT}, {"type": "audio", "path": audio_path}]}]
-            with torch.no_grad():
-                model_inputs = processor.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, add_special_tokens=True, return_dict=True).to(args.device)
+            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                model_inputs = processor.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    add_special_tokens=True,
+                    return_dict=True,
+                )
+                model_inputs = {
+                    key: value.to(args.device) if hasattr(value, "to") else value
+                    for key, value in model_inputs.items()
+                }
                 generation = model.generate(**model_inputs)
             hypothesis = tokenizer.batch_decode(generation, skip_special_tokens=True)[0]
             counts = score(reference, hypothesis)
