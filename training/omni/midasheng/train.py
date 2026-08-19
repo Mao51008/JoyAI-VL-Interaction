@@ -15,6 +15,7 @@ from training.omni.projector_stage2.train import (
     load_manifest,
     train_model,
     validate_manifests,
+    WeightedAudioBatchSource,
 )
 
 from .model import build_phase1_model
@@ -173,14 +174,29 @@ def run_training(
         from torch.nn.parallel import DistributedDataParallel
 
         model = DistributedDataParallel(model, device_ids=[torch.cuda.current_device()])
-    train_batches = CachedConversationBatchSource(
+    train_batches = WeightedAudioBatchSource(
         train_rows, tokenizer, feature_dir, int(placeholder_id), batch_size,
-        max_cached_feature_shards, shuffle=True, seed=seed, audio_token_factor=5,
+        max_cached_feature_shards, voiceassistant_weight=0.40,
+        librispeech_weight=0.40, clotho_weight=0.20, seed=seed, audio_token_factor=5,
     )
     dev_batches = CachedConversationBatchSource(
         dev_rows, tokenizer, feature_dir, int(placeholder_id), batch_size,
         max_cached_feature_shards, audio_token_factor=5,
     )
+    validation_sources = {
+        name: CachedConversationBatchSource(
+            [row for row in dev_rows if row.get("provenance", {}).get("dataset") == dataset],
+            tokenizer, feature_dir, int(placeholder_id), batch_size,
+            max_cached_feature_shards, audio_token_factor=5,
+        )
+        for name, dataset in {
+            "voiceassistant": "shenyunhang/VoiceAssistant-400K",
+            "librispeech": "LibriSpeech",
+            "clotho_aqa": "Clotho-AQA",
+        }.items()
+    }
+    if any(len(source) == 0 for source in validation_sources.values()):
+        raise ValueError("every task requires at least one fixed validation batch")
     config = Stage2Config(
         train_manifest=train_manifest, dev_manifest=dev_manifest, output_dir=output_dir,
         lora_rank=8, lora_alpha=16.0, projector_learning_rate=learning_rate,
@@ -190,7 +206,7 @@ def run_training(
         validation_every=validation_every, warmup_steps=warmup_steps,
         no_progress=no_progress,
     )
-    result = train_model(model, train_batches, dev_batches, config)
+    result = train_model(model, train_batches, dev_batches, config, validation_sources)
     if rank == 0:
         (output_dir / "preflight.json").write_text(
             json.dumps(preflight_result, ensure_ascii=False, indent=2, sort_keys=True) + "\n",

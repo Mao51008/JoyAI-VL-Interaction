@@ -203,9 +203,11 @@ class WeightedAudioBatchSource(CachedConversationBatchSource):
         voiceassistant_weight: float = 0.5, clotho_weight: float = 0.15,
         librispeech_weight: float = 0.35, seed: int = 3407,
         cache_factory: Callable[[Path, int], Any] | None = None,
+        audio_token_factor: int = 1,
     ) -> None:
         super().__init__(rows, tokenizer, feature_dir, audio_placeholder_id, batch_size,
-                         max_cached_shards, shuffle=False, seed=seed, cache_factory=cache_factory)
+                         max_cached_shards, shuffle=False, seed=seed, cache_factory=cache_factory,
+                         audio_token_factor=audio_token_factor)
         self.weights = (voiceassistant_weight, clotho_weight, librispeech_weight)
         if any(weight <= 0 for weight in self.weights) or not math.isclose(sum(self.weights), 1.0, rel_tol=0.0, abs_tol=1e-9):
             raise ValueError("audio sampling weights must be positive and sum to 1")
@@ -240,7 +242,7 @@ class WeightedAudioBatchSource(CachedConversationBatchSource):
         rows = self._rows_for_epoch(self._epoch)
         self._epoch += 1
         for index in range(0, len(rows), self.batch_size):
-            yield collate_cached_audio_conversations(rows[index : index + self.batch_size], self.tokenizer, feature_cache, self.audio_placeholder_id)
+            yield collate_cached_audio_conversations(rows[index : index + self.batch_size], self.tokenizer, feature_cache, self.audio_placeholder_id, audio_token_factor=self.audio_token_factor)
 
 
 def load_vision_distillation_manifest(path: Path) -> list[dict[str, Any]]:
