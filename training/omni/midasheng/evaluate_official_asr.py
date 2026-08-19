@@ -98,7 +98,7 @@ def main() -> None:
     }
     (args.output_dir / "run_config.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
-    model = AutoModelForCausalLM.from_pretrained(args.model_dir, trust_remote_code=True, torch_dtype=torch.bfloat16).to(args.device).eval()
+    model = AutoModelForCausalLM.from_pretrained(args.model_dir, trust_remote_code=True).to(args.device).eval()
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
     processor = AutoProcessor.from_pretrained(args.model_dir, trust_remote_code=True)
     totals = {key: 0 for key in ("word_errors", "insertions", "deletions", "substitutions", "reference_words", "char_errors", "char_insertions", "char_deletions", "char_substitutions", "reference_chars")}
