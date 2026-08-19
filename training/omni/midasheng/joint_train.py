@@ -35,7 +35,7 @@ from training.omni.projector_stage2.train import (
 )
 from .hybrid_trainer import HybridConfig, HybridTrainer, assert_hybrid_partition, build_audio_encoder_branch, build_projector_lora_core
 
-TASK_WEIGHTS = {"voiceassistant": 0.50, "clotho_aqa": 0.30, "librispeech": 0.20}
+TASK_WEIGHTS = {"voiceassistant": 0.40, "clotho_aqa": 0.20, "librispeech": 0.40}
 TASK_DATASETS = {
     "voiceassistant": "shenyunhang/VoiceAssistant-400K",
     "clotho_aqa": "Clotho-AQA",

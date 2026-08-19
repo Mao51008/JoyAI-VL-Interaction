@@ -118,12 +118,20 @@ class CachedProjectorStage1Model(nn.Module):
         labels: Tensor,
         **language_model_kwargs: Any,
     ) -> Any:
-        projected_audio = self.audio_projector(audio_features)
+        projected = (
+            self.audio_projector(audio_features, audio_attention_mask)
+            if hasattr(self.audio_projector, "k")
+            else self.audio_projector(audio_features)
+        )
+        if isinstance(projected, tuple):
+            projected_audio, projected_mask = projected
+        else:
+            projected_audio, projected_mask = projected, audio_attention_mask
         inputs_embeds = replace_audio_placeholders(
             text_embeddings,
             projected_audio,
             audio_placeholder_mask.bool(),
-            audio_attention_mask.bool(),
+            projected_mask.bool(),
         )
         return self.language_model(
             inputs_embeds=inputs_embeds,

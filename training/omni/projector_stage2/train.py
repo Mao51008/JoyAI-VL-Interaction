@@ -521,6 +521,7 @@ def collate_cached_audio_conversations(
     feature_cache: Any,
     audio_placeholder_id: int,
     max_length: int = 2048,
+    audio_token_factor: int = 1,
 ) -> Stage2ConversationBatch:
     """Create bounded text tensors plus padded cached ASR features and replacement masks."""
     import torch
@@ -536,12 +537,14 @@ def collate_cached_audio_conversations(
         if feature.ndim != 2 or feature.shape[0] <= 0:
             raise ValueError("cached audio features must be rank-2 and non-empty")
         features.append(feature)
+        if audio_token_factor <= 0 or feature.shape[0] < audio_token_factor:
+            raise ValueError("cached audio is shorter than the projector subsampling factor")
         text_batches.append(
             _build_supervised_sequence(
                 row,
                 tokenizer,
                 audio_placeholder_id,
-                int(feature.shape[0]),
+                int(feature.shape[0]) // audio_token_factor,
                 max_length,
             )
         )

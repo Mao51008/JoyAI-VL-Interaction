@@ -5,7 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 
-def build_phase1_model(llm: Any, *, projector_in_features: int = 1280, projector_out_features: int = 4096) -> Any:
+def build_phase1_model(
+    llm: Any, *, projector_in_features: int = 1280, projector_out_features: int = 4096,
+    audio_projector: Any | None = None,
+) -> Any:
     """Build a cached-feature model with exactly the project projector trainable.
 
     The caller supplies batches from
@@ -21,7 +24,7 @@ def build_phase1_model(llm: Any, *, projector_in_features: int = 1280, projector
         freeze_for_projector_training,
     )
 
-    projector = AudioProjector(AudioProjectorConfig(
+    projector = audio_projector or AudioProjector(AudioProjectorConfig(
         input_size=projector_in_features, output_size=projector_out_features,
         hidden_size=projector_out_features,
     ))

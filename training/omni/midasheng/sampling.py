@@ -8,9 +8,9 @@ from collections.abc import Mapping, Sequence
 
 
 PHASE1_TASK_WEIGHTS = {
-    "voiceassistant": 0.50,
-    "librispeech": 0.25,
-    "clotho_aqa": 0.25,
+    "voiceassistant": 0.40,
+    "librispeech": 0.40,
+    "clotho_aqa": 0.20,
 }
 
 

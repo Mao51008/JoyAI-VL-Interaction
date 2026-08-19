@@ -14,9 +14,9 @@ from training.omni.midasheng.joint_train import (
 
 def test_joint_sampling_is_exact_for_one_hundred_samples():
     assert _task_counts(100) == {
-        "voiceassistant": 50,
-        "clotho_aqa": 30,
-        "librispeech": 20,
+        "voiceassistant": 40,
+        "clotho_aqa": 20,
+        "librispeech": 40,
     }
 
 
