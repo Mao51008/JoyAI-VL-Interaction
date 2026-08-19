@@ -228,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-cached-feature-shards", type=int, default=8)
     parser.add_argument("--steps", type=int, default=1000)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--learning-rate", type=float, default=3e-6)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--validation-every", type=int, default=100)
