@@ -100,8 +100,18 @@ def main() -> None:
         raise AssertionError("prompt input_ids differ from teacher-forcing prefix")
     if not torch.equal(prompt_embeddings, full_embeddings[:, :target_start]):
         raise AssertionError("prompt embeddings differ from teacher-forcing prefix")
+    captured: dict[str, Any] = {}
+
+    def capture_inputs(_module: Any, _args: Any, kwargs: dict[str, Any]) -> None:
+        captured["inputs_embeds"] = kwargs["inputs_embeds"].detach().clone()
+        captured["attention_mask"] = kwargs["attention_mask"].detach().clone()
+        captured["labels"] = kwargs.get("labels")
+
+    hook = language_model.register_forward_pre_hook(capture_inputs, with_kwargs=True)
     with torch.inference_mode():
         full_output = model(full_batch)
+    hook.remove()
+    with torch.inference_mode():
         direct_full_output = language_model(
             inputs_embeds=full_embeddings,
             attention_mask=full_batch.attention_mask.to(device),
@@ -206,6 +216,13 @@ def main() -> None:
                     - direct_labeled_no_cache_output.logits[0, target_start - 1].float()
                 ).abs().max()
             ),
+            "wrapper_vs_rebuilt_embeddings_max_abs": float(
+                (captured["inputs_embeds"].float() - full_embeddings.float()).abs().max()
+            ),
+            "wrapper_attention_matches_full": bool(
+                torch.equal(captured["attention_mask"], full_batch.attention_mask.to(device))
+            ),
+            "wrapper_received_labels": captured["labels"] is not None,
         },
         "language_model": {
             "class": type(language_model).__name__,
