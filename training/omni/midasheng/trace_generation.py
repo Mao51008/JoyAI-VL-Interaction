@@ -182,6 +182,15 @@ def main() -> None:
             "full_placeholder_tokens": int(full_placeholders[0].sum()),
             "prompt_placeholder_tokens": int(prompt_placeholders[0].sum()),
             "full_projected_mask_equals_prompt": bool(torch.equal(full_audio_mask, prompt_audio_mask)),
+            "full_id_placeholder_equals_batch_mask": bool(
+                torch.equal(full_placeholders, full_batch.audio_placeholder_mask.to(device).bool())
+            ),
+            "prompt_id_placeholder_equals_batch_mask": bool(
+                torch.equal(prompt_placeholders, prompt_batch.audio_placeholder_mask.to(device).bool())
+            ),
+            "full_placeholder_mask_difference_count": int(
+                (full_placeholders != full_batch.audio_placeholder_mask.to(device).bool()).sum()
+            ),
         },
         "teacher_forcing": {
             "first_top_k": _top_k(full_output.logits[0, target_start - 1], tokenizer),
@@ -223,6 +232,18 @@ def main() -> None:
                 torch.equal(captured["attention_mask"], full_batch.attention_mask.to(device))
             ),
             "wrapper_received_labels": captured["labels"] is not None,
+            "wrapper_vs_rebuilt_placeholder_max_abs": float(
+                (
+                    captured["inputs_embeds"][full_batch.audio_placeholder_mask.to(device).bool()].float()
+                    - full_embeddings[full_batch.audio_placeholder_mask.to(device).bool()].float()
+                ).abs().max()
+            ),
+            "wrapper_vs_rebuilt_non_placeholder_max_abs": float(
+                (
+                    captured["inputs_embeds"][~full_batch.audio_placeholder_mask.to(device).bool()].float()
+                    - full_embeddings[~full_batch.audio_placeholder_mask.to(device).bool()].float()
+                ).abs().max()
+            ),
         },
         "language_model": {
             "class": type(language_model).__name__,
