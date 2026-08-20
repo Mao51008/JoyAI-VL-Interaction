@@ -108,6 +108,19 @@ def main() -> None:
             use_cache=False,
             return_dict=True,
         )
+        direct_labeled_output = language_model(
+            inputs_embeds=full_embeddings,
+            attention_mask=full_batch.attention_mask.to(device),
+            labels=full_batch.labels.to(device),
+            return_dict=True,
+        )
+        direct_labeled_no_cache_output = language_model(
+            inputs_embeds=full_embeddings,
+            attention_mask=full_batch.attention_mask.to(device),
+            labels=full_batch.labels.to(device),
+            use_cache=False,
+            return_dict=True,
+        )
         prompt_output = language_model(
             inputs_embeds=prompt_embeddings,
             attention_mask=prompt_batch.attention_mask.to(device),
@@ -166,6 +179,12 @@ def main() -> None:
             "direct_full_first_top_k": _top_k(
                 direct_full_output.logits[0, target_start - 1], tokenizer
             ),
+            "direct_labeled_first_top_k": _top_k(
+                direct_labeled_output.logits[0, target_start - 1], tokenizer
+            ),
+            "direct_labeled_no_cache_first_top_k": _top_k(
+                direct_labeled_no_cache_output.logits[0, target_start - 1], tokenizer
+            ),
             "full_vs_prompt_first_logit_max_abs": float(
                 (full_output.logits[0, target_start - 1].float() - first_logits.float()).abs().max()
             ),
@@ -173,6 +192,18 @@ def main() -> None:
                 (
                     full_output.logits[0, target_start - 1].float()
                     - direct_full_output.logits[0, target_start - 1].float()
+                ).abs().max()
+            ),
+            "model_vs_direct_labeled_first_logit_max_abs": float(
+                (
+                    full_output.logits[0, target_start - 1].float()
+                    - direct_labeled_output.logits[0, target_start - 1].float()
+                ).abs().max()
+            ),
+            "direct_labeled_vs_no_cache_first_logit_max_abs": float(
+                (
+                    direct_labeled_output.logits[0, target_start - 1].float()
+                    - direct_labeled_no_cache_output.logits[0, target_start - 1].float()
                 ).abs().max()
             ),
         },
