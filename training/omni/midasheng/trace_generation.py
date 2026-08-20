@@ -159,6 +159,12 @@ def main() -> None:
             return_dict_in_generate=True,
             output_scores=True,
         )
+        full_generated = language_model.generate(
+            inputs_embeds=prompt_embeddings,
+            attention_mask=prompt_batch.attention_mask.to(device),
+            do_sample=False,
+            max_new_tokens=128,
+        )[0]
     labels = full_batch.labels[0]
     reference_first = int(labels[target_start])
     reference_second = int(labels[target_start + 1])
@@ -271,6 +277,13 @@ def main() -> None:
             ),
             "score_steps": len(generated.scores),
             "stopped_on_eos": bool(eos_id in generated_tokens),
+        },
+        "hf_generate_full": {
+            "decoded": tokenizer.decode(full_generated, skip_special_tokens=True).strip(),
+            "generated_tokens": int(full_generated.numel()),
+            "stopped_on_eos": bool(eos_id in full_generated),
+            "exact_match": tokenizer.decode(full_generated, skip_special_tokens=True).strip()
+            == str(row["user_text"]),
         },
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
