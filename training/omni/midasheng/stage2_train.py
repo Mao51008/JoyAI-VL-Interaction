@@ -221,8 +221,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise AssertionError("JoyAI LoRA is not trainable")
     if any(parameter.grad is not None for parameter in base_model.audio_encoder.parameters()):
         raise AssertionError("frozen encoder unexpectedly has gradients before training")
-    smoke_gradient_squares = {"official_projector": 0.0, "adapter": 0.0, "lora": 0.0}
+    smoke_gradient_squares: dict[str, Any] = {}
     if args.smoke:
+        smoke_gradient_squares = {
+            name: torch.zeros((), device=args.device)
+            for name in ("official_projector", "adapter", "lora")
+        }
         def gradient_group(name: str) -> str:
             if ".official_projector." in name:
                 return "official_projector"
@@ -238,7 +242,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             group = gradient_group(name)
 
             def record_gradient(gradient: Any, *, group_name: str = group) -> Any:
-                smoke_gradient_squares[group_name] += float(gradient.detach().float().square().sum())
+                with torch.no_grad():
+                    smoke_gradient_squares[group_name].add_(gradient.detach().float().square().sum())
                 return gradient
 
             parameter.register_hook(record_gradient)
@@ -293,9 +298,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     result = train_model(model, train_source, next(iter(validation_sources.values())), config, validation_sources)
     if args.smoke:
-        gradient_tensor = torch.tensor(
-            [smoke_gradient_squares[name] for name in ("official_projector", "adapter", "lora")],
-            device=args.device,
+        gradient_tensor = torch.stack(
+            [smoke_gradient_squares[name] for name in ("official_projector", "adapter", "lora")]
         )
         if torch.distributed.is_initialized():
             torch.distributed.all_reduce(gradient_tensor)
