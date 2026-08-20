@@ -324,7 +324,9 @@ def main(argv: list[str] | None = None) -> int:
         import torch
 
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-        torch.distributed.init_process_group("nccl")
+        torch.distributed.init_process_group(
+            "nccl", device_id=torch.device("cuda", torch.cuda.current_device())
+        )
         args.device = f"cuda:{torch.cuda.current_device()}"
     manifests = validate_manifests(args.train_manifest, args.dev_manifest)
     if not args.distributed or __import__("torch").distributed.get_rank() == 0:
