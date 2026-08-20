@@ -11,8 +11,8 @@ def subsampled_token_count(raw_tokens: int, factor: int = 5) -> int:
     return raw_tokens // factor
 
 
-def build_frozen_projector_adapter(source: Any) -> Any:
-    """Preserve the complete official projector and append Linear(3584, 4096)."""
+def build_official_projector_adapter(source: Any, *, freeze_official: bool) -> Any:
+    """Copy the complete official projector and append the JoyAI-space adapter."""
     import copy
 
     from torch import nn
@@ -29,7 +29,7 @@ def build_frozen_projector_adapter(source: Any) -> Any:
     if not isinstance(activation, nn.GELU) or not isinstance(final, nn.Linear) or (final.in_features, final.out_features) != (3584, 3584):
         raise ValueError("official projector must retain GELU and Linear(3584, 3584)")
     for parameter in official.parameters():
-        parameter.requires_grad_(False)
+        parameter.requires_grad_(not freeze_official)
 
     class OfficialProjectorJoyAIAdapter(nn.Module):
         def __init__(self) -> None:
@@ -38,8 +38,16 @@ def build_frozen_projector_adapter(source: Any) -> Any:
             self.joyai_adapter = nn.Linear(3584, 4096, dtype=final.weight.dtype)
 
         def forward(self, features: Any, mask: Any) -> tuple[Any, Any]:
-            with __import__("torch").no_grad():
+            if freeze_official:
+                with __import__("torch").no_grad():
+                    projected, projected_mask = self.official_projector(features, mask)
+            else:
                 projected, projected_mask = self.official_projector(features, mask)
             return self.joyai_adapter(projected), projected_mask
 
     return OfficialProjectorJoyAIAdapter()
+
+
+def build_frozen_projector_adapter(source: Any) -> Any:
+    """Preserve the complete frozen official projector for Stage 1."""
+    return build_official_projector_adapter(source, freeze_official=True)

@@ -77,6 +77,8 @@ class Stage2Config:
     lora_alpha: float = 16.0
     learning_rate: float | None = None
     projector_learning_rate: float = 3e-6
+    official_projector_learning_rate: float | None = None
+    adapter_learning_rate: float | None = None
     lora_learning_rate: float = 1e-5
     encoder_learning_rate: float | None = None
     weight_decay: float = 0.01
@@ -93,6 +95,10 @@ class Stage2Config:
     warmup_steps: int = 100
     min_learning_rate_ratio: float = 0.1
     deepspeed_config: dict[str, Any] | None = None
+    steps_per_epoch: int | None = None
+    sampling_task_names: tuple[str, ...] = ()
+    checkpoint_metadata: dict[str, Any] | None = None
+    require_nonzero_grad_groups: bool = False
 
 
 @dataclass
@@ -592,7 +598,10 @@ def collate_cached_audio_conversations(
         audio_features=audio_features,
         audio_attention_mask=audio_attention_mask,
         audio_placeholder_mask=placeholder_mask,
-        task_types=[str(row.get("training_task", "dialogue_response")) for row in rows],
+        task_types=[
+            str(row.get("_sampling_task", row.get("training_task", "dialogue_response")))
+            for row in rows
+        ],
     )
 
 
@@ -821,7 +830,12 @@ def validate_config(config: Stage2Config) -> None:
     learning_rates = (
         [config.learning_rate]
         if config.learning_rate is not None
-        else [config.projector_learning_rate, config.lora_learning_rate]
+        else [
+            config.projector_learning_rate,
+            config.official_projector_learning_rate or config.projector_learning_rate,
+            config.adapter_learning_rate or config.projector_learning_rate,
+            config.lora_learning_rate,
+        ]
     )
     if (
         any(rate <= 0 for rate in learning_rates)
@@ -849,6 +863,8 @@ def validate_config(config: Stage2Config) -> None:
         raise ValueError("min_learning_rate_ratio must be in (0, 1]")
     if config.max_validation_batches is not None and config.max_validation_batches <= 0:
         raise ValueError("max_validation_batches must be positive")
+    if config.steps_per_epoch is not None and config.steps_per_epoch <= 0:
+        raise ValueError("steps_per_epoch must be positive")
     if config.output_dir.exists() and config.resume_from is None:
         raise FileExistsError(
             f"refusing to reuse output directory: {config.output_dir}"
@@ -881,6 +897,8 @@ def run_preflight(config: Stage2Config) -> dict[str, Any]:
             "dev_manifest": str(config.dev_manifest.resolve()),
             "learning_rate": config.learning_rate,
             "projector_learning_rate": config.projector_learning_rate,
+            "official_projector_learning_rate": config.official_projector_learning_rate,
+            "adapter_learning_rate": config.adapter_learning_rate,
             "lora_learning_rate": config.lora_learning_rate,
             "weight_decay": config.weight_decay,
             "gradient_accumulation_steps": config.gradient_accumulation_steps,
@@ -892,6 +910,8 @@ def run_preflight(config: Stage2Config) -> dict[str, Any]:
             "warmup_steps": config.warmup_steps,
             "min_learning_rate_ratio": config.min_learning_rate_ratio,
             "early_stopping_patience": config.early_stopping_patience,
+            "steps_per_epoch": config.steps_per_epoch,
+            "sampling_task_names": config.sampling_task_names,
         },
         "manifests": manifest_info,
     }
@@ -1117,8 +1137,14 @@ def _optimizer_parameter_groups(
     model: Any, config: Stage2Config
 ) -> list[dict[str, Any]]:
     projector_lr = config.learning_rate or config.projector_learning_rate
+    official_projector_lr = config.learning_rate or (
+        config.official_projector_learning_rate or projector_lr
+    )
+    adapter_lr = config.learning_rate or (config.adapter_learning_rate or projector_lr)
     lora_lr = config.learning_rate or config.lora_learning_rate
     projector_parameters = []
+    official_projector_parameters = []
+    adapter_parameters = []
     lora_parameters = []
     encoder_parameters = []
     unexpected = []
@@ -1129,6 +1155,10 @@ def _optimizer_parameter_groups(
             config.asr_encoder_prefix + "."
         ):
             encoder_parameters.append(parameter)
+        elif ".official_projector." in name:
+            official_projector_parameters.append(parameter)
+        elif ".joyai_adapter." in name:
+            adapter_parameters.append(parameter)
         elif (
             name.startswith(config.projector_prefix + ".")
             or ("." + config.projector_prefix + ".") in name
@@ -1157,6 +1187,24 @@ def _optimizer_parameter_groups(
                 "lr": projector_lr,
                 "weight_decay": config.weight_decay,
                 "group_name": "projector",
+            }
+        )
+    if official_projector_parameters:
+        groups.append(
+            {
+                "params": official_projector_parameters,
+                "lr": official_projector_lr,
+                "weight_decay": config.weight_decay,
+                "group_name": "official_projector",
+            }
+        )
+    if adapter_parameters:
+        groups.append(
+            {
+                "params": adapter_parameters,
+                "lr": adapter_lr,
+                "weight_decay": config.weight_decay,
+                "group_name": "adapter",
             }
         )
     if lora_parameters:
@@ -1241,6 +1289,7 @@ def _save_checkpoint(
     step: int,
     best_loss: float,
     config: Stage2Config,
+    epoch: int | None = None,
 ) -> None:
     import torch
 
@@ -1260,12 +1309,15 @@ def _save_checkpoint(
         {
             "format": "projector-stage2-v2",
             "step": step,
+            "epoch": epoch,
             "trainable_state": trainable_state,
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "best_validation_loss": best_loss,
             "training_config": {
                 "projector_learning_rate": config.projector_learning_rate,
+                "official_projector_learning_rate": config.official_projector_learning_rate,
+                "adapter_learning_rate": config.adapter_learning_rate,
                 "lora_learning_rate": config.lora_learning_rate,
                 "encoder_learning_rate": config.encoder_learning_rate,
                 "legacy_learning_rate_override": config.learning_rate,
@@ -1276,6 +1328,8 @@ def _save_checkpoint(
                 "asr_replay_ratio": config.asr_replay_ratio,
                 "warmup_steps": config.warmup_steps,
                 "min_learning_rate_ratio": config.min_learning_rate_ratio,
+                "steps_per_epoch": config.steps_per_epoch,
+                "sampling_task_names": config.sampling_task_names,
             },
             "lora_targets": sorted(
                 {
@@ -1288,6 +1342,7 @@ def _save_checkpoint(
                 checkpoint_model, "projector_initialization", None
             ),
             "feature_cache": getattr(checkpoint_model, "feature_cache_metadata", None),
+            "checkpoint_metadata": config.checkpoint_metadata,
         },
         path,
     )
@@ -1402,6 +1457,8 @@ def train_model(
         start_step = int(state["step"])
         best_validation = float(state.get("best_validation_loss", best_validation))
     train_iterator = iter(train_batches)
+    started_at = time.monotonic()
+    cumulative_task_counts: Counter[str] = Counter()
     progress = None
     if rank == 0 and not config.no_progress:
         try:
@@ -1459,11 +1516,51 @@ def train_model(
             scheduler.step()
         else:
             grad_norm = torch.zeros((), device=trainables[0].device)
+        gradient_norm_by_group = {}
+        for group in optimizer.param_groups:
+            squared_norm = sum(
+                (parameter.grad.detach().float().square().sum() for parameter in group["params"]
+                 if parameter.grad is not None),
+                torch.zeros((), device=trainables[0].device),
+            )
+            gradient_norm_by_group[group["group_name"]] = float(squared_norm.sqrt())
+        if config.require_nonzero_grad_groups and any(
+            value == 0.0 for value in gradient_norm_by_group.values()
+        ):
+            raise AssertionError(f"zero gradient group: {gradient_norm_by_group}")
         if distributed:
             torch.distributed.all_reduce(weighted_loss_sum)
         loss_value = weighted_loss_sum / global_token_count
+        step_task_counts = Counter(
+            task
+            for batch in microbatches
+            for task in (getattr(batch, "task_types", None) or ["unknown"])
+        )
+        if config.sampling_task_names:
+            task_count_tensor = torch.tensor(
+                [step_task_counts[name] for name in config.sampling_task_names],
+                device=trainables[0].device,
+                dtype=torch.long,
+            )
+            if distributed:
+                torch.distributed.all_reduce(task_count_tensor)
+            step_task_counts = Counter(
+                dict(zip(config.sampling_task_names, task_count_tensor.cpu().tolist(), strict=True))
+            )
+        cumulative_task_counts.update(step_task_counts)
+        sampled_total = sum(cumulative_task_counts.values())
+        elapsed_seconds = time.monotonic() - started_at
+        epoch = (
+            (step - 1) // config.steps_per_epoch + 1
+            if config.steps_per_epoch is not None
+            else 1
+        )
         record = {
             "step": step,
+            "epoch": epoch,
+            "completed_fraction": step / config.steps,
+            "elapsed_seconds": elapsed_seconds,
+            "eta_seconds": elapsed_seconds * (config.steps - step) / step,
             "loss": float(loss_value),
             "learning_rate": learning_rates.get(
                 "projector", next(iter(learning_rates.values()))
@@ -1471,21 +1568,27 @@ def train_model(
             "learning_rates": learning_rates,
             "supervised_tokens": int(global_token_count),
             "gradient_norm": float(grad_norm),
+            "gradient_norm_by_group": gradient_norm_by_group,
+            "cuda_memory_allocated": torch.cuda.memory_allocated(
+                trainables[0].device
+            ) if torch.cuda.is_available() else 0,
+            "cuda_memory_reserved": torch.cuda.memory_reserved(
+                trainables[0].device
+            ) if torch.cuda.is_available() else 0,
             "cuda_max_memory_allocated": torch.cuda.max_memory_allocated(
                 trainables[0].device
             ) if torch.cuda.is_available() else 0,
             "cuda_max_memory_reserved": torch.cuda.max_memory_reserved(
                 trainables[0].device
             ) if torch.cuda.is_available() else 0,
-            "task_samples": dict(
-                Counter(
-                    task
-                    for batch in microbatches
-                    for task in (getattr(batch, "task_types", None) or ["unknown"])
-                )
-            ),
+            "task_samples": dict(step_task_counts),
+            "cumulative_task_samples": dict(cumulative_task_counts),
+            "cumulative_task_ratios": {
+                name: count / sampled_total for name, count in cumulative_task_counts.items()
+            },
         }
-        if step % config.validation_every == 0 or step == config.steps:
+        epoch_end = config.steps_per_epoch is not None and step % config.steps_per_epoch == 0
+        if step % config.validation_every == 0 or epoch_end or step == config.steps:
             model.eval()
             with torch.no_grad():
                 sources = validation_sources or {"mixed": dev_batches}
@@ -1525,6 +1628,7 @@ def train_model(
                             step,
                             source_loss,
                             config,
+                            epoch,
                         )
             if validation_loss < best_validation:
                 best_validation = validation_loss
@@ -1538,7 +1642,19 @@ def train_model(
                         step,
                         best_validation,
                         config,
+                        epoch,
                     )
+            if rank == 0:
+                _save_checkpoint(
+                    config.output_dir / "latest.pt",
+                    model,
+                    optimizer,
+                    scheduler,
+                    step,
+                    best_validation,
+                    config,
+                    epoch,
+                )
             else:
                 bad_checks += 1
         if rank == 0:
@@ -1548,7 +1664,12 @@ def train_model(
             _write_loss_curve(records, config.output_dir / "loss_curve.svg")
         if progress is not None:
             progress.update(1)
-            progress.set_postfix(loss=f"{record['loss']:.4f}")
+            progress.set_description(f"Epoch {epoch}")
+            progress.set_postfix(
+                loss=f"{record['loss']:.4f}",
+                **{name: f"{ratio:.1%}" for name, ratio in record["cumulative_task_ratios"].items()},
+                eta=f"{record['eta_seconds'] / 60:.1f}m",
+            )
         if (
             config.early_stopping_patience
             and bad_checks >= config.early_stopping_patience
@@ -1565,8 +1686,37 @@ def train_model(
             records[-1]["step"],
             best_validation,
             config,
+            records[-1].get("epoch"),
+        )
+        _save_checkpoint(
+            config.output_dir / "latest.pt",
+            model,
+            optimizer,
+            scheduler,
+            records[-1]["step"],
+            best_validation,
+            config,
+            records[-1].get("epoch"),
         )
         _write_loss_curve(records, config.output_dir / "loss_curve.svg")
+        (config.output_dir / "history.json").write_text(
+            json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        import csv
+
+        source_names = sorted(
+            {name for row in records for name in (row.get("validation_by_source") or {})}
+        )
+        with (config.output_dir / "history.csv").open("w", newline="", encoding="utf-8") as handle:
+            fields = ["step", "epoch", "loss", "validation_loss", *source_names]
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            for row in records:
+                writer.writerow({
+                    "step": row["step"], "epoch": row.get("epoch"), "loss": row["loss"],
+                    "validation_loss": row.get("validation_loss"),
+                    **(row.get("validation_by_source") or {}),
+                })
     return {
         "steps": records[-1]["step"] if rank == 0 else config.steps,
         "best_validation_loss": best_validation,

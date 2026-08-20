@@ -58,3 +58,48 @@ def build_phase1_model(
     trainable = getattr(model.core.audio_projector, "joyai_adapter", model.core.audio_projector)
     freeze_for_projector_training(model, trainable)
     return model
+
+
+def build_official_projector_lora_model(llm: Any, *, audio_projector: Any) -> Any:
+    """Build Stage 2 from cached frozen-encoder features.
+
+    The caller has already injected LoRA into ``llm`` and loaded the Stage 1
+    adapter weights into ``audio_projector``.  The only trainable parameters
+    are the full official projector, the adapter, and LoRA tensors.
+    """
+    from torch import nn
+
+    from training.omni.projector_stage1.model import CachedProjectorStage1Model
+
+    core = CachedProjectorStage1Model(llm, audio_projector)
+
+    class OfficialProjectorLoRAModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.audio_encoder = nn.Identity()
+            self.core = core
+
+        def forward(self, batch: Any) -> Any:
+            required = (
+                "input_ids", "labels", "attention_mask", "audio_features",
+                "audio_attention_mask", "audio_placeholder_mask",
+            )
+            if any(getattr(batch, name, None) is None for name in required):
+                raise TypeError("stage-two batch must contain cached audio features and replacement masks")
+            input_ids = batch.input_ids.to(next(self.parameters()).device)
+            projector_dtype = next(self.core.audio_projector.parameters()).dtype
+            return self.core(
+                audio_features=batch.audio_features.to(input_ids.device, dtype=projector_dtype),
+                audio_attention_mask=batch.audio_attention_mask.to(input_ids.device).bool(),
+                text_embeddings=self.core.language_model.get_input_embeddings()(input_ids),
+                audio_placeholder_mask=batch.audio_placeholder_mask.to(input_ids.device).bool(),
+                attention_mask=batch.attention_mask.to(input_ids.device),
+                labels=batch.labels.to(input_ids.device),
+            )
+
+    model = OfficialProjectorLoRAModel()
+    for name, parameter in model.named_parameters():
+        parameter.requires_grad_(
+            ".official_projector." in name or ".joyai_adapter." in name or ".lora_" in name
+        )
+    return model
