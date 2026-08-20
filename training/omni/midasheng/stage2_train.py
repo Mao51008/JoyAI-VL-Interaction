@@ -221,6 +221,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise AssertionError("JoyAI LoRA is not trainable")
     if any(parameter.grad is not None for parameter in base_model.audio_encoder.parameters()):
         raise AssertionError("frozen encoder unexpectedly has gradients before training")
+    smoke_gradient_squares = {"official_projector": 0.0, "adapter": 0.0, "lora": 0.0}
+    if args.smoke:
+        def gradient_group(name: str) -> str:
+            if ".official_projector." in name:
+                return "official_projector"
+            if ".joyai_adapter." in name:
+                return "adapter"
+            if ".lora_" in name:
+                return "lora"
+            raise AssertionError(f"unexpected smoke trainable: {name}")
+
+        for name, parameter in base_model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            group = gradient_group(name)
+
+            def record_gradient(gradient: Any, *, group_name: str = group) -> Any:
+                smoke_gradient_squares[group_name] += float(gradient.detach().float().square().sum())
+                return gradient
+
+            parameter.register_hook(record_gradient)
     train_source = ExplicitTaskBatchSource(
         train_rows, tokenizer, args.feature_dir, int(placeholder_id), batch_size=args.batch_size,
         samples_per_epoch=math.ceil(args.samples_per_epoch / world_size),
@@ -268,9 +289,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "sampling": {"weights": PHASE1_TASK_WEIGHTS, "samples_per_epoch": args.samples_per_epoch},
             "input_limits": {"max_input_tokens": 1536, "max_audio_tokens": 512},
         },
-        require_nonzero_grad_groups=args.smoke,
+        require_nonzero_grad_groups=False,
     )
     result = train_model(model, train_source, next(iter(validation_sources.values())), config, validation_sources)
+    if args.smoke:
+        gradient_tensor = torch.tensor(
+            [smoke_gradient_squares[name] for name in ("official_projector", "adapter", "lora")],
+            device=args.device,
+        )
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(gradient_tensor)
+        smoke_gradients = {
+            name: float(value.sqrt())
+            for name, value in zip(("official_projector", "adapter", "lora"), gradient_tensor.cpu(), strict=True)
+        }
+        if any(value == 0.0 for value in smoke_gradients.values()):
+            raise AssertionError(f"zero Stage 2 smoke gradient group: {smoke_gradients}")
+        result["smoke_gradient_norm_by_group"] = smoke_gradients
     local_memory = {
         "rank": rank,
         "device": args.device,
