@@ -48,6 +48,11 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--samples-per-task", type=int, default=20)
+    parser.add_argument(
+        "--all-rows",
+        action="store_true",
+        help="Generate every row in the manifest instead of a fixed per-task subset.",
+    )
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--max-new-tokens", type=int, default=128)
     args = parser.parse_args()
@@ -57,9 +62,10 @@ def main() -> None:
     from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
 
     rows = load_manifest(args.manifest)
-    if args.samples_per_task <= 0:
-        raise ValueError("--samples-per-task must be positive")
-    rows = select_fixed_task_rows(rows, args.samples_per_task, args.seed)
+    if not args.all_rows:
+        if args.samples_per_task <= 0:
+            raise ValueError("--samples-per-task must be positive")
+        rows = select_fixed_task_rows(rows, args.samples_per_task, args.seed)
     validate_feature_cache(args.feature_dir, rows)
     tokenizer = AutoTokenizer.from_pretrained(args.llm_model, fix_mistral_regex=True)
     placeholder_id = tokenizer.convert_tokens_to_ids("<|vision_pad|>")
@@ -91,6 +97,7 @@ def main() -> None:
     args.output.write_text(json.dumps({
         "checkpoint": str(args.checkpoint),
         "audio_model": args.audio_model,
+        "all_rows": args.all_rows,
         "samples_per_task": args.samples_per_task,
         "seed": args.seed,
         "max_new_tokens": args.max_new_tokens,
