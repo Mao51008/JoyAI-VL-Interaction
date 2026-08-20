@@ -50,6 +50,7 @@ def main() -> None:
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--check-every", type=int, default=20)
     parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--stop-on-exact", action="store_true")
     args = parser.parse_args()
     if args.output_dir.exists():
         raise FileExistsError(f"refusing to reuse output directory: {args.output_dir}")
@@ -101,7 +102,7 @@ def main() -> None:
     first_exact_step: int | None = 0 if initial_text == reference else None
     final_loss: float | None = None
     for step in range(1, args.steps + 1):
-        if first_exact_step is not None:
+        if first_exact_step is not None and args.stop_on_exact:
             break
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -125,8 +126,9 @@ def main() -> None:
             "exact_match": exact_match,
         })
         print(json.dumps(records[-1], ensure_ascii=False), flush=True)
-        if exact_match:
+        if exact_match and first_exact_step is None:
             first_exact_step = step
+        if exact_match and args.stop_on_exact:
             break
     final = records[-1]
     report = {
@@ -144,6 +146,27 @@ def main() -> None:
         "records": records,
     }
     args.output_dir.mkdir(parents=True)
+    trainable_state = {
+        name: parameter.detach().cpu()
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    torch.save(
+        {
+            "format": "projector-stage2-v2",
+            "step": final["step"],
+            "trainable_state": trainable_state,
+            "optimizer": optimizer.state_dict(),
+            "overfit_report": {
+                "sample_id": row["sample_id"],
+                "reference": reference,
+                "learning_rate": args.learning_rate,
+                "final_loss": final_loss,
+                "final_exact_match": final["exact_match"],
+            },
+        },
+        args.output_dir / f"adapter_step{final['step']}.pt",
+    )
     (args.output_dir / "report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
