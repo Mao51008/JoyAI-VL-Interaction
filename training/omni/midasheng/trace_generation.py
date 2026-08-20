@@ -102,6 +102,12 @@ def main() -> None:
         raise AssertionError("prompt embeddings differ from teacher-forcing prefix")
     with torch.inference_mode():
         full_output = model(full_batch)
+        direct_full_output = language_model(
+            inputs_embeds=full_embeddings,
+            attention_mask=full_batch.attention_mask.to(device),
+            use_cache=False,
+            return_dict=True,
+        )
         prompt_output = language_model(
             inputs_embeds=prompt_embeddings,
             attention_mask=prompt_batch.attention_mask.to(device),
@@ -157,6 +163,24 @@ def main() -> None:
         "teacher_forcing": {
             "first_top_k": _top_k(full_output.logits[0, target_start - 1], tokenizer),
             "second_top_k": _top_k(full_output.logits[0, target_start], tokenizer),
+            "direct_full_first_top_k": _top_k(
+                direct_full_output.logits[0, target_start - 1], tokenizer
+            ),
+            "full_vs_prompt_first_logit_max_abs": float(
+                (full_output.logits[0, target_start - 1].float() - first_logits.float()).abs().max()
+            ),
+            "model_vs_direct_full_first_logit_max_abs": float(
+                (
+                    full_output.logits[0, target_start - 1].float()
+                    - direct_full_output.logits[0, target_start - 1].float()
+                ).abs().max()
+            ),
+        },
+        "language_model": {
+            "class": type(language_model).__name__,
+            "is_encoder_decoder": bool(getattr(language_model.config, "is_encoder_decoder", False)),
+            "is_decoder": bool(getattr(language_model.config, "is_decoder", False)),
+            "attn_implementation": getattr(language_model.config, "_attn_implementation", None),
         },
         "manual_cache": {
             "first_top_k": _top_k(first_logits, tokenizer),
