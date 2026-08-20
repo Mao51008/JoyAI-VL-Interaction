@@ -1489,6 +1489,7 @@ def train_model(
         if distributed:
             torch.distributed.all_reduce(global_token_count)
         weighted_loss_sum = torch.zeros((), device=trainables[0].device)
+        gradient_norm_by_group: dict[str, float] = {}
         for microbatch_index, (batch, token_count) in enumerate(
             zip(microbatches, local_token_counts)
         ):
@@ -1506,6 +1507,19 @@ def train_model(
                     (loss * loss_scale).backward()
                 else:
                     deepspeed_engine.backward(loss * loss_scale)
+                    gradient_norm_by_group = {
+                        group["group_name"]: float(
+                            sum(
+                                (
+                                    parameter.grad.detach().float().square().sum()
+                                    for parameter in group["params"]
+                                    if parameter.grad is not None
+                                ),
+                                torch.zeros((), device=trainables[0].device),
+                            ).sqrt()
+                        )
+                        for group in optimizer.param_groups
+                    }
                 trace_microbatch("after_backward", step, microbatch_index, batch)
             weighted_loss_sum += loss.detach() * token_count
             if deepspeed_engine is not None:
@@ -1516,14 +1530,15 @@ def train_model(
             scheduler.step()
         else:
             grad_norm = torch.zeros((), device=trainables[0].device)
-        gradient_norm_by_group = {}
-        for group in optimizer.param_groups:
-            squared_norm = sum(
-                (parameter.grad.detach().float().square().sum() for parameter in group["params"]
-                 if parameter.grad is not None),
-                torch.zeros((), device=trainables[0].device),
-            )
-            gradient_norm_by_group[group["group_name"]] = float(squared_norm.sqrt())
+        if deepspeed_engine is None:
+            gradient_norm_by_group = {}
+            for group in optimizer.param_groups:
+                squared_norm = sum(
+                    (parameter.grad.detach().float().square().sum() for parameter in group["params"]
+                     if parameter.grad is not None),
+                    torch.zeros((), device=trainables[0].device),
+                )
+                gradient_norm_by_group[group["group_name"]] = float(squared_norm.sqrt())
         if config.require_nonzero_grad_groups and any(
             value == 0.0 for value in gradient_norm_by_group.values()
         ):

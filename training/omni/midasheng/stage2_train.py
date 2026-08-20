@@ -141,12 +141,20 @@ def load_stage1_adapter(projector: Any, checkpoint: Path) -> dict[str, Any]:
 
 
 def deepspeed_bf16_config() -> dict[str, Any]:
-    """Stable BF16 ZeRO configuration; external loop owns accumulation."""
+    """Two-GPU BF16 ZeRO-3 configuration; external loop owns accumulation."""
     return {
         "train_micro_batch_size_per_gpu": 1,
         "gradient_accumulation_steps": 1,
         "bf16": {"enabled": True},
-        "zero_optimization": {"stage": 2, "overlap_comm": True, "contiguous_gradients": True},
+        "zero_optimization": {
+            "stage": 3,
+            "overlap_comm": True,
+            "contiguous_gradients": True,
+            "reduce_scatter": True,
+            "allgather_partitions": True,
+            "offload_optimizer": {"device": "none"},
+            "offload_param": {"device": "none"},
+        },
         "gradient_clipping": 1.0,
         "zero_allow_untested_optimizer": True,
     }
@@ -263,6 +271,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         require_nonzero_grad_groups=args.smoke,
     )
     result = train_model(model, train_source, next(iter(validation_sources.values())), config, validation_sources)
+    local_memory = {
+        "rank": rank,
+        "device": args.device,
+        "max_allocated": torch.cuda.max_memory_allocated(),
+        "max_reserved": torch.cuda.max_memory_reserved(),
+    }
+    memory_by_rank: list[dict[str, Any] | None] = [None] * world_size
+    if torch.distributed.is_initialized():
+        torch.distributed.all_gather_object(memory_by_rank, local_memory)
+    else:
+        memory_by_rank = [local_memory]
+    result["memory_by_rank"] = memory_by_rank
     result["runtime"] = {
         "adapter_initialization": adapter_initialization,
         "trainable_parameter_names": sorted(trainable),
