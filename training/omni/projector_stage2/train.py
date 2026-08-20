@@ -1507,19 +1507,6 @@ def train_model(
                     (loss * loss_scale).backward()
                 else:
                     deepspeed_engine.backward(loss * loss_scale)
-                    gradient_norm_by_group = {
-                        group["group_name"]: float(
-                            sum(
-                                (
-                                    parameter.grad.detach().float().square().sum()
-                                    for parameter in group["params"]
-                                    if parameter.grad is not None
-                                ),
-                                torch.zeros((), device=trainables[0].device),
-                            ).sqrt()
-                        )
-                        for group in optimizer.param_groups
-                    }
                 trace_microbatch("after_backward", step, microbatch_index, batch)
             weighted_loss_sum += loss.detach() * token_count
             if deepspeed_engine is not None:
@@ -1529,7 +1516,11 @@ def train_model(
             optimizer.step()
             scheduler.step()
         else:
-            grad_norm = torch.zeros((), device=trainables[0].device)
+            # ZeRO-3 owns partitioned gradients.  Reading every parameter's ``.grad``
+            # here can materialize/synchronize shards hundreds of times per step.
+            # Its optimizer computes the clipped global norm during ``engine.step()``.
+            grad_norm = getattr(deepspeed_engine.optimizer, "_global_grad_norm", 0.0)
+            gradient_norm_by_group = {"zero3_global": float(grad_norm)}
         if deepspeed_engine is None:
             gradient_norm_by_group = {}
             for group in optimizer.param_groups:
