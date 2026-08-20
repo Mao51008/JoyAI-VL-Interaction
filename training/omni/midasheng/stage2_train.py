@@ -236,11 +236,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 return "lora"
             raise AssertionError(f"unexpected smoke trainable: {name}")
 
+        sentinels: dict[str, tuple[str, Any]] = {}
         for name, parameter in base_model.named_parameters():
             if not parameter.requires_grad:
                 continue
             group = gradient_group(name)
+            sentinels.setdefault(group, (name, parameter))
+        if set(sentinels) != set(smoke_gradient_squares):
+            raise AssertionError(f"missing Stage 2 smoke gradient sentinel: {sorted(sentinels)}")
 
+        for group, (name, parameter) in sentinels.items():
             def record_gradient(gradient: Any, *, group_name: str = group) -> Any:
                 with torch.no_grad():
                     smoke_gradient_squares[group_name].add_(gradient.detach().float().square().sum())
