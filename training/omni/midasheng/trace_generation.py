@@ -44,7 +44,7 @@ def _prepare_embeddings(model: Any, batch: Any, tokenizer: Any) -> tuple[Any, An
     audio, projected_mask = projector(features, raw_mask)
     placeholders = input_ids.eq(tokenizer.convert_tokens_to_ids("<|vision_pad|>"))
     embeddings = replace_audio_placeholders(
-        language_model.get_input_embeddings()(input_ids), audio, placeholders, projected_mask
+        language_model.get_input_embeddings()(input_ids), audio, placeholders, projected_mask.bool()
     )
     return input_ids, embeddings, placeholders, projected_mask
 

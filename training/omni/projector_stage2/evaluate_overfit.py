@@ -118,6 +118,7 @@ def _generate(model: Any, batch: Stage2ConversationBatch, tokenizer: Any, max_ne
         audio, audio_mask = projector(features, audio_mask)
     else:
         audio = projector(features)
+    audio_mask = audio_mask.bool()
     text_embeddings = language_model.get_input_embeddings()(input_ids)
     embeddings = replace_audio_placeholders(
         text_embeddings,

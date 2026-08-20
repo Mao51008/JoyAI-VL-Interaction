@@ -60,6 +60,13 @@ class ProjectorDependencyTest(unittest.TestCase):
             torch.tensor([[True, True]]),
         )
         self.assertTrue(torch.equal(replaced[0, 1:3], audio[0]))
+        replaced_from_long_mask = replace_audio_placeholders(
+            text,
+            audio,
+            torch.tensor([[0, 1, 1, 0]]),
+            torch.tensor([[1, 1]]),
+        )
+        self.assertTrue(torch.equal(replaced_from_long_mask[0, 1:3], audio[0]))
         with self.assertRaisesRegex(ValueError, "placeholders"):
             replace_audio_placeholders(
                 text,

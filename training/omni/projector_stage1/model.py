@@ -28,6 +28,11 @@ def replace_audio_placeholders(
     if text_embeddings.shape[-1] != audio_embeddings.shape[-1]:
         raise ValueError("text and projected audio embedding sizes differ")
 
+    # Official MiDasheng subsampling returns an int64 0/1 mask.  Tensor indexing
+    # requires a boolean mask here; otherwise the values are interpreted as indexes.
+    audio_placeholder_mask = audio_placeholder_mask.bool()
+    audio_attention_mask = audio_attention_mask.bool()
+
     output = text_embeddings.clone()
     for batch_index in range(text_embeddings.shape[0]):
         placeholder_count = int(audio_placeholder_mask[batch_index].sum().item())
