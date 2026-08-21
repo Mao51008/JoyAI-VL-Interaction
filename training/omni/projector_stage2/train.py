@@ -1400,6 +1400,32 @@ def train_model(
             model=base_model, optimizer=optimizer, config=config.deepspeed_config
         )
         model = deepspeed_engine
+        if os.environ.get("STAGE2_DEBUG_ZERO3_STEP") == "1":
+            zero_optimizer = deepspeed_engine.optimizer
+            for method_name in (
+                "_pre_step", "_partition_all_parameters", "_overflow_check_and_loss_scale_update",
+                "_get_norm_groups", "_prepare_sub_group", "unscale_and_clip_grads",
+                "_optimizer_step", "_reassign_or_swap_out_partitioned_parameters",
+                "_release_sub_group", "_post_step",
+            ):
+                original = getattr(zero_optimizer, method_name, None)
+                if original is None:
+                    continue
+
+                def traced(*args: Any, _original: Any = original, _name: str = method_name,
+                           **kwargs: Any) -> Any:
+                    torch.cuda.synchronize(device=trainables[0].device)
+                    started = time.monotonic()
+                    result = _original(*args, **kwargs)
+                    torch.cuda.synchronize(device=trainables[0].device)
+                    print(
+                        f"stage2_zero3_step rank={rank} method={_name} "
+                        f"seconds={time.monotonic() - started:.3f}",
+                        flush=True,
+                    )
+                    return result
+
+                setattr(zero_optimizer, method_name, traced)
         audio_encoder = getattr(base_model, "audio_encoder", None)
         if audio_encoder is not None:
             audio_encoder.float()
