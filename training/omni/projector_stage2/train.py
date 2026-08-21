@@ -1510,7 +1510,6 @@ def train_model(
     start_step = 0
     if config.resume_from is not None:
         state = torch.load(config.resume_from, map_location="cpu", weights_only=True)
-        base_model.load_state_dict(state["trainable_state"], strict=False)
         if deepspeed_engine is not None:
             zero3 = state.get("zero3")
             if not isinstance(zero3, dict) or zero3.get("public_checkpoint") != config.resume_from.name:
@@ -1521,8 +1520,9 @@ def train_model(
             if client_state.get("public_checkpoint") != config.resume_from.name:
                 raise ValueError("ZeRO-3 shard checkpoint does not match public checkpoint")
         else:
+            base_model.load_state_dict(state["trainable_state"], strict=False)
             try:
-                optimizer.load_state_dict(state["optimizer"])
+                optimizer.load_state_dict(state["optimizer_state"])
             except ValueError as error:
                 raise ValueError(
                     "checkpoint optimizer groups are incompatible with the separated "
