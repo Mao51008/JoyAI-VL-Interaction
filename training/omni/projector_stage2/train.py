@@ -19,7 +19,6 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import Enum
-from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -1685,18 +1684,39 @@ def train_model(
                     # Periodic monitoring may use a fixed prefix, but an epoch-end
                     # validation must always traverse the complete dev source.
                     validation_limit = None if full_epoch_validation else config.max_validation_batches
-                    for batch in islice(iter(source), validation_limit):
-                        token_count = _supervised_token_count(batch)
-                        source_total += _loss_value(model(batch)).detach() * token_count
-                        source_count += token_count
+                    local_batch_count = len(source)
+                    if validation_limit is not None:
+                        local_batch_count = min(local_batch_count, validation_limit)
+                    synced_batch_count = torch.tensor(
+                        local_batch_count, device=trainables[0].device, dtype=torch.long
+                    )
                     if distributed:
-                        # ZeRO-3 parameter prefetches may still have NCCL work in flight
-                        # after a no-grad forward.  Synchronize every rank before the
-                        # scalar metric collective so it cannot overtake a parameter
-                        # all-gather on a peer rank.
-                        if trainables[0].device.type == "cuda":
-                            torch.cuda.synchronize(trainables[0].device)
-                        torch.distributed.barrier()
+                        # The dev manifest is sharded per rank.  ZeRO-3 nevertheless
+                        # requires every rank to execute the same number of forwards:
+                        # otherwise one rank can begin the metric all-reduce while a
+                        # peer is still gathering partitioned parameters.  Pad the
+                        # shorter shard by replaying its final batch for collectives
+                        # only; its loss is deliberately excluded from the metric.
+                        torch.distributed.all_reduce(
+                            synced_batch_count, op=torch.distributed.ReduceOp.MAX
+                        )
+                    batch_iterator = iter(source)
+                    padding_batch = None
+                    for batch_index in range(int(synced_batch_count.item())):
+                        include_in_metric = batch_index < local_batch_count
+                        if include_in_metric:
+                            batch = next(batch_iterator)
+                            padding_batch = batch
+                        else:
+                            if padding_batch is None:
+                                raise ValueError("distributed validation shard is empty")
+                            batch = padding_batch
+                        loss = _loss_value(model(batch)).detach()
+                        if include_in_metric:
+                            token_count = _supervised_token_count(batch)
+                            source_total += loss * token_count
+                            source_count += token_count
+                    if distributed:
                         torch.distributed.all_reduce(source_total)
                         torch.distributed.all_reduce(source_count)
                     if source_count.item() <= 0:
