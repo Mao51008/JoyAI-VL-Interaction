@@ -1359,6 +1359,33 @@ def train_model(
     """Train an injected model for CPU tests or a future authorized runtime."""
     import torch
 
+    class GroupLambdaScheduler:
+        """Minimal scheduler that also accepts DeepSpeed's ZeRO optimizer wrapper."""
+
+        def __init__(self, wrapped_optimizer: Any, lr_lambda: Callable[[int], float]) -> None:
+            self.optimizer = wrapped_optimizer
+            self.lr_lambda = lr_lambda
+            self.base_lrs = [group["lr"] for group in wrapped_optimizer.param_groups]
+            self.last_epoch = 0
+            self._apply()
+
+        def _apply(self) -> None:
+            scale = self.lr_lambda(self.last_epoch)
+            for group, base_lr in zip(self.optimizer.param_groups, self.base_lrs, strict=True):
+                group["lr"] = base_lr * scale
+
+        def step(self) -> None:
+            self.last_epoch += 1
+            self._apply()
+
+        def state_dict(self) -> dict[str, Any]:
+            return {"base_lrs": self.base_lrs, "last_epoch": self.last_epoch}
+
+        def load_state_dict(self, state: dict[str, Any]) -> None:
+            self.base_lrs = list(state["base_lrs"])
+            self.last_epoch = int(state["last_epoch"])
+            self._apply()
+
     distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
     rank = torch.distributed.get_rank() if distributed else 0
     world_size = torch.distributed.get_world_size() if distributed else 1
@@ -1451,7 +1478,7 @@ def train_model(
 
     external_scheduler = scheduler is None
     if external_scheduler:
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, learning_rate_scale)
+        scheduler = GroupLambdaScheduler(optimizer, learning_rate_scale)
     if not hasattr(train_batches, "__len__") or not hasattr(dev_batches, "__len__"):
         raise TypeError("train and dev batches must be re-iterable sized sources")
     if len(train_batches) == 0 or len(dev_batches) == 0:
