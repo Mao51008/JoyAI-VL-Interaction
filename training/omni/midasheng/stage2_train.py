@@ -22,6 +22,7 @@ from training.omni.projector_stage2.train import (
     Stage2Config,
     collate_cached_audio_conversations,
     inject_lora,
+    load_stage2_trainable_initialization,
     load_manifest,
     train_model,
     validate_manifests,
@@ -268,6 +269,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     }
     if any(len(source) == 0 for source in validation_sources.values()):
         raise ValueError("fixed validation must retain every task")
+    if args.smoke:
+        audit_batch = next(iter(train_source))
+        train_source.epoch -= 1
+        projector_dtype = next(base_model.core.audio_projector.parameters()).dtype
+        with torch.no_grad():
+            _projected, projected_mask = base_model.core.audio_projector(
+                audit_batch.audio_features.to(args.device, dtype=projector_dtype),
+                audit_batch.audio_attention_mask.to(args.device).bool(),
+            )
+        audio_audit = {
+            "raw_audio_token_count": int(audit_batch.audio_attention_mask.bool().sum()),
+            "subsampled_token_count": int(projected_mask.numel()),
+            "valid_bool_mask_count": int(projected_mask.bool().sum()),
+            "placeholder_count": int(audit_batch.audio_placeholder_mask.bool().sum()),
+        }
+        if audio_audit["valid_bool_mask_count"] != audio_audit["placeholder_count"]:
+            raise AssertionError(f"audio placeholder/mask mismatch: {audio_audit}")
+        print("STAGE2_SMOKE_AUDIO_AUDIT=" + json.dumps(audio_audit), flush=True)
+    else:
+        audio_audit = None
     steps_per_epoch = math.ceil(len(train_source) / args.gradient_accumulation_steps)
     config = Stage2Config(
         train_manifest=args.train_manifest,
@@ -334,14 +355,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "trainable_parameter_names": sorted(trainable),
         "input_filter": {"train": train_filter, "dev": dev_filter},
         "validation_sizes": {name: len(source) for name, source in validation_sources.items()},
+        "smoke_audio_audit": audio_audit,
     }
     if args.smoke and rank == 0:
-        state = torch.load(args.output_dir / "latest.pt", map_location="cpu", weights_only=True)
+        checkpoint = args.output_dir / "latest.pt"
+        state = torch.load(checkpoint, map_location="cpu", weights_only=True)
         saved_names = set(state["trainable_state"])
         required = ("official_projector", "joyai_adapter", ".lora_")
         if not all(any(marker in name for name in saved_names) for marker in required):
             raise AssertionError("latest checkpoint lacks one Stage 2 trainable component")
-        result["smoke_checkpoint_restored"] = True
+        result["smoke_checkpoint_reload"] = load_stage2_trainable_initialization(
+            base_model, checkpoint, _sha256(checkpoint)
+        )
     if rank == 0:
         (args.output_dir / "stage2_report.json").write_text(
             json.dumps(result, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8"
