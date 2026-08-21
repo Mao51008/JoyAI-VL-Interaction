@@ -92,6 +92,7 @@ class Stage2Config:
     no_progress: bool = False
     resume_from: Path | None = None
     max_validation_batches: int | None = None
+    skip_epoch_end_validation: bool = False
     warmup_steps: int = 100
     min_learning_rate_ratio: float = 0.1
     deepspeed_config: dict[str, Any] | None = None
@@ -1620,7 +1621,8 @@ def train_model(
             },
         }
         epoch_end = config.steps_per_epoch is not None and step % config.steps_per_epoch == 0
-        if step % config.validation_every == 0 or epoch_end or step == config.steps:
+        full_epoch_validation = epoch_end and not config.skip_epoch_end_validation
+        if step % config.validation_every == 0 or full_epoch_validation or step == config.steps:
             model.eval()
             with torch.no_grad():
                 sources = validation_sources or {"mixed": dev_batches}
@@ -1630,7 +1632,10 @@ def train_model(
                 for name, source in sources.items():
                     source_total = torch.zeros((), device=trainables[0].device)
                     source_count = torch.zeros((), device=trainables[0].device)
-                    for batch in islice(iter(source), config.max_validation_batches):
+                    # Periodic monitoring may use a fixed prefix, but an epoch-end
+                    # validation must always traverse the complete dev source.
+                    validation_limit = None if full_epoch_validation else config.max_validation_batches
+                    for batch in islice(iter(source), validation_limit):
                         token_count = _supervised_token_count(batch)
                         source_total += _loss_value(model(batch)).detach() * token_count
                         source_count += token_count

@@ -286,6 +286,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         steps=steps_per_epoch * args.epochs,
         steps_per_epoch=steps_per_epoch,
         validation_every=args.validation_every,
+        max_validation_batches=args.max_validation_batches,
+        skip_epoch_end_validation=args.skip_full_dev,
         warmup_steps=args.warmup_steps,
         no_progress=args.no_progress,
         resume_from=args.resume_from,
@@ -366,6 +368,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-alpha", type=float, default=16.0)
     parser.add_argument("--validation-every", type=int, default=300)
+    parser.add_argument("--max-validation-batches", type=int)
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--max-cached-feature-shards", type=int, default=8)
@@ -375,12 +378,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--deepspeed", action="store_true")
     parser.add_argument("--distributed", action="store_true")
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument(
+        "--skip-full-dev",
+        action="store_true",
+        help="Do not run epoch-end full dev validation (smoke automatically enables this).",
+    )
     parser.add_argument("--no-progress", action="store_true")
     args = parser.parse_args(argv)
     if args.epochs <= 0 or args.samples_per_epoch <= 0:
         parser.error("--epochs and --samples-per-epoch must be positive")
     if args.deepspeed and not args.distributed:
         parser.error("--deepspeed requires --distributed")
+    if args.smoke:
+        args.skip_full_dev = True
+        if args.max_validation_batches is None:
+            args.max_validation_batches = 1
     if not args.smoke and not args.deepspeed:
         parser.error("formal Stage 2 training requires --deepspeed; use --smoke for the audited DDP run")
     if args.distributed:
@@ -398,6 +410,8 @@ def main(argv: list[str] | None = None) -> int:
             "manifests": manifests, "sampling": PHASE1_TASK_WEIGHTS,
             "learning_rates": {"official_projector": args.projector_lr, "adapter": args.adapter_lr, "lora": args.lora_lr},
             "validation_every": args.validation_every, "stage1_checkpoint": str(args.stage1_checkpoint),
+            "max_validation_batches": args.max_validation_batches,
+            "skip_epoch_end_validation": args.skip_full_dev,
         }, ensure_ascii=False), flush=True)
     result = run(args)
     if not args.distributed or __import__("torch").distributed.get_rank() == 0:

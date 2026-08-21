@@ -613,6 +613,35 @@ def test_training_and_validation_losses_are_weighted_by_supervised_tokens(tmp_pa
 
 
 @pytest.mark.skipif(torch is None, reason="PyTorch is not installed")
+def test_smoke_style_final_validation_uses_fixed_prefix_not_full_epoch_dev(tmp_path):
+    class MockModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.audio_encoder = torch.nn.Linear(1, 1)
+            self.audio_projector = torch.nn.Linear(1, 1)
+            self.lora_weight = torch.nn.Parameter(torch.tensor(0.1))
+
+        def forward(self, batch):
+            return self.audio_projector.weight.sum() * 0 + batch.loss
+
+    def batch(loss):
+        labels = torch.tensor([[-100, 1]])
+        return SimpleNamespace(loss=torch.tensor(float(loss)), labels=labels)
+
+    config = replace(
+        _config(tmp_path), steps=2, steps_per_epoch=2, validation_every=300,
+        max_validation_batches=1, skip_epoch_end_validation=True,
+        gradient_accumulation_steps=1, warmup_steps=0,
+    )
+    result = train_model(
+        MockModel(), [batch(1)], [batch(3), batch(99)], config,
+        validation_sources={"voiceassistant": [batch(3), batch(99)]},
+    )
+    assert "validation_loss" not in result["records"][0]
+    assert result["records"][1]["validation_loss"] == pytest.approx(3.0)
+
+
+@pytest.mark.skipif(torch is None, reason="PyTorch is not installed")
 def test_stage_one_projector_checkpoint_initializes_matching_projector(tmp_path):
     from training.omni.projector_stage1.projector import (
         AudioProjector,
