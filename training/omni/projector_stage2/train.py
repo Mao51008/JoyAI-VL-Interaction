@@ -18,6 +18,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
+from enum import Enum
 from itertools import islice
 from pathlib import Path
 from typing import Any
@@ -720,8 +721,8 @@ def load_stage2_trainable_initialization(
     import torch
 
     state = torch.load(checkpoint, map_location="cpu", weights_only=True)
-    if state.get("format") != "projector-stage2-v2":
-        raise ValueError("checkpoint is not a projector-stage2-v2 checkpoint")
+    if state.get("format") not in {"projector-stage2-v2", "projector-stage2-v3"}:
+        raise ValueError("checkpoint is not a supported projector-stage2 checkpoint")
     trainable_state = state.get("trainable_state")
     if not isinstance(trainable_state, dict) or not trainable_state:
         raise ValueError("stage-two checkpoint has no trainable_state")
@@ -1306,47 +1307,54 @@ def _save_checkpoint(
     }
     if not trainable_state:
         raise RuntimeError("refusing to save a checkpoint without trainable weights")
-    torch.save(
-        {
-            "format": "projector-stage2-v2",
-            "step": step,
-            "epoch": epoch,
-            "trainable_state": trainable_state,
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "best_validation_loss": best_loss,
-            "training_config": {
-                "projector_learning_rate": config.projector_learning_rate,
-                "official_projector_learning_rate": config.official_projector_learning_rate,
-                "adapter_learning_rate": config.adapter_learning_rate,
-                "lora_learning_rate": config.lora_learning_rate,
-                "encoder_learning_rate": config.encoder_learning_rate,
-                "legacy_learning_rate_override": config.learning_rate,
-                "weight_decay": config.weight_decay,
-                "gradient_accumulation_steps": config.gradient_accumulation_steps,
-                "max_grad_norm": config.max_grad_norm,
-                "shuffle_seed": config.shuffle_seed,
-                "asr_replay_ratio": config.asr_replay_ratio,
-                "warmup_steps": config.warmup_steps,
-                "min_learning_rate_ratio": config.min_learning_rate_ratio,
-                "steps_per_epoch": config.steps_per_epoch,
-                "sampling_task_names": config.sampling_task_names,
-            },
-            "lora_targets": sorted(
-                {
-                    name.removeprefix("core.language_model.").rsplit(".", 1)[0]
-                    for name in trainable_state
-                    if ".lora_" in name
-                }
-            ),
-            "projector_initialization": getattr(
-                checkpoint_model, "projector_initialization", None
-            ),
-            "feature_cache": getattr(checkpoint_model, "feature_cache_metadata", None),
-            "checkpoint_metadata": config.checkpoint_metadata,
+    def sanitize_checkpoint_state(value: Any, path: str = "checkpoint") -> Any:
+        """Permit only tensors and weights-only-safe Python data in public checkpoints."""
+        if isinstance(value, torch.Tensor) or value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, Enum):
+            return sanitize_checkpoint_state(value.value, path)
+        if isinstance(value, dict):
+            if not all(isinstance(key, (str, int, float, bool)) for key in value):
+                raise TypeError(f"non-primitive checkpoint key at {path}")
+            return {key: sanitize_checkpoint_state(item, f"{path}.{key}") for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [sanitize_checkpoint_state(item, f"{path}[{index}]") for index, item in enumerate(value)]
+        raise TypeError(f"unsupported checkpoint value at {path}: {type(value).__name__}")
+
+    state = {
+        "format": "projector-stage2-v3",
+        "step": step,
+        "epoch": epoch,
+        "trainable_state": trainable_state,
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "best_validation_loss": best_loss,
+        "training_config": {
+            "projector_learning_rate": config.projector_learning_rate,
+            "official_projector_learning_rate": config.official_projector_learning_rate,
+            "adapter_learning_rate": config.adapter_learning_rate,
+            "lora_learning_rate": config.lora_learning_rate,
+            "encoder_learning_rate": config.encoder_learning_rate,
+            "legacy_learning_rate_override": config.learning_rate,
+            "weight_decay": config.weight_decay,
+            "gradient_accumulation_steps": config.gradient_accumulation_steps,
+            "max_grad_norm": config.max_grad_norm,
+            "shuffle_seed": config.shuffle_seed,
+            "asr_replay_ratio": config.asr_replay_ratio,
+            "warmup_steps": config.warmup_steps,
+            "min_learning_rate_ratio": config.min_learning_rate_ratio,
+            "steps_per_epoch": config.steps_per_epoch,
+            "sampling_task_names": config.sampling_task_names,
         },
-        path,
-    )
+        "lora_targets": sorted(
+            {name.removeprefix("core.language_model.").rsplit(".", 1)[0]
+             for name in trainable_state if ".lora_" in name}
+        ),
+        "projector_initialization": getattr(checkpoint_model, "projector_initialization", None),
+        "feature_cache": getattr(checkpoint_model, "feature_cache_metadata", None),
+        "checkpoint_metadata": config.checkpoint_metadata,
+    }
+    torch.save(sanitize_checkpoint_state(state), path)
 
 
 def train_model(
@@ -1502,13 +1510,20 @@ def train_model(
     if config.resume_from is not None:
         state = torch.load(config.resume_from, map_location="cpu", weights_only=True)
         base_model.load_state_dict(state["trainable_state"], strict=False)
-        try:
-            optimizer.load_state_dict(state["optimizer"])
-        except ValueError as error:
-            raise ValueError(
-                "checkpoint optimizer groups are incompatible with the separated "
-                "projector/LoRA learning-rate groups; start a fresh stability run"
-            ) from error
+        if deepspeed_engine is not None:
+            _load_path, client_state = deepspeed_engine.load_checkpoint(
+                str(config.resume_from.parent), tag=config.resume_from.name + ".zero3"
+            )
+            if client_state.get("public_checkpoint") != config.resume_from.name:
+                raise ValueError("ZeRO-3 shard checkpoint does not match public checkpoint")
+        else:
+            try:
+                optimizer.load_state_dict(state["optimizer"])
+            except ValueError as error:
+                raise ValueError(
+                    "checkpoint optimizer groups are incompatible with the separated "
+                    "projector/LoRA learning-rate groups; start a fresh stability run"
+                ) from error
         scheduler.load_state_dict(state["scheduler"])
         start_step = int(state["step"])
         best_validation = float(state.get("best_validation_loss", best_validation))
@@ -1725,6 +1740,13 @@ def train_model(
                 )
             else:
                 bad_checks += 1
+            if deepspeed_engine is not None:
+                if distributed:
+                    torch.distributed.barrier()
+                deepspeed_engine.save_checkpoint(
+                    str(config.output_dir), tag="latest.pt.zero3",
+                    client_state={"public_checkpoint": "latest.pt", "step": step, "epoch": epoch},
+                )
         if rank == 0:
             records.append(record)
             with metrics_path.open("a", encoding="utf-8") as handle:
