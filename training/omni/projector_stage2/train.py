@@ -1394,6 +1394,7 @@ def train_model(
     parameter_groups = _optimizer_parameter_groups(base_model, config)
     optimizer = torch.optim.AdamW(parameter_groups)
     deepspeed_engine = None
+    scheduler = None
     if config.deepspeed_config is not None:
         import deepspeed
 
@@ -1448,7 +1449,8 @@ def train_model(
         progress = min(1.0, max(0.0, (step - config.warmup_steps) / decay_steps))
         return 1.0 - (1.0 - config.min_learning_rate_ratio) * progress
 
-    if deepspeed_engine is None:
+    external_scheduler = scheduler is None
+    if external_scheduler:
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, learning_rate_scale)
     if not hasattr(train_batches, "__len__") or not hasattr(dev_batches, "__len__"):
         raise TypeError("train and dev batches must be re-iterable sized sources")
@@ -1548,6 +1550,8 @@ def train_model(
             # Its optimizer computes the clipped global norm during ``engine.step()``.
             grad_norm = getattr(deepspeed_engine.optimizer, "_global_grad_norm", 0.0)
             gradient_norm_by_group = {"zero3_global": float(grad_norm)}
+            if external_scheduler:
+                scheduler.step()
         if deepspeed_engine is None:
             gradient_norm_by_group = {}
             for group in optimizer.param_groups:
