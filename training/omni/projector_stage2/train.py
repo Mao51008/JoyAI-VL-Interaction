@@ -1419,7 +1419,7 @@ def train_model(
     if distributed:
         torch.distributed.barrier()
     if rank == 0:
-        config.output_dir.mkdir(parents=True)
+        config.output_dir.mkdir(parents=True, exist_ok=config.resume_from is not None)
     if distributed:
         torch.distributed.barrier()
     base_model = getattr(model, "module", model)
