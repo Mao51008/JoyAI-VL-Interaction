@@ -237,22 +237,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 return "lora"
             raise AssertionError(f"unexpected smoke trainable: {name}")
 
-        sentinels: dict[str, tuple[str, Any]] = {}
+        seen_groups: set[str] = set()
         for name, parameter in base_model.named_parameters():
             if not parameter.requires_grad:
                 continue
             group = gradient_group(name)
-            sentinels.setdefault(group, (name, parameter))
-        if set(sentinels) != set(smoke_gradient_squares):
-            raise AssertionError(f"missing Stage 2 smoke gradient sentinel: {sorted(sentinels)}")
-
-        for group, (name, parameter) in sentinels.items():
+            seen_groups.add(group)
             def record_gradient(gradient: Any, *, group_name: str = group) -> Any:
                 with torch.no_grad():
                     smoke_gradient_squares[group_name].add_(gradient.detach().float().square().sum())
                 return gradient
 
             parameter.register_hook(record_gradient)
+        if seen_groups != set(smoke_gradient_squares):
+            raise AssertionError(f"missing Stage 2 smoke gradient group: {sorted(seen_groups)}")
     train_source = ExplicitTaskBatchSource(
         train_rows, tokenizer, args.feature_dir, int(placeholder_id), batch_size=args.batch_size,
         samples_per_epoch=math.ceil(args.samples_per_epoch / world_size),
