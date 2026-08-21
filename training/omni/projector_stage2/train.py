@@ -1690,6 +1690,13 @@ def train_model(
                         source_total += _loss_value(model(batch)).detach() * token_count
                         source_count += token_count
                     if distributed:
+                        # ZeRO-3 parameter prefetches may still have NCCL work in flight
+                        # after a no-grad forward.  Synchronize every rank before the
+                        # scalar metric collective so it cannot overtake a parameter
+                        # all-gather on a peer rank.
+                        if trainables[0].device.type == "cuda":
+                            torch.cuda.synchronize(trainables[0].device)
+                        torch.distributed.barrier()
                         torch.distributed.all_reduce(source_total)
                         torch.distributed.all_reduce(source_count)
                     if source_count.item() <= 0:
