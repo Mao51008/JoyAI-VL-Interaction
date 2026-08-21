@@ -1292,6 +1292,7 @@ def _save_checkpoint(
     best_loss: float,
     config: Stage2Config,
     epoch: int | None = None,
+    zero3_tag: str | None = None,
 ) -> None:
     import torch
 
@@ -1326,8 +1327,8 @@ def _save_checkpoint(
         "step": step,
         "epoch": epoch,
         "trainable_state": trainable_state,
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
+        "zero3": None if zero3_tag is None else {"tag": zero3_tag, "public_checkpoint": path.name},
         "best_validation_loss": best_loss,
         "training_config": {
             "projector_learning_rate": config.projector_learning_rate,
@@ -1511,8 +1512,11 @@ def train_model(
         state = torch.load(config.resume_from, map_location="cpu", weights_only=True)
         base_model.load_state_dict(state["trainable_state"], strict=False)
         if deepspeed_engine is not None:
+            zero3 = state.get("zero3")
+            if not isinstance(zero3, dict) or zero3.get("public_checkpoint") != config.resume_from.name:
+                raise ValueError("public checkpoint lacks a matching ZeRO-3 shard reference")
             _load_path, client_state = deepspeed_engine.load_checkpoint(
-                str(config.resume_from.parent), tag=config.resume_from.name + ".zero3"
+                str(config.resume_from.parent), tag=zero3["tag"]
             )
             if client_state.get("public_checkpoint") != config.resume_from.name:
                 raise ValueError("ZeRO-3 shard checkpoint does not match public checkpoint")
@@ -1524,7 +1528,7 @@ def train_model(
                     "checkpoint optimizer groups are incompatible with the separated "
                     "projector/LoRA learning-rate groups; start a fresh stability run"
                 ) from error
-        scheduler.load_state_dict(state["scheduler"])
+        scheduler.load_state_dict(state["scheduler_state"])
         start_step = int(state["step"])
         best_validation = float(state.get("best_validation_loss", best_validation))
     train_iterator = iter(train_batches)
@@ -1737,6 +1741,7 @@ def train_model(
                     best_validation,
                     config,
                     epoch,
+                    "latest.pt.zero3",
                 )
             else:
                 bad_checks += 1
@@ -1787,6 +1792,7 @@ def train_model(
             best_validation,
             config,
             records[-1].get("epoch"),
+            "latest.pt.zero3",
         )
         _write_loss_curve(records, config.output_dir / "loss_curve.svg")
         (config.output_dir / "history.json").write_text(
