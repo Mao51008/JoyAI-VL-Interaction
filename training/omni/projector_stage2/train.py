@@ -1357,6 +1357,49 @@ def _save_checkpoint(
     torch.save(sanitize_checkpoint_state(state), path)
 
 
+def _save_inference_checkpoint(
+    path: Path, model: Any, step: int, best_loss: float, config: Stage2Config, epoch: int | None
+) -> None:
+    """Save complete trainable weights for inference, never ZeRO-3 partitions."""
+    import torch
+
+    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+    rank = torch.distributed.get_rank() if distributed else 0
+    checkpoint_model = getattr(model, "module", model)
+    named_parameters = [
+        (name, parameter)
+        for name, parameter in checkpoint_model.named_parameters()
+        if parameter.requires_grad
+    ]
+    if not named_parameters:
+        raise RuntimeError("refusing to save inference checkpoint without trainable weights")
+    context = nullcontext()
+    if hasattr(model, "optimizer"):
+        import deepspeed
+
+        context = deepspeed.zero.GatheredParameters(
+            [parameter for _name, parameter in named_parameters], modifier_rank=0
+        )
+    with context:
+        if rank != 0:
+            return
+        state = {
+            "format": "projector-stage2-inference-v1",
+            "step": step,
+            "epoch": epoch,
+            "best_validation_loss": best_loss,
+            "trainable_state": {
+                name: parameter.detach().cpu().clone() for name, parameter in named_parameters
+            },
+            "lora_targets": sorted(
+                {name.removeprefix("core.language_model.").rsplit(".", 1)[0]
+                 for name, _parameter in named_parameters if ".lora_" in name}
+            ),
+            "checkpoint_metadata": config.checkpoint_metadata,
+        }
+        torch.save(state, path)
+
+
 def train_model(
     model: Any,
     train_batches: Iterable[Any],
@@ -1730,34 +1773,18 @@ def train_model(
             record["validation_loss"] = validation_loss
             record["validation_supervised_tokens"] = int(validation_count)
             record["validation_by_source"] = validation_metrics
-            if rank == 0:
-                for name, source_loss in validation_metrics.items():
-                    if source_loss < best_validation_by_source[name]:
-                        best_validation_by_source[name] = source_loss
-                        _save_checkpoint(
-                            config.output_dir / f"best_{name}.pt",
-                            model,
-                            optimizer,
-                            scheduler,
-                            step,
-                            source_loss,
-                            config,
-                            epoch,
-                        )
+            for name, source_loss in validation_metrics.items():
+                if source_loss < best_validation_by_source[name]:
+                    best_validation_by_source[name] = source_loss
+                    _save_inference_checkpoint(
+                        config.output_dir / f"best_{name}.pt", model, step, source_loss, config, epoch
+                    )
             if validation_loss < best_validation:
                 best_validation = validation_loss
                 bad_checks = 0
-                if rank == 0:
-                    _save_checkpoint(
-                        config.output_dir / "best.pt",
-                        model,
-                        optimizer,
-                        scheduler,
-                        step,
-                        best_validation,
-                        config,
-                        epoch,
-                    )
+                _save_inference_checkpoint(
+                    config.output_dir / "best.pt", model, step, best_validation, config, epoch
+                )
             if rank == 0:
                 _save_checkpoint(
                     config.output_dir / "latest.pt",

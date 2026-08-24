@@ -89,7 +89,7 @@ def main() -> int:
     from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
 
     state = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-    if state.get("format") != "projector-stage2-v3":
+    if state.get("format") not in {"projector-stage2-v3", "projector-stage2-inference-v1"}:
         raise ValueError(f"unsupported checkpoint format: {state.get('format')!r}")
     tokenizer = AutoTokenizer.from_pretrained(args.llm_model, fix_mistral_regex=True)
     placeholder_id = tokenizer.convert_tokens_to_ids("<|vision_pad|>")
@@ -99,7 +99,17 @@ def main() -> int:
     llm = AutoModelForImageTextToText.from_pretrained(args.llm_model, dtype=torch.bfloat16)
     inject_lora(llm, language_all_linear_targets(llm), 8, 16.0)
     model = build_official_projector_lora_model(llm, audio_projector=projector).to(args.device, dtype=torch.bfloat16).eval()
-    incompatible = model.load_state_dict(state["trainable_state"], strict=False)
+    zero3 = state.get("zero3")
+    if isinstance(zero3, dict):
+        from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
+
+        tag = zero3.get("tag")
+        if not isinstance(tag, str) or zero3.get("public_checkpoint") != args.checkpoint.name:
+            raise ValueError("checkpoint has an invalid ZeRO-3 association")
+        trainable_state = get_fp32_state_dict_from_zero_checkpoint(str(args.checkpoint.parent), tag=tag)
+    else:
+        trainable_state = state["trainable_state"]
+    incompatible = model.load_state_dict(trainable_state, strict=False)
     if incompatible.unexpected_keys:
         raise ValueError(f"checkpoint tensor mismatch: {incompatible}")
 
