@@ -51,8 +51,10 @@ def transcribe(args: argparse.Namespace, rows: list[dict[str, Any]]) -> None:
     model.audio_projector.float()
     tokenizer = AutoTokenizer.from_pretrained(args.audio_model, trust_remote_code=True)
     processor = AutoProcessor.from_pretrained(args.audio_model, trust_remote_code=True)
-    with args.output.open("w", encoding="utf-8") as handle, torch.inference_mode():
-        for position, row in enumerate(rows, start=1):
+    completed = _completed_ids(args.output, rows, args.resume)
+    pending = [row for row in rows if row["sample_id"] not in completed]
+    with args.output.open("a" if completed else "w", encoding="utf-8") as handle, torch.inference_mode():
+        for position, row in enumerate(pending, start=1):
             audio_path = args.audio_root / str(row["source_audio_path"])
             messages = [{"role": "user", "content": [
                 {"type": "text", "text": OFFICIAL_ASR_PROMPT},
@@ -75,7 +77,7 @@ def transcribe(args: argparse.Namespace, rows: list[dict[str, Any]]) -> None:
             }
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             handle.flush()
-            print(f"TRANSCRIPT {position}/{len(rows)} {record['sample_id']}", flush=True)
+            print(f"TRANSCRIPT {position}/{len(pending)} {record['sample_id']}", flush=True)
 
 
 def teach(args: argparse.Namespace, rows: list[dict[str, Any]]) -> None:
@@ -88,8 +90,10 @@ def teach(args: argparse.Namespace, rows: list[dict[str, Any]]) -> None:
         raise ValueError(f"missing transcripts for {len(missing)} rows")
     tokenizer = AutoTokenizer.from_pretrained(args.llm_model, fix_mistral_regex=True)
     model = AutoModelForImageTextToText.from_pretrained(args.llm_model, dtype=torch.bfloat16).to(args.device).eval()
-    with args.output.open("w", encoding="utf-8") as handle, torch.inference_mode():
-        for position, row in enumerate(rows, start=1):
+    completed = _completed_ids(args.output, rows, args.resume)
+    pending = [row for row in rows if row["sample_id"] not in completed]
+    with args.output.open("a" if completed else "w", encoding="utf-8") as handle, torch.inference_mode():
+        for position, row in enumerate(pending, start=1):
             transcript = transcripts[row["sample_id"]]
             messages = [
                 {"role": "system", "content": CANONICAL_SYSTEM_PROMPT},
@@ -115,7 +119,22 @@ def teach(args: argparse.Namespace, rows: list[dict[str, Any]]) -> None:
             }
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             handle.flush()
-            print(f"TEACHER {position}/{len(rows)} {record['sample_id']}", flush=True)
+            print(f"TEACHER {position}/{len(pending)} {record['sample_id']}", flush=True)
+
+
+def _completed_ids(output: Path, rows: list[dict[str, Any]], resume: bool) -> set[str]:
+    if not output.exists():
+        return set()
+    if not resume:
+        raise FileExistsError(f"refusing to overwrite output: {output}")
+    allowed = {str(row["sample_id"]) for row in rows}
+    records = _read_jsonl(output)
+    completed = [str(record.get("sample_id", "")) for record in records]
+    if any(not sample_id or sample_id not in allowed for sample_id in completed):
+        raise ValueError(f"resume output contains a sample outside this shard: {output}")
+    if len(completed) != len(set(completed)):
+        raise ValueError(f"resume output contains duplicate sample IDs: {output}")
+    return set(completed)
 
 
 def main() -> int:
@@ -131,9 +150,8 @@ def main() -> int:
     parser.add_argument("--transcripts", type=Path)
     parser.add_argument("--llm-model")
     parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--resume", action="store_true", help="Append only missing records after strict shard validation.")
     args = parser.parse_args()
-    if args.output.exists():
-        raise FileExistsError(f"refusing to overwrite output: {args.output}")
     rows = _shard(_read_jsonl(args.manifest), args.shard_index, args.shard_count)
     if args.mode == "transcribe":
         if args.audio_root is None or not args.audio_model:
