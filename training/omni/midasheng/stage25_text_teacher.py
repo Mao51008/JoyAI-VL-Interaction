@@ -56,25 +56,35 @@ def transcribe(args: argparse.Namespace, rows: list[dict[str, Any]]) -> None:
     with args.output.open("a" if completed else "w", encoding="utf-8") as handle, torch.inference_mode():
         for position, row in enumerate(pending, start=1):
             audio_path = args.audio_root / str(row["source_audio_path"])
-            messages = [{"role": "user", "content": [
-                {"type": "text", "text": OFFICIAL_ASR_PROMPT},
-                {"type": "audio", "path": str(audio_path)},
-            ]}]
-            inputs = processor.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True, add_special_tokens=True, return_dict=True
-            )
-            inputs = {name: value.to(args.device) if hasattr(value, "to") else value for name, value in inputs.items()}
-            generated = model.generate(**inputs)
-            transcript = tokenizer.batch_decode(generated, skip_special_tokens=True)[0].strip()
-            token_count = int(generated.shape[-1])
-            eos_id = tokenizer.eos_token_id
-            eos = bool(eos_id is not None and eos_id in generated[0])
+            error: str | None = None
+            try:
+                messages = [{"role": "user", "content": [
+                    {"type": "text", "text": OFFICIAL_ASR_PROMPT},
+                    {"type": "audio", "path": str(audio_path)},
+                ]}]
+                inputs = processor.apply_chat_template(
+                    messages, tokenize=True, add_generation_prompt=True, add_special_tokens=True, return_dict=True
+                )
+                inputs = {name: value.to(args.device) if hasattr(value, "to") else value for name, value in inputs.items()}
+                generated = model.generate(**inputs)
+                transcript = tokenizer.batch_decode(generated, skip_special_tokens=True)[0].strip()
+                token_count = int(generated.shape[-1])
+                eos_id = tokenizer.eos_token_id
+                eos = bool(eos_id is not None and eos_id in generated[0])
+            except Exception as exception:
+                transcript, token_count, eos = "", 0, False
+                error = f"{type(exception).__name__}: {exception}"
+            quality_flags = _quality_flags(transcript, token_count, eos)
+            if error is not None:
+                quality_flags.append("transcription_error")
             record = {
                 "sample_id": row["sample_id"], "audio_path": str(audio_path), "audio_id": row["source_audio_path"],
                 "transcript": transcript, "transcript_source": "midasheng_pseudo", "generated_tokens": token_count,
                 "eos": eos, "generation": {"prompt": OFFICIAL_ASR_PROMPT, "do_sample": False, "official_chat_template": True},
-                "quality_flags": _quality_flags(transcript, token_count, eos),
+                "quality_flags": quality_flags,
             }
+            if error is not None:
+                record["error"] = error
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             handle.flush()
             print(f"TRANSCRIPT {position}/{len(pending)} {record['sample_id']}", flush=True)
