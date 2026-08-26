@@ -98,6 +98,9 @@ def teach(args: argparse.Namespace, rows: list[dict[str, Any]]) -> None:
     missing = [row["sample_id"] for row in rows if row["sample_id"] not in transcripts]
     if missing:
         raise ValueError(f"missing transcripts for {len(missing)} rows")
+    if args.skip_flagged_transcripts:
+        rows = [row for row in rows if not transcripts[row["sample_id"]].get("quality_flags")]
+    audio_generations = _stage2_audio_generations(args.stage2_audio_generations)
     tokenizer = AutoTokenizer.from_pretrained(args.llm_model, fix_mistral_regex=True)
     model = AutoModelForImageTextToText.from_pretrained(args.llm_model, dtype=torch.bfloat16).to(args.device).eval()
     completed = _completed_ids(args.output, rows, args.resume)
@@ -123,6 +126,7 @@ def teach(args: argparse.Namespace, rows: list[dict[str, Any]]) -> None:
             record = {
                 "sample_id": row["sample_id"], "transcript": transcript["transcript"],
                 "transcript_source": transcript["transcript_source"], "original_reference_answer": row["assistant_response"],
+                "stage2_audio_generation": audio_generations.get(row["sample_id"]),
                 "teacher_generation": teacher, "teacher_generated_tokens": int(continuation.numel()), "teacher_eos": eos,
                 "chat_messages": messages, "text_prompt": tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True),
                 "rouge_l_f1_vs_reference": rouge_l_f1(row["assistant_response"], teacher),
@@ -147,6 +151,26 @@ def _completed_ids(output: Path, rows: list[dict[str, Any]], resume: bool) -> se
     return set(completed)
 
 
+def _stage2_audio_generations(path: Path | None) -> dict[str, str]:
+    if path is None:
+        return {}
+    records = json.loads(path.read_text(encoding="utf-8")).get("records")
+    if not isinstance(records, list):
+        raise ValueError(f"invalid Stage 2 generation file: {path}")
+    result: dict[str, str] = {}
+    for record in records:
+        sample_id = str(record.get("sample_id", ""))
+        source_match = re.search(r"(voiceassistant:\\d+)$", sample_id)
+        generation = record.get("generation")
+        if source_match is None or not isinstance(generation, str):
+            raise ValueError(f"invalid Stage 2 generation record: {sample_id}")
+        source_id = source_match.group(1)
+        existing = result.setdefault(source_id, generation)
+        if existing != generation:
+            raise ValueError(f"inconsistent Stage 2 greedy generations for {source_id}")
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("transcribe", "teach"), required=True)
@@ -159,6 +183,8 @@ def main() -> int:
     parser.add_argument("--audio-model")
     parser.add_argument("--transcripts", type=Path)
     parser.add_argument("--llm-model")
+    parser.add_argument("--stage2-audio-generations", type=Path)
+    parser.add_argument("--skip-flagged-transcripts", action="store_true")
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--resume", action="store_true", help="Append only missing records after strict shard validation.")
     args = parser.parse_args()
