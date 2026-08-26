@@ -123,10 +123,12 @@ def teach(args: argparse.Namespace, rows: list[dict[str, Any]]) -> None:
             teacher = tokenizer.decode(continuation, skip_special_tokens=True).strip()
             eos_id = tokenizer.eos_token_id
             eos = bool(eos_id is not None and eos_id in continuation)
+            stage2_variants = audio_generations.get(row["sample_id"], [])
             record = {
                 "sample_id": row["sample_id"], "transcript": transcript["transcript"],
                 "transcript_source": transcript["transcript_source"], "original_reference_answer": row["assistant_response"],
-                "stage2_audio_generation": audio_generations.get(row["sample_id"]),
+                "stage2_audio_generation": stage2_variants[0]["generation"] if len(stage2_variants) == 1 else None,
+                "stage2_audio_generations": stage2_variants,
                 "teacher_generation": teacher, "teacher_generated_tokens": int(continuation.numel()), "teacher_eos": eos,
                 "chat_messages": messages, "text_prompt": tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True),
                 "rouge_l_f1_vs_reference": rouge_l_f1(row["assistant_response"], teacher),
@@ -151,13 +153,13 @@ def _completed_ids(output: Path, rows: list[dict[str, Any]], resume: bool) -> se
     return set(completed)
 
 
-def _stage2_audio_generations(path: Path | None) -> dict[str, str]:
+def _stage2_audio_generations(path: Path | None) -> dict[str, list[dict[str, str]]]:
     if path is None:
         return {}
     records = json.loads(path.read_text(encoding="utf-8")).get("records")
     if not isinstance(records, list):
         raise ValueError(f"invalid Stage 2 generation file: {path}")
-    result: dict[str, str] = {}
+    result: dict[str, list[dict[str, str]]] = {}
     for record in records:
         sample_id = str(record.get("sample_id", ""))
         source_match = re.search(r"(voiceassistant:\d+)$", sample_id)
@@ -165,9 +167,7 @@ def _stage2_audio_generations(path: Path | None) -> dict[str, str]:
         if source_match is None or not isinstance(generation, str):
             raise ValueError(f"invalid Stage 2 generation record: {sample_id}")
         source_id = source_match.group(1)
-        existing = result.setdefault(source_id, generation)
-        if existing != generation:
-            raise ValueError(f"inconsistent Stage 2 greedy generations for {source_id}")
+        result.setdefault(source_id, []).append({"sample_id": sample_id, "generation": generation})
     return result
 
 
