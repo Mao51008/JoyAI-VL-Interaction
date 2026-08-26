@@ -160,7 +160,7 @@ def _stage2_audio_generations(path: Path | None) -> dict[str, str]:
     result: dict[str, str] = {}
     for record in records:
         sample_id = str(record.get("sample_id", ""))
-        source_match = re.search(r"(voiceassistant:\\d+)$", sample_id)
+        source_match = re.search(r"(voiceassistant:\d+)$", sample_id)
         generation = record.get("generation")
         if source_match is None or not isinstance(generation, str):
             raise ValueError(f"invalid Stage 2 generation record: {sample_id}")
