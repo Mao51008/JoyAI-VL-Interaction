@@ -106,9 +106,11 @@ def main() -> int:
         from transformers import AutoModelForImageTextToText, AutoProcessor
 
         processor = AutoProcessor.from_pretrained(args.model)
+        # The existing services environment supports Qwen3.5 but does not install
+        # accelerate.  A single-GPU pilot does not require a device map.
         model = AutoModelForImageTextToText.from_pretrained(
-            args.model, torch_dtype=torch.bfloat16, device_map={"": args.device}
-        ).eval()
+            args.model, torch_dtype=torch.bfloat16
+        ).to(args.device).eval()
         for row in pending:
             prompt = PROMPT.format(utterance=row["transcript"])
             inputs = processor(text=prompt, return_tensors="pt").to(model.device)
