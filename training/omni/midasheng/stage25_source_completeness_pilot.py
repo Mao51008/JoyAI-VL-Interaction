@@ -12,7 +12,9 @@ from pathlib import Path
 REQUIRED_IDS = {"voiceassistant:0191573", "voiceassistant:0032429"}
 REFERENTIAL = re.compile(
     r"\b(the following|these words|this sentence|the sentence|the passage|the text below|"
-    r"this text|rewrite this|translate this|summarize this|spell the following)\b",
+    r"this text|rewrite this|translate this|summarize this|spell the following|"
+    r"this headline|the headline|this article|the article|this paragraph|the paragraph|"
+    r"this conversation|the conversation)\b",
     re.IGNORECASE,
 )
 QUESTION = re.compile(r"^(what|who|when|where|why|how|which|is|are|can|could|do|does|did|will|would)\b", re.I)
