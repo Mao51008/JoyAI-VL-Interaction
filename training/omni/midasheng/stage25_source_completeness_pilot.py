@@ -16,6 +16,9 @@ REFERENTIAL = re.compile(
     re.IGNORECASE,
 )
 QUESTION = re.compile(r"^(what|who|when|where|why|how|which|is|are|can|could|do|does|did|will|would)\b", re.I)
+INSTRUCTION = re.compile(r"\b(edit|rewrite|translate|paraphrase|summarize|spell|correct|classify)\b", re.I)
+SAFETY = re.compile(r"\b(safe|safety|weapon|harm|illegal|vaccine|medical|suicide)\b", re.I)
+NUMBER_OR_DATE = re.compile(r"\b\d{1,4}\b|\b(january|february|march|april|may|june|july|august|september|october|november|december)\b", re.I)
 
 
 def classify(text: str) -> tuple[str, str, str]:
@@ -48,15 +51,39 @@ def main() -> int:
     missing = REQUIRED_IDS - by_id.keys()
     if missing:
         raise ValueError(f"required IDs missing: {sorted(missing)}")
-    ranked = sorted(
+    ordered_rows = sorted(
         rows,
-        key=lambda row: (
-            0 if row["sample_id"] in REQUIRED_IDS else 1,
-            0 if REFERENTIAL.search(str(row.get("transcript", ""))) else 1,
-            random.Random(f"source-completeness:{row['sample_id']}").random(),
-        ),
+        key=lambda row: random.Random(f"source-completeness:{row['sample_id']}").random(),
     )
-    selected = ranked[: args.count]
+    selected: list[dict[str, object]] = []
+    selected_ids: set[str] = set()
+
+    def take(predicate: object, limit: int) -> None:
+        for row in ordered_rows:
+            sample_id = str(row["sample_id"])
+            if len(selected) >= args.count or sum(
+                1 for prior in selected if predicate(prior)
+            ) >= limit:
+                return
+            if sample_id not in selected_ids and predicate(row):
+                selected.append(row)
+                selected_ids.add(sample_id)
+
+    # Deliberately cap each group: the first version let referential prompts fill all 400 slots.
+    take(lambda row: str(row["sample_id"]) in REQUIRED_IDS, len(REQUIRED_IDS))
+    take(lambda row: bool(REFERENTIAL.search(str(row.get("transcript", "")))), 90)
+    take(lambda row: bool(INSTRUCTION.search(str(row.get("transcript", "")))), 90)
+    take(lambda row: bool(QUESTION.match(str(row.get("transcript", "")))), 110)
+    take(lambda row: bool(SAFETY.search(str(row.get("transcript", "")))), 45)
+    take(lambda row: bool(NUMBER_OR_DATE.search(str(row.get("transcript", "")))), 45)
+    take(lambda row: len(str(row.get("transcript", "")).split()) >= 25, 45)
+    take(lambda row: len(str(row.get("transcript", "")).split()) <= 8, 45)
+    for row in ordered_rows:
+        if len(selected) >= args.count:
+            break
+        if str(row["sample_id"]) not in selected_ids:
+            selected.append(row)
+            selected_ids.add(str(row["sample_id"]))
     with args.output.open("x", encoding="utf-8") as handle:
         for row in selected:
             label, reason, method = classify(str(row.get("transcript", "")))
